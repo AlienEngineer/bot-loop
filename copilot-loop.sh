@@ -78,9 +78,9 @@
 #   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
 #   --repo-dir <dir>         Repository to operate in              (default: current git repo)
 #   --model <model>          Model passed to copilot --model       (default: unset/auto)
-#   --commit-model <model>   Cheapest model used to write the commit message
-#                            from the staged diff ("off" = fixed message)
-#                                                                  (default: gpt-5-mini)
+#   --commit-model <model>   Model used to write the commit message from the
+#                            staged diff; unset/"off" uses a deterministic
+#                            "Resolve #<n>: <title>" message        (default: off)
 #   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
 #   --quiet                  Do not stream Copilot's output to stdout; write it
 #                            only to the per-run log files (the original
@@ -136,9 +136,10 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
 # Model used *only* to write the commit message from the staged diff. Kept
-# separate from COPILOT_MODEL so the expensive coding model is never spent on a
-# commit message: default to the cheapest model available. Set it empty (or
-# "off") to skip the model call and use the deterministic fallback message.
+# separate from COPILOT_MODEL so the coding model is never spent on a commit
+# message. Off by default (deterministic message); set a model such as the cheap
+# gpt-5-mini to have the message written from the diff, or "off" to force the
+# deterministic fallback.
 COMMIT_MODEL="${COMMIT_MODEL:-}"
 ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
@@ -237,9 +238,9 @@ work:
   --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
   --repo-dir <dir>         Repository to operate in               (default: current git repo)
   --model <model>          Model passed to copilot --model        (default: unset/auto)
-  --commit-model <model>   Cheapest model used to write the commit message from
-                           the staged diff; "off" uses a fixed message
-                                                                  (default: gpt-5-mini)
+  --commit-model <model>   Model used to write the commit message from the
+                           staged diff; unset/"off" uses a deterministic
+                           "Resolve #<n>: <title>" message         (default: off)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
   --quiet                  Do not stream Copilot's output to stdout; write it
                            only to the per-run log files (the original
@@ -398,9 +399,12 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 QUIET="${QUIET:-0}"
 ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
-# Cheapest model by default so commit-message generation costs almost nothing.
-# An explicit empty value or "off"/"none" disables the model call (fallback msg).
-COMMIT_MODEL="${COMMIT_MODEL:-gpt-5-mini}"
+# Commit messages use a deterministic "Resolve #<n>: <title>" by default so the
+# loop spends Copilot only on implementing issues, not on writing commit
+# messages. Opt in to model-written messages with --commit-model <model> (e.g.
+# the cheap gpt-5-mini); an unset value or "off"/"none" keeps the deterministic
+# message.
+COMMIT_MODEL="${COMMIT_MODEL:-}"
 case "$COMMIT_MODEL" in off|none|0) COMMIT_MODEL="" ;; esac
 
 # Auto-merge each PR instead of leaving it for review. Normalise the various
@@ -426,7 +430,6 @@ case "$MAX_ATTEMPTS" in ''|*[!0-9]*) MAX_ATTEMPTS=2 ;; esac
 
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
-LOCK_DIR="$WORK_DIR/lock"
 
 # --- Preflight ---------------------------------------------------------------
 for bin in git gh copilot; do
@@ -444,17 +447,35 @@ mkdir -p "$LOG_DIR"
 # Multiple instances can run concurrently but must synchronize around GitHub API calls.
 GITHUB_LOCK_FILE="$WORK_DIR/github.lock"
 
-# Acquire a lock by creating a lock file. Waits until available.
-# Caller must ensure lock is released with release_github_lock().
+# Best-effort modification time (epoch seconds) of a path. Portable across the
+# BSD stat on macOS (-f %m) and GNU stat on Linux (-c %Y); echoes 0 when it
+# cannot tell.
+_lock_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+# Acquire the GitHub lock (a directory created with mkdir). Waits up to max_wait
+# real seconds, then gives up (returns 1) so a busy peer never stalls the loop
+# for long. A lock left behind by a crashed instance is reclaimed once it is
+# older than stale_after seconds, so a hard-killed holder cannot wedge every
+# instance forever. Caller must release with release_github_lock().
 acquire_github_lock() {
-  local max_wait=30 waited=0
+  local max_wait=30 stale_after=600 start now lock_mtime
+  start="$(date +%s)"
   while ! mkdir "$GITHUB_LOCK_FILE" 2>/dev/null; do
-    if [ $waited -ge $max_wait ]; then
-      log "WARNING: GitHub lock timeout after ${max_wait}s, proceeding anyway"
+    now="$(date +%s)"
+    # Reclaim a stale lock from a crashed holder (skip when mtime is unknown).
+    lock_mtime="$(_lock_mtime "$GITHUB_LOCK_FILE")"
+    if [ "$lock_mtime" -gt 0 ] 2>/dev/null && [ $(( now - lock_mtime )) -ge "$stale_after" ]; then
+      log "WARNING: breaking stale GitHub lock (older than ${stale_after}s)"
+      rm -rf "$GITHUB_LOCK_FILE" 2>/dev/null || true
+      continue
+    fi
+    if [ $(( now - start )) -ge "$max_wait" ]; then
+      log "WARNING: GitHub lock busy after ${max_wait}s; skipping this pass"
       return 1
     fi
-    sleep 0.1
-    waited=$((waited + 1))
+    sleep 0.2
   done
   return 0
 }
@@ -654,8 +675,12 @@ process_issue() {
   local title body slug branch commit_msg commit_text commit_out pr_body log_file ahead pr_url
   local question_file comments comments_block
 
-  title="$(gh issue view "$num" --json title --jq '.title')"
-  body="$(gh issue view "$num" --json body --jq '.body')"
+  # One API round-trip for everything we need from the issue (title, body, and
+  # the comment thread) instead of three separate `gh issue view` calls. Fields
+  # are NUL-separated so multi-line bodies and comments survive intact.
+  { IFS= read -r -d '' title; IFS= read -r -d '' body; IFS= read -r -d '' comments; } < <(
+    gh issue view "$num" --json title,body,comments \
+      --jq '[.title, (.body // ""), ([.comments[] | "--- @" + (.author.login // "ghost") + " wrote:\n" + (.body // "")] | join("\n"))] | join("\u0000")' 2>/dev/null)
   slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' \
           | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)"
   [ -n "$slug" ] || slug="issue"
@@ -692,10 +717,8 @@ process_issue() {
   log "issue #$num: working on branch $branch"
   set_terminal_title "$branch"
 
-  # Build the prompt for Copilot. Include the existing comment thread so any
-  # earlier question/answer exchange is available as context.
-  comments="$(gh issue view "$num" --json comments \
-              --jq '.comments[] | "--- @" + .author.login + " wrote:\n" + .body' 2>/dev/null)"
+  # Include the existing comment thread (fetched above) so any earlier
+  # question/answer exchange is available to Copilot as context.
   comments_block=""
   [ -n "$comments" ] && comments_block=$'\n\nConversation so far (most recent last):\n'"$comments"
 
@@ -839,7 +862,7 @@ _count_failures() {
 # fallback) and clean up the branch. While under the MAX_ATTEMPTS cap the issue
 # is re-queued (trigger label re-added) for another automatic try; once the
 # attempts are exhausted it is marked "copilot-failed". A later user reply
-# resumes such an issue for a fresh attempt (see next_reply_issue).
+# resumes such an issue for a fresh attempt (see claim_next_reply_issue).
 _fail_issue() {
   local num="$1" log_file="$2" reason="$3" details="${4:-}"
   # Prefer explicit details (the exact failing command's output) over the raw
@@ -953,6 +976,7 @@ _fail_pr() {
   gh pr comment "$num" --body "$(printf 'copilot-loop could not resolve merge conflicts: %s\n\n```\n%s\n```' \
     "$reason" "$tail_out")" >/dev/null 2>&1 || true
   gh pr edit "$num" --add-label "$CONFLICT_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
+  gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
   cleanup_workspace "$head"
 }
 
@@ -1077,17 +1101,16 @@ reconcile_pending_labels() {
 # Returns the issue number on success, empty string if none available.
 # This prevents multiple instances from selecting the same issue.
 claim_next_ready_issue() {
-  local nums n body blockers issue=""
+  local n body blockers issue=""
   acquire_github_lock || return 1
 
-  # Ready issues oldest first (lowest number == earliest created). Walk them in
-  # order and claim the first that is not blocked by an unresolved dependency
-  # (see issue_open_blockers). A blocked issue keeps its trigger label so it is
+  # Ready issues oldest first (lowest number == earliest created). Fetch each
+  # issue's body in the same list call (NUL-separated number/body pairs) so we no
+  # longer spend one `gh issue view` per queued issue. Walk them in order and
+  # claim the first that is not blocked by an unresolved dependency (see
+  # issue_open_blockers). A blocked issue keeps its trigger label so it is
   # reconsidered on a later pass once its blockers close.
-  nums="$(gh issue list --state open --label "$TRIGGER_LABEL" \
-            --limit 1000 --json number --jq 'sort_by(.number) | .[].number' 2>/dev/null)"
-  for n in $nums; do
-    body="$(gh issue view "$n" --json body --jq '.body' 2>/dev/null)"
+  while IFS= read -r -d '' n && IFS= read -r -d '' body; do
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
@@ -1100,7 +1123,9 @@ claim_next_ready_issue() {
     gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
     break
-  done
+  done < <(gh issue list --state open --label "$TRIGGER_LABEL" --limit 1000 \
+             --json number,body \
+             --jq 'sort_by(.number) | .[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000"' 2>/dev/null)
 
   release_github_lock
   [ -n "$issue" ] && printf '%s\n' "$issue"
@@ -1142,12 +1167,14 @@ claim_next_reply_issue() {
                --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
            | sort -n -u )"
   for n in $nums; do
-    last_author="$(gh issue view "$n" --json comments \
-                    --jq '.comments[-1].author.login // empty' 2>/dev/null)"
+    # One view call per candidate for both the last comment's author and the
+    # body (NUL-separated) instead of two separate `gh issue view` calls.
+    { IFS= read -r -d '' last_author; IFS= read -r -d '' body; } < <(
+      gh issue view "$n" --json comments,body \
+        --jq '[(.comments[-1].author.login // ""), (.body // "")] | join("\u0000")' 2>/dev/null)
     [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ] || continue
     # Honour the same dependency gate as fresh issues: do not resume an issue
     # while an issue it declares it is waiting for is still open.
-    body="$(gh issue view "$n" --json body --jq '.body' 2>/dev/null)"
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: replied but blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
@@ -1167,34 +1194,6 @@ claim_next_reply_issue() {
   [ -n "$issue" ]
 }
 
-# Echo the number of an issue that is waiting on the user — either "needs-info"
-# (a pending question) or "copilot-failed" (retries exhausted) — and has since
-# received a reply, i.e. its most recent comment was written by someone other
-# than this bot. Oldest first. Returns 1 (no output) when nothing to resume.
-# NOTE: This function is now used only for display/checking; actual claiming is
-# done atomically by claim_next_reply_issue().
-next_reply_issue() {
-  [ -n "$BOT_LOGIN" ] || return 1
-  local nums n last_author
-  # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
-  # Sorted ascending (by number == creation order) so the oldest replied issue
-  # resumes first. High --limit avoids dropping old issues to gh's default cap.
-  nums="$( { gh issue list --state open --label "$NEEDS_INFO_LABEL" \
-               --limit 1000 --json number --jq '.[].number' 2>/dev/null;
-             gh issue list --state open --label "$FAILED_LABEL" \
-               --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
-           | sort -n -u )"
-  for n in $nums; do
-    last_author="$(gh issue view "$n" --json comments \
-                    --jq '.comments[-1].author.login // empty' 2>/dev/null)"
-    if [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ]; then
-      printf '%s\n' "$n"
-      return 0
-    fi
-  done
-  return 1
-}
-
 # --- Core: resolve merge conflicts on a single PR ---------------------------
 # Merges the PR's base branch into its head branch; if that conflicts, hands the
 # conflicted files to Copilot to resolve, then commits and pushes so the PR
@@ -1203,15 +1202,18 @@ resolve_pr_conflicts() {
   local num="$1"
   local head base title log_file conflicts copilot_rc
 
-  head="$(gh pr view "$num" --json headRefName --jq '.headRefName' 2>/dev/null)"
-  base="$(gh pr view "$num" --json baseRefName --jq '.baseRefName' 2>/dev/null)"
-  title="$(gh pr view "$num" --json title --jq '.title' 2>/dev/null)"
+  # One API round-trip for the PR's head branch, base branch and title (all
+  # single-line) instead of three separate `gh pr view` calls.
+  { IFS= read -r -d '' head; IFS= read -r -d '' base; IFS= read -r -d '' title; } < <(
+    gh pr view "$num" --json headRefName,baseRefName,title \
+      --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
   [ -n "$base" ] || base="$DEFAULT_BRANCH"
   log_file="$LOG_DIR/pr-${num}-$(date '+%Y%m%d-%H%M%S').log"
 
   if [ -z "$head" ]; then
     log "PR #$num: could not determine head branch, skipping"
     gh pr edit "$num" --add-label "$CONFLICT_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     return 1
   fi
 
@@ -1286,21 +1288,41 @@ EOF
 
   gh pr comment "$num" \
     --body "copilot-loop resolved the merge conflicts with \`$base\`." >/dev/null 2>&1 || true
+  gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
   log "PR #$num: conflicts resolved and pushed"
   cleanup_workspace "$head"
   return 0
 }
 
 # Echo the number of the lowest-numbered open PR targeting the default branch
-# whose merge is CONFLICTING, skipping any already marked unresolved. Returns 1
-# (no output) when no PR needs conflict resolution.
+# whose merge is CONFLICTING, skipping any already marked unresolved or already
+# claimed (in-progress) by another instance. Returns 1 (no output) when no PR
+# needs conflict resolution.
 next_conflicted_pr() {
   local jq_filter
   jq_filter='[.[] | select(.mergeable == "CONFLICTING")'
   jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$CONFLICT_UNRESOLVED_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$INPROGRESS_LABEL"'")) | not)'
   jq_filter="$jq_filter"' | .number] | sort | .[0] // empty'
   gh pr list --state open --base "$DEFAULT_BRANCH" \
     --json number,mergeable,labels --jq "$jq_filter" 2>/dev/null
+}
+
+# Atomically select and claim the next conflicted PR, protected by the GitHub
+# lock, so two instances never resolve the same PR (which would collide on the
+# shared worktree path and race each other's pushes). Marks the PR in-progress
+# while holding the lock; the resolve/fail paths clear that label. Echoes the PR
+# number on success, nothing when there is no PR to work.
+claim_next_conflicted_pr() {
+  local pr=""
+  acquire_github_lock || return 1
+  pr="$(next_conflicted_pr)"
+  if [ -n "$pr" ]; then
+    gh pr edit "$pr" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  fi
+  release_github_lock
+  [ -n "$pr" ] && printf '%s\n' "$pr"
+  [ -n "$pr" ]
 }
 
 # --- Self-update: pull the loop code and restart when it changed --------------
@@ -1382,8 +1404,9 @@ while true; do
   process_issue_files
 
   # Before starting any new task, make sure no open PR is left with merge
-  # conflicts; resolve one if found and re-check before doing anything else.
-  conflicted_pr="$(next_conflicted_pr || true)"
+  # conflicts; claim one atomically if found and re-check before doing anything
+  # else. Claiming under the lock stops two instances resolving the same PR.
+  conflicted_pr="$(claim_next_conflicted_pr || true)"
   if [ -n "$conflicted_pr" ]; then
     log "PR #$conflicted_pr has conflicts, resolving before starting new tasks"
     resolve_pr_conflicts "$conflicted_pr" || true
