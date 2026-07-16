@@ -36,6 +36,7 @@ assert_eq "osc empty title"        "$(terminal_title_seq '')"               "$(p
 # --- set_terminal_title: tmux path renames the current window ---------------
 # Mock tmux so `rename-window` records its argument instead of touching tmux.
 rename_log=""
+# shellcheck disable=SC2329  # invoked indirectly by set_terminal_title
 tmux() {
   if [ "$1" = "rename-window" ]; then
     rename_log="$2"

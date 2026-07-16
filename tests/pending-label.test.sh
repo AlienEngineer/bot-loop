@@ -62,7 +62,9 @@ FAILED_LABEL="copilot-failed"
 PENDING_LABEL="pending"
 
 # Silence the reconciler's log lines and stub the blocker formatter it uses.
+# shellcheck disable=SC2329  # invoked indirectly by reconcile_pending_labels
 log() { :; }
+# shellcheck disable=SC2329  # invoked indirectly by reconcile_pending_labels
 _fmt_blockers() { printf '%s' "$1"; }
 
 # Fixture: dependency states and per-issue body / current pending flag.
@@ -76,15 +78,16 @@ BODY[60]="Wait for: #43"   ; HASPEND[60]="true"   # unblocked, stale label   -> 
 BODY[70]="no dependencies" ; HASPEND[70]="false"  # never blocked            -> noop
 BODY[80]="Wait for: #43"   ; HASPEND[80]="false"  # unblocked, unlabelled    -> noop
 
-QUEUE="45 50 60 70 80"
+QUEUE=(45 50 60 70 80)
 EDITS=""
 
 # Mock gh: list returns the queue (deduped by the caller), view answers the
 # body/labels/state field asked for, edit records add/remove operations.
+# shellcheck disable=SC2329  # invoked indirectly by reconcile_pending_labels
 gh() {
   case "$1 $2" in
     "issue list")
-      printf '%s\n' $QUEUE ;;
+      printf '%s\n' "${QUEUE[@]}" ;;
     "issue view")
       local n="$3"
       case "$*" in
