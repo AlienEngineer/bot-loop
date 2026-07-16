@@ -49,7 +49,11 @@
 #   6a. If Copilot needs more information it writes a question file; post the
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
-#   6b. Otherwise commit, sync the branch with the latest default branch, then
+#   6b. Otherwise stage and commit the work (the commit message is written from
+#       the staged diff by the cheapest model, COMMIT_MODEL, with a deterministic
+#       fallback). The commit must succeed, so a commit failure fails the issue
+#       loudly instead of silently opening an empty PR. Then sync the branch with
+#       the latest default branch and, only if commits remain after the sync,
 #       push and open a PR that closes the issue. When --auto-merge is on the PR
 #       is set to merge automatically (GitHub auto-merge when the repo allows it,
 #       otherwise merged immediately) so no manual review is required.
@@ -71,6 +75,9 @@
 #   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
 #   --repo-dir <dir>         Repository to operate in              (default: current git repo)
 #   --model <model>          Model passed to copilot --model       (default: unset/auto)
+#   --commit-model <model>   Cheapest model used to write the commit message
+#                            from the staged diff ("off" = fixed message)
+#                                                                  (default: gpt-5-mini)
 #   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
 #   --quiet                  Do not stream Copilot's output to stdout; write it
 #                            only to the per-run log files (the original
@@ -87,8 +94,8 @@
 #   -h, --help               Show help and exit.
 #
 # Environment variables (equivalent to the flags above):
-#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET,
-#   USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
+#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
+#   ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
 # Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 # (default: 2).
 #
@@ -104,6 +111,11 @@ REPO_DIR="${REPO_DIR:-}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
+# Model used *only* to write the commit message from the staged diff. Kept
+# separate from COPILOT_MODEL so the expensive coding model is never spent on a
+# commit message: default to the cheapest model available. Set it empty (or
+# "off") to skip the model call and use the deterministic fallback message.
+COMMIT_MODEL="${COMMIT_MODEL:-}"
 ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
@@ -175,6 +187,9 @@ work:
   --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
   --repo-dir <dir>         Repository to operate in               (default: current git repo)
   --model <model>          Model passed to copilot --model        (default: unset/auto)
+  --commit-model <model>   Cheapest model used to write the commit message from
+                           the staged diff; "off" uses a fixed message
+                                                                  (default: gpt-5-mini)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
   --quiet                  Do not stream Copilot's output to stdout; write it
                            only to the per-run log files (the original
@@ -195,8 +210,8 @@ work:
   -h, --help               Show this help and exit.
 
 Environment variables (equivalent to the flags above):
-  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET,
-  USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
+  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
+  ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
 Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 (default: 2).
 EOF
@@ -213,6 +228,62 @@ run_copilot() {
   else
     copilot "$@" 2>&1 | tee -a "$log_file"
     COPILOT_RC="${PIPESTATUS[0]}"
+  fi
+}
+
+# Run a command with a wall-clock limit when a timeout utility is available so a
+# hung helper (e.g. the commit-message model) can never stall the whole loop.
+# Uses timeout/gtimeout if present, otherwise runs the command unguarded. Passes
+# through the command's exit status (124 on timeout, per timeout(1)).
+_run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Echo a commit message for the staged changes in WORKSPACE_DIR. Tries to have
+# the cheapest model (COMMIT_MODEL) summarise the staged diff, and always falls
+# back to a deterministic "Resolve #<n>: <title>" so a missing, disabled, slow or
+# failing model never blocks the commit. Only the diff is sent to the model (no
+# tools, no repo access needed), and the call is time-boxed. Never fails.
+build_commit_message() {
+  local num="$1" title="$2"
+  local fallback="Resolve #${num}: ${title}"
+  local diff prompt msg
+
+  # Model generation disabled -> deterministic message.
+  [ -n "$COMMIT_MODEL" ] || { printf '%s' "$fallback"; return 0; }
+
+  # Feed the model a bounded view of the staged diff (name-status + patch),
+  # capped so a huge change set cannot blow up the prompt or the cost.
+  diff="$(git -C "$WORKSPACE_DIR" diff --cached --stat 2>/dev/null)"$'\n\n'"$(git -C "$WORKSPACE_DIR" diff --cached 2>/dev/null | head -c 12000)"
+  [ -n "${diff// /}" ] || { printf '%s' "$fallback"; return 0; }
+
+  prompt="$(cat <<EOF
+Write a git commit message for the staged changes below, which resolve GitHub issue #${num} ("${title}").
+Reply with ONLY the commit message and nothing else: a single subject line of at most 72 characters in the imperative mood, optionally followed by a blank line and a short body. Do not wrap it in code fences or add any preamble.
+
+${diff}
+EOF
+)"
+
+  # Cheapest model, no tools, no color/logs; time-boxed. Discard stderr so any
+  # provider noise cannot leak into the message. Fall back on any failure.
+  msg="$(cd "$WORKSPACE_DIR" 2>/dev/null \
+         && _run_with_timeout 120 copilot -p "$prompt" \
+              --model "$COMMIT_MODEL" --allow-all-tools --no-color --log-level none 2>/dev/null)"
+  # Trim leading/trailing blank lines and strip stray surrounding code fences.
+  msg="$(printf '%s\n' "$msg" | sed -e 's/^```.*$//' -e '/^[[:space:]]*$/d' | head -c 500)"
+
+  if [ -n "$msg" ]; then
+    printf '%s' "$msg"
+  else
+    printf '%s' "$fallback"
   fi
 }
 
@@ -249,6 +320,8 @@ while [ $# -gt 0 ]; do
     --repo-dir=*)      REPO_DIR="${1#*=}" ;;
     --model)           need_arg $# "$1"; COPILOT_MODEL="$2"; shift ;;
     --model=*)         COPILOT_MODEL="${1#*=}" ;;
+    --commit-model)    need_arg $# "$1"; COMMIT_MODEL="$2"; shift ;;
+    --commit-model=*)  COMMIT_MODEL="${1#*=}" ;;
     --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
     --issues-dir=*)    ISSUES_DIR="${1#*=}" ;;
     --quiet)           QUIET=1 ;;
@@ -275,6 +348,10 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 QUIET="${QUIET:-0}"
 ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
+# Cheapest model by default so commit-message generation costs almost nothing.
+# An explicit empty value or "off"/"none" disables the model call (fallback msg).
+COMMIT_MODEL="${COMMIT_MODEL:-gpt-5-mini}"
+case "$COMMIT_MODEL" in off|none|0) COMMIT_MODEL="" ;; esac
 
 # Auto-merge each PR instead of leaving it for review. Normalise the various
 # truthy/falsy spellings to 1/0; anything unset or unrecognised means off.
@@ -499,7 +576,7 @@ try_auto_merge() {
 # Returns 0 on success (PR opened), 1 on failure.
 process_issue() {
   local num="$1"
-  local title body slug branch commit_msg pr_body log_file ahead pr_url
+  local title body slug branch commit_msg commit_text commit_out pr_body log_file ahead pr_url
   local question_file comments comments_block
 
   title="$(gh issue view "$num" --json title --jq '.title')"
@@ -586,9 +663,25 @@ EOF
     return 0
   fi
 
-  # Commit whatever changed (in case Copilot did not commit itself).
+  # Stage everything Copilot produced. It is told not to commit, but if it did
+  # anyway `add -A` is a harmless no-op for already-committed files.
   git -C "$WORKSPACE_DIR" add -A
-  git -C "$WORKSPACE_DIR" diff --cached --quiet || git -C "$WORKSPACE_DIR" commit -m "$commit_msg" >/dev/null 2>&1
+
+  # Ensure the work is committed *before* we ever try to open a PR. A commit can
+  # fail in ways easy to miss when the output is discarded (no git identity, a
+  # rejecting pre-commit hook, ...), which only later surfaces as the confusing
+  # "No commits between main and <branch>" error from `gh pr create`. So commit
+  # explicitly, capture the output, and fail the issue loudly if it does not
+  # succeed rather than pressing on with nothing committed.
+  if ! git -C "$WORKSPACE_DIR" diff --cached --quiet; then
+    commit_text="$(build_commit_message "$num" "$title")"
+    if ! commit_out="$(git -C "$WORKSPACE_DIR" commit -m "$commit_text" 2>&1)"; then
+      printf '%s\n' "$commit_out" >>"$log_file"
+      _fail_issue "$num" "$log_file" "git commit failed" "$commit_out"
+      return 1
+    fi
+    printf '%s\n' "$commit_out" >>"$log_file"
+  fi
 
   # Refresh our view of the default branch so we can sync against any work that
   # landed on it while Copilot was running.
@@ -619,6 +712,15 @@ EOF
         reason="failed to sync with ${DEFAULT_BRANCH}"
       fi
       _fail_issue "$num" "$log_file" "$reason" "$rebase_out"
+      return 1
+    fi
+    # The rebase may have dropped our commits entirely (their work already
+    # landed on the default branch, or the commit turned out empty). Re-count
+    # what is unique to the branch *after* syncing so we never push an empty
+    # branch and then hit "No commits between main and <branch>" at PR creation.
+    ahead="$(git -C "$WORKSPACE_DIR" rev-list --count "${sync_target}..HEAD" 2>/dev/null || echo 0)"
+    if [ "${ahead:-0}" -le 0 ]; then
+      _fail_issue "$num" "$log_file" "no commits to open a PR with after syncing with ${DEFAULT_BRANCH}"
       return 1
     fi
     log "issue #$num: $ahead commit(s), pushing branch $branch"
