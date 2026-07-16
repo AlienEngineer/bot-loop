@@ -7,11 +7,18 @@
 # available it sleeps and checks again.
 #
 # Flow per iteration:
-#   1. Find the oldest open issue with the trigger label (default: "ready").
-#   2. Claim it: remove trigger label, add "in-progress" (prevents re-pickup).
+#   1. Pick the next issue to work on:
+#        a. an issue awaiting a reply ("needs-info") whose latest comment came
+#           from a human (the user answered a question) -> resume it; else
+#        b. the oldest open issue with the trigger label (default: "ready").
+#   2. Claim it: add "in-progress", remove the trigger/"needs-info" labels.
 #   3. Create a fresh branch off the default branch.
-#   4. Run `copilot -p` (all tools, but file access restricted to this repo).
-#   5. Commit + push the changes and open a PR that closes the issue.
+#   4. Run `copilot -p` (all tools, file access restricted to this repo),
+#      passing the issue's comment thread so any prior Q&A is available.
+#   5a. If Copilot needs more information it writes a question file; post the
+#       question as an issue comment, label the issue "needs-info", and wait for
+#       the user to reply (no PR opened, not counted as a failure).
+#   5b. Otherwise commit + push the changes and open a PR that closes the issue.
 #   6. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
 #   7. If no issues are found, sleep and repeat.
 #
@@ -40,6 +47,11 @@ COPILOT_MODEL="${COPILOT_MODEL:-}"
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
 FAILED_LABEL="copilot-failed"
+NEEDS_INFO_LABEL="needs-info"
+
+# Hidden marker appended to comments the loop posts when asking the user a
+# question, so they are easy to recognise in the thread.
+QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
 
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
@@ -89,6 +101,10 @@ REPO_SLUG="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null
 [ -n "$REPO_SLUG" ] || REPO_SLUG="unknown"
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)"
 [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="main"
+# Our own login, used to tell the user's replies apart from the loop's own
+# comments when deciding whether a "needs-info" issue is ready to resume.
+BOT_LOGIN="$(gh api user --jq '.login' 2>/dev/null)"
+[ -n "$BOT_LOGIN" ] || log "WARNING: could not determine gh login; reply detection disabled"
 
 log "starting copilot-loop"
 log "============================================================"
@@ -102,12 +118,14 @@ ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up
 ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot loop"
 ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the copilot loop"
 ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce changes"
+ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
 
 # --- Core: process a single issue -------------------------------------------
 # Returns 0 on success (PR opened), 1 on failure.
 process_issue() {
   local num="$1"
   local title body slug branch commit_msg pr_body log_file ahead pr_url
+  local question_file comments comments_block
 
   title="$(gh issue view "$num" --json title --jq '.title')"
   body="$(gh issue view "$num" --json body --jq '.body')"
@@ -118,11 +136,18 @@ process_issue() {
   commit_msg="Resolve #${num}: ${title}"
   pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
+  # Copilot writes here when it needs to ask the user something. Lives in the
+  # gitignored work dir so it is never committed; clear any stale copy.
+  question_file="$WORK_DIR/issue-${num}.question"
+  rm -f "$question_file"
 
   log "issue #$num on $REPO_SLUG: $title"
 
   # Claim the issue up-front so it is never picked up twice, even on a crash.
-  gh issue edit "$num" --add-label "$INPROGRESS_LABEL" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1
+  # (Separate calls so removing an absent label can't skip the add.)
+  gh issue edit "$num" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  gh issue edit "$num" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
+  gh issue edit "$num" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
 
   # Start from a clean, up-to-date default branch.
   git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
@@ -130,19 +155,33 @@ process_issue() {
   # Fresh branch (reset if a stale one lingers from a previous failed run).
   git switch -c "$branch" >/dev/null 2>&1 || git switch -C "$branch" >/dev/null 2>&1
 
-  # Build the prompt for Copilot.
+  # Build the prompt for Copilot. Include the existing comment thread so any
+  # earlier question/answer exchange is available as context.
+  comments="$(gh issue view "$num" --json comments \
+              --jq '.comments[] | "--- @" + .author.login + " wrote:\n" + .body' 2>/dev/null)"
+  comments_block=""
+  [ -n "$comments" ] && comments_block=$'\n\nConversation so far (most recent last):\n'"$comments"
+
   local prompt
   prompt="$(cat <<EOF
 You are working in a git repository to resolve a GitHub issue.
 
 Issue #${num}: ${title}
 
-${body}
+${body}${comments_block}
 
 Implement the necessary code changes in the current working directory to fully
 resolve this issue. Run any build or test commands needed to verify your work.
 Do NOT run git commit, git push, create branches, or open pull requests — those
 steps are handled automatically outside this session. Only edit files and verify.
+
+If you are blocked and need more information or a decision from the user, do NOT
+guess. Write your question(s) for the user to this file and stop without making
+code changes:
+  ${question_file}
+Whatever you write there is posted as a comment on the issue; once the user
+replies you will be run again with their answer included above. Only do this
+when you genuinely cannot proceed without their input.
 EOF
 )"
 
@@ -155,6 +194,13 @@ EOF
   copilot "${copilot_args[@]}" >"$log_file" 2>&1
   local copilot_rc=$?
   log "issue #$num: copilot exited with code $copilot_rc"
+
+  # Copilot asked for more information instead of coding: relay the question to
+  # the user and wait for their reply (handled, so return success without a PR).
+  if [ -s "$question_file" ]; then
+    _ask_issue "$num" "$question_file"
+    return 0
+  fi
 
   # Commit whatever changed (in case Copilot did not commit itself).
   git add -A
@@ -199,8 +245,54 @@ _fail_issue() {
   git branch -D "$branch" >/dev/null 2>&1 || true
 }
 
+# Copilot needs more information: post its question to the issue, mark it
+# "needs-info", and leave it for the user to answer. Discards any work in
+# progress so the branch is clean for the eventual resume.
+_ask_issue() {
+  local num="$1" qf="$2" question
+  question="$(cat "$qf" 2>/dev/null)"
+  log "issue #$num: needs more info, asking the user on the issue"
+  gh issue comment "$num" \
+    --body "$(printf '**copilot-loop needs more information to continue:**\n\n%s\n\n%s' \
+      "$question" "$QUESTION_MARKER")" >/dev/null 2>&1 || true
+  gh issue edit "$num" --add-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
+  gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  rm -f "$qf"
+  git reset --hard >/dev/null 2>&1
+  git clean -fd >/dev/null 2>&1
+  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
+  git branch -D "$branch" >/dev/null 2>&1 || true
+}
+
+# Echo the number of an issue that is waiting on the user ("needs-info") and has
+# since received a reply — i.e. its most recent comment was written by someone
+# other than this bot. Returns 1 (no output) when there is nothing to resume.
+next_reply_issue() {
+  [ -n "$BOT_LOGIN" ] || return 1
+  local nums n last_author
+  nums="$(gh issue list --state open --label "$NEEDS_INFO_LABEL" \
+            --json number --jq '.[].number' 2>/dev/null)"
+  for n in $nums; do
+    last_author="$(gh issue view "$n" --json comments \
+                    --jq '.comments[-1].author.login // empty' 2>/dev/null)"
+    if [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ]; then
+      printf '%s\n' "$n"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  # Prefer resuming an issue where the user has answered a pending question.
+  next_issue="$(next_reply_issue || true)"
+  if [ -n "$next_issue" ]; then
+    log "issue #$next_issue: user replied, resuming"
+    process_issue "$next_issue" || true
+    continue
+  fi
+
   next_issue="$(gh issue list --state open --label "$TRIGGER_LABEL" \
                   --limit 1 --json number --jq '.[0].number // empty' 2>/dev/null)"
 
