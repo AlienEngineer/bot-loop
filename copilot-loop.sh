@@ -18,7 +18,8 @@
 #   5a. If Copilot needs more information it writes a question file; post the
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
-#   5b. Otherwise commit + push the changes and open a PR that closes the issue.
+#   5b. Otherwise commit, sync the branch with the latest default branch, then
+#       push and open a PR that closes the issue.
 #   6. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
 #   7. If no issues are found, sleep and repeat.
 #
@@ -206,10 +207,21 @@ EOF
   git add -A
   git diff --cached --quiet || git commit -m "$commit_msg" >/dev/null 2>&1
 
+  # Refresh our view of the default branch so we can sync against any work that
+  # landed on it while Copilot was running.
+  git fetch origin "$DEFAULT_BRANCH" >>"$log_file" 2>&1 || true
+
   ahead="$(git rev-list --count "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null \
           || git rev-list --count "${DEFAULT_BRANCH}..HEAD" 2>/dev/null || echo 0)"
 
   if [ "${ahead:-0}" -gt 0 ]; then
+    # Sync onto the latest default branch before pushing so the PR merges
+    # cleanly and does not fall behind commits that landed during the run.
+    if ! git rebase "origin/${DEFAULT_BRANCH}" >>"$log_file" 2>&1; then
+      git rebase --abort >/dev/null 2>&1 || true
+      _fail_issue "$num" "$log_file" "failed to sync with ${DEFAULT_BRANCH} (rebase conflict)"
+      return 1
+    fi
     log "issue #$num: $ahead commit(s), pushing branch $branch"
     if ! git push -u origin "$branch" >>"$log_file" 2>&1; then
       _fail_issue "$num" "$log_file" "git push failed"
