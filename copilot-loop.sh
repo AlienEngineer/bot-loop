@@ -32,34 +32,40 @@
 # Requirements: git, gh (authenticated), copilot.
 #
 # Usage:
-#   ./copilot-loop.sh [--quiet]
+#   ./copilot-loop.sh [options]
 #
-# Options:
-#   --quiet   Do not stream Copilot's output to stdout; write it only to the
-#             per-run log files (the original behaviour). By default the loop
-#             streams Copilot's output live to stdout as well as the log files.
+# Options (each is also settable via the matching environment variable; when
+# both are given the command-line flag wins):
+#   --trigger-label <label>  Label that marks an issue as ready   (default: ready)
+#   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
+#   --repo-dir <dir>         Repository to operate in              (default: current git repo)
+#   --model <model>          Model passed to copilot --model       (default: unset/auto)
+#   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
+#   --quiet                  Do not stream Copilot's output to stdout; write it
+#                            only to the per-run log files (the original
+#                            behaviour). By default the loop streams Copilot's
+#                            output live to stdout as well as the log files.
+#   -h, --help               Show help and exit.
 #
-# Configuration (override via environment variables):
-#   TRIGGER_LABEL   Label that marks an issue as ready   (default: ready)
-#   SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
-#   REPO_DIR        Repository to operate in              (default: current git repo)
-#   COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
-#   ISSUES_DIR      Folder scanned for issue markdown files (default: <repo>/issues)
-#   QUIET           Same as --quiet when set to 1          (default: 0)
+# Environment variables (equivalent to the flags above):
+#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET
 #
 set -uo pipefail
 
 # --- Configuration -----------------------------------------------------------
-# Operate on the current directory's repository by default, not the script's
-# install location (it may be a symlink on PATH). Resolve to the git top-level
-# so running from a subdirectory still targets the whole repo.
-REPO_DIR="${REPO_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
-SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
+# Every option below can be supplied two ways: as an environment variable, or as
+# a command-line flag (see --help / usage). A flag always overrides the matching
+# environment variable, which overrides the built-in default. Read the raw env
+# values here and fill in defaults after argument parsing, so a flag such as
+# --repo-dir can still influence the derived paths (ISSUES_DIR, WORK_DIR, ...).
+REPO_DIR="${REPO_DIR:-}"
+TRIGGER_LABEL="${TRIGGER_LABEL:-}"
+SLEEP_MINUTES="${SLEEP_MINUTES:-}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
+ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
-QUIET="${QUIET:-0}"
+QUIET="${QUIET:-}"
 
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
@@ -73,11 +79,6 @@ CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
 # question, so they are easy to recognise in the thread.
 QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
 
-WORK_DIR="$REPO_DIR/.copilot-loop"
-LOG_DIR="$WORK_DIR/logs"
-LOCK_DIR="$WORK_DIR/lock"
-ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
-
 # --- Helpers -----------------------------------------------------------------
 log() {
   printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -88,6 +89,14 @@ die() {
   exit 1
 }
 
+# Guard that a flag which expects a value was actually given one. Call as:
+#   need_arg $# "$1"
+# where the first argument is the remaining arg count (the flag plus anything
+# after it) and the second is the flag name used in the error message.
+need_arg() {
+  [ "$1" -ge 2 ] || die "option $2 requires a value"
+}
+
 # Ensure a label exists (ignore "already exists" errors).
 ensure_label() {
   local name="$1" color="$2" desc="$3"
@@ -96,22 +105,26 @@ ensure_label() {
 
 usage() {
   cat <<'EOF'
-Usage: ./copilot-loop.sh [--quiet]
+Usage: ./copilot-loop.sh [options]
 
 Autonomous loop that resolves labelled GitHub issues with the Copilot CLI.
 
-Options:
-  --quiet     Do not stream Copilot's output to stdout; write it only to the
-              per-run log files (the original behaviour). By default the loop
-              streams Copilot's output live to stdout as well as the log files.
-  -h, --help  Show this help and exit.
+Options (each is also settable via the matching environment variable; when both
+are given the command-line flag wins). "--flag value" and "--flag=value" both
+work:
+  --trigger-label <label>  Label that marks an issue as ready    (default: ready)
+  --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
+  --repo-dir <dir>         Repository to operate in               (default: current git repo)
+  --model <model>          Model passed to copilot --model        (default: unset/auto)
+  --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
+  --quiet                  Do not stream Copilot's output to stdout; write it
+                           only to the per-run log files (the original
+                           behaviour). By default the loop streams Copilot's
+                           output live to stdout as well as the log files.
+  -h, --help               Show this help and exit.
 
-Configuration via environment variables:
-  TRIGGER_LABEL   Label that marks an issue as ready   (default: ready)
-  SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
-  REPO_DIR        Repository to operate in              (default: current git repo)
-  COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
-  QUIET           Same as --quiet when set to 1          (default: 0)
+Environment variables (equivalent to the flags above):
+  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET
 EOF
 }
 
@@ -150,14 +163,42 @@ interruptible_sleep() {
 }
 
 # --- Argument parsing --------------------------------------------------------
+# Flags override the matching environment variables read above. Both
+# "--flag value" and "--flag=value" forms are accepted.
 while [ $# -gt 0 ]; do
   case "$1" in
-    --quiet)   QUIET=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *)         die "unknown argument: $1 (use --help)" ;;
+    --trigger-label)   need_arg $# "$1"; TRIGGER_LABEL="$2"; shift ;;
+    --trigger-label=*) TRIGGER_LABEL="${1#*=}" ;;
+    --sleep-minutes)   need_arg $# "$1"; SLEEP_MINUTES="$2"; shift ;;
+    --sleep-minutes=*) SLEEP_MINUTES="${1#*=}" ;;
+    --repo-dir)        need_arg $# "$1"; REPO_DIR="$2"; shift ;;
+    --repo-dir=*)      REPO_DIR="${1#*=}" ;;
+    --model)           need_arg $# "$1"; COPILOT_MODEL="$2"; shift ;;
+    --model=*)         COPILOT_MODEL="${1#*=}" ;;
+    --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
+    --issues-dir=*)    ISSUES_DIR="${1#*=}" ;;
+    --quiet)           QUIET=1 ;;
+    -h|--help)         usage; exit 0 ;;
+    *)                 die "unknown argument: $1 (use --help)" ;;
   esac
   shift
 done
+
+# --- Apply configuration defaults --------------------------------------------
+# Fill in anything left unset by both the environment and the flags. Done after
+# parsing so a --repo-dir flag feeds the derived paths below.
+# Operate on the current directory's repository by default, not the script's
+# install location (it may be a symlink on PATH). Resolve to the git top-level
+# so running from a subdirectory still targets the whole repo.
+REPO_DIR="${REPO_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
+SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
+QUIET="${QUIET:-0}"
+ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
+
+WORK_DIR="$REPO_DIR/.copilot-loop"
+LOG_DIR="$WORK_DIR/logs"
+LOCK_DIR="$WORK_DIR/lock"
 
 # --- Preflight ---------------------------------------------------------------
 for bin in git gh copilot; do
