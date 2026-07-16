@@ -69,7 +69,12 @@
 #      up to MAX_ATTEMPTS times (re-queuing via the trigger label); once the
 #      attempts are exhausted label it "copilot-failed". A later user reply on a
 #      failed issue resumes it for another attempt.
-#   8. If no issues are found, sleep and repeat. While sleeping, press 'f' to
+#   8. Sweep merged branches: each pass removes any local work branch and worktree
+#      whose PR has merged and, when the repo does not auto-delete on merge,
+#      deletes the merged remote branch too (CLEANUP_MERGED / DELETE_REMOTE_BRANCH).
+#      Only the loop's own branches are touched, never the default branch or a
+#      branch with un-pushed work.
+#   9. If no issues are found, sleep and repeat. While sleeping, press 'f' to
 #      wake immediately and check for work.
 #
 # Requirements: git, gh (authenticated), copilot.
@@ -109,12 +114,18 @@
 #                            review (default: off).
 #   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
 #                            (default: merge).
+#   --cleanup-merged / --no-cleanup-merged
+#                            Sweep merged issue branches and worktrees each pass
+#                            (default: on).
+#   --delete-remote-branch / --no-delete-remote-branch
+#                            Delete a merged issue's remote branch (default: auto,
+#                            on only when the repo does not auto-delete on merge).
 #   -h, --help               Show help and exit.
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
 #   TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
-#   MERGE_METHOD
+#   MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 # (default: 2).
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
@@ -185,6 +196,14 @@ USE_WORKTREES="${USE_WORKTREES:-}"
 AUTO_MERGE="${AUTO_MERGE:-}"
 # Merge method used when AUTO_MERGE is on: merge, squash or rebase.
 MERGE_METHOD="${MERGE_METHOD:-}"
+# Delete the remote head branch of an issue once its PR merges. Empty means
+# auto-detect (on only when the repository does not already delete branches on
+# merge, so we complement GitHub's own cleanup instead of duplicating it); 1/0
+# force it on/off.
+DELETE_REMOTE_BRANCH="${DELETE_REMOTE_BRANCH:-}"
+# Periodically remove local branches, worktrees and remote branches whose PR has
+# merged. On by default; set to 0 (or pass --no-cleanup-merged) to disable.
+CLEANUP_MERGED="${CLEANUP_MERGED:-}"
 
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
@@ -197,6 +216,11 @@ PENDING_LABEL="pending"
 # Marks a PR whose conflicts the loop tried and failed to resolve, so it is not
 # retried forever. Remove it by hand to let the loop try again.
 CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
+
+# Prefix of every work branch the loop creates ("copilot/<num>-<slug>"). Used to
+# recognise the loop's own branches when cleaning up so a sweep never touches the
+# default branch or a branch a human created.
+BRANCH_PREFIX="copilot/"
 
 # Hidden marker appended to comments the loop posts when asking the user a
 # question, so they are easy to recognise in the thread.
@@ -310,12 +334,20 @@ work:
   --no-auto-merge          Leave PRs open for manual review (the default).
   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
                            (default: merge).
+  --cleanup-merged         Sweep merged issue branches and worktrees each pass
+                           (the default).
+  --no-cleanup-merged      Leave merged branches and worktrees in place.
+  --delete-remote-branch   Delete a merged issue's remote branch. Default: auto —
+                           on only when the repository does not already delete
+                           head branches on merge.
+  --no-delete-remote-branch
+                           Never delete remote branches; leave that to GitHub.
   -h, --help               Show this help and exit.
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
   TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
-  MERGE_METHOD
+  MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 (default: 2).
 EOF
@@ -524,6 +556,10 @@ while [ $# -gt 0 ]; do
     --no-auto-merge)   AUTO_MERGE=0 ;;
     --merge-method)    need_arg $# "$1"; MERGE_METHOD="$2"; shift ;;
     --merge-method=*)  MERGE_METHOD="${1#*=}" ;;
+    --delete-remote-branch)    DELETE_REMOTE_BRANCH=1 ;;
+    --no-delete-remote-branch) DELETE_REMOTE_BRANCH=0 ;;
+    --cleanup-merged)          CLEANUP_MERGED=1 ;;
+    --no-cleanup-merged)       CLEANUP_MERGED=0 ;;
     -h|--help)         usage; exit 0 ;;
     *)                 die "unknown argument: $1 (use --help)" ;;
   esac
@@ -573,6 +609,14 @@ MERGE_METHOD="${MERGE_METHOD:-merge}"
 case "$MERGE_METHOD" in
   merge|squash|rebase) ;;
   *) die "invalid --merge-method: $MERGE_METHOD (use merge, squash or rebase)" ;;
+esac
+
+# Periodic cleanup of merged issue branches/worktrees. On unless explicitly
+# disabled; DELETE_REMOTE_BRANCH (auto-detected further below, once gh is known
+# to be available) then decides whether remote branches are removed too.
+case "$CLEANUP_MERGED" in
+  0|false|no|off) CLEANUP_MERGED=0 ;;
+  *)              CLEANUP_MERGED=1 ;;
 esac
 
 # Total attempts (initial + automatic retries) before an issue is marked failed.
@@ -685,6 +729,22 @@ if ! git config --get-all remote.origin.fetch 2>/dev/null | grep -q .; then
     && log "restored missing fetch refspec for origin"
 fi
 
+# Decide whether to delete an issue's remote branch once its PR merges. When not
+# forced with 1/0, auto-detect from the repository: skip it when GitHub already
+# deletes head branches on merge (it cleans up for us) and enable it otherwise,
+# so a repo without that setting no longer accumulates merged branches.
+case "$DELETE_REMOTE_BRANCH" in
+  1|true|yes|on)  DELETE_REMOTE_BRANCH=1 ;;
+  0|false|no|off) DELETE_REMOTE_BRANCH=0 ;;
+  *)
+    if [ "$(gh repo view --json deleteBranchOnMerge --jq '.deleteBranchOnMerge' 2>/dev/null)" = "true" ]; then
+      DELETE_REMOTE_BRANCH=0
+    else
+      DELETE_REMOTE_BRANCH=1
+    fi
+    ;;
+esac
+
 # --- Self-update setup -------------------------------------------------------
 # Decide whether the loop keeps itself current by pulling the default branch and
 # re-execing when this script changed upstream (see self_update, called at the
@@ -764,6 +824,15 @@ if [ "$AUTO_MERGE" = 1 ]; then
   log "auto-merge: on (method=$MERGE_METHOD) — PRs merge without review"
 else
   log "auto-merge: off — PRs are left open for review (pass --auto-merge to enable)"
+fi
+if [ "$CLEANUP_MERGED" = 1 ]; then
+  if [ "$DELETE_REMOTE_BRANCH" = 1 ]; then
+    log "cleanup: on — merged branches and worktrees removed, remote branches deleted"
+  else
+    log "cleanup: on — merged branches and worktrees removed (remote branches left to GitHub)"
+  fi
+else
+  log "cleanup: off — merged branches and worktrees are not swept (pass --cleanup-merged to enable)"
 fi
 
 ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up"
@@ -855,6 +924,151 @@ try_auto_merge() {
   return 0
 }
 
+# --- Core: branch & worktree cleanup ----------------------------------------
+# Once an issue's PR is merged its work branch and worktree are dead weight. The
+# helpers below remove them safely: only ever the loop's own branches
+# ("$BRANCH_PREFIX"*, never the default branch), and never a branch that still
+# has commits which are neither merged into the default branch nor pushed to its
+# own remote branch (so un-pushed work is always preserved).
+#
+# branch_is_ours is pure (string logic only) and, with the rest of this block, is
+# covered by tests/cleanup-branches.test.sh between the markers — keep them intact.
+# >>> cleanup helpers >>>
+# branch_is_ours <branch>
+# True (0) only for a non-empty branch that is one of the loop's own work
+# branches (matches "$BRANCH_PREFIX"*) and is not the default branch. Guards
+# every destructive cleanup so it can never delete main/master or a branch a
+# human created.
+branch_is_ours() {
+  local branch="$1"
+  [ -n "$branch" ] || return 1
+  [ "$branch" != "$DEFAULT_BRANCH" ] || return 1
+  case "$branch" in
+    "$BRANCH_PREFIX"?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _worktree_dir_for_branch <branch>
+# Echo the path of the linked worktree that currently has <branch> checked out,
+# or nothing if none does. Reads `git worktree list` so the worktree is found
+# wherever it lives, not only at the loop's own _worktree_path.
+_worktree_dir_for_branch() {
+  local branch="$1"
+  git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$branch" '
+    /^worktree /  { wt = substr($0, 10) }
+    /^branch /    { if (substr($0, 8) == b) { print wt; exit } }'
+}
+
+# branch_has_unpushed_work <branch> <base-ref>
+# True (0) when <branch> has commits that are neither contained in <base-ref>
+# (merged) nor in its own pushed remote ref (origin/<branch>) — i.e. deleting it
+# would lose un-pushed work. Errs on the side of caution: any failure to tell is
+# treated as "has un-pushed work" so the branch is preserved.
+branch_has_unpushed_work() {
+  local branch="$1" base="$2" n
+  if git rev-parse --verify --quiet "origin/$branch" >/dev/null 2>&1; then
+    n="$(git rev-list --count "$branch" --not "$base" "origin/$branch" 2>/dev/null || echo 1)"
+  else
+    n="$(git rev-list --count "$branch" --not "$base" 2>/dev/null || echo 1)"
+  fi
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  [ "$n" -gt 0 ]
+}
+
+# remove_local_branch <branch>
+# Remove <branch>'s worktree (if any) and delete the local branch. Safe no-op for
+# a branch that is not the loop's own; never checks out the default branch.
+remove_local_branch() {
+  local branch="$1" wt
+  branch_is_ours "$branch" || return 0
+  wt="$(_worktree_dir_for_branch "$branch")"
+  if [ -n "$wt" ]; then
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  fi
+  git worktree prune >/dev/null 2>&1 || true
+  git branch -D "$branch" >/dev/null 2>&1 || true
+}
+
+# delete_remote_branch <branch>
+# Delete <branch> on origin when remote-branch cleanup is enabled. Safe no-op for
+# a foreign/default branch or when the remote branch is already gone.
+delete_remote_branch() {
+  local branch="$1"
+  [ "$DELETE_REMOTE_BRANCH" = 1 ] || return 0
+  branch_is_ours "$branch" || return 0
+  git push origin --delete "$branch" >/dev/null 2>&1 || true
+}
+
+# _branch_is_merged <ref> <base-ref> <merged-list> [name]
+# True (0) when <ref>'s work is merged: <ref> is an ancestor of <base-ref> (the
+# merge-commit method), or its branch <name> appears in <merged-list> (a merged
+# PR, covering squash/rebase merges whose commits are not ancestors of the base).
+# <name> defaults to <ref>.
+_branch_is_merged() {
+  local ref="$1" base="$2" merged_list="$3" name="${4:-$1}"
+  if git merge-base --is-ancestor "$ref" "$base" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '%s\n' "$merged_list" | grep -qxF -- "$name"
+}
+
+# sweep_merged_branches
+# Periodic safety net: remove local branches/worktrees whose PR has merged, and
+# delete the remote branches that linger after a merge. Only ever touches the
+# loop's own branches and never one with un-pushed work. Best effort — every
+# operation is guarded so a hiccup never interrupts the loop. Assumes the current
+# directory is inside the repository (true in the main loop).
+sweep_merged_branches() {
+  [ "$CLEANUP_MERGED" = 1 ] || return 0
+
+  # Refresh remote-tracking refs and drop ones already deleted upstream so the
+  # merge checks below see the true remote state.
+  git fetch --prune origin >/dev/null 2>&1 || true
+
+  local base="origin/${DEFAULT_BRANCH}"
+  git rev-parse --verify --quiet "$base" >/dev/null 2>&1 || base="$DEFAULT_BRANCH"
+
+  # One API call for the set of merged issue-branch names so squash/rebase merges
+  # (whose commits are not ancestors of the base) are recognised too.
+  local merged_prs
+  merged_prs="$(gh pr list --state merged --base "$DEFAULT_BRANCH" --limit 200 \
+                  --json headRefName --jq '.[].headRefName' 2>/dev/null)"
+
+  local removed=0 b
+  # Local branches: remove merged ones together with their worktree.
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    branch_is_ours "$b" || continue
+    _branch_is_merged "$b" "$base" "$merged_prs" || continue
+    if branch_has_unpushed_work "$b" "$base"; then
+      log "cleanup: keeping $b (has un-pushed work)"
+      continue
+    fi
+    remove_local_branch "$b"
+    delete_remote_branch "$b"
+    log "cleanup: removed merged branch $b"
+    removed=$(( removed + 1 ))
+  done < <(git for-each-ref --format='%(refname:short)' "refs/heads/${BRANCH_PREFIX}" 2>/dev/null)
+
+  # Remote branches: delete ones whose PR merged but that still linger on origin
+  # (the local branch was often already removed inline when its PR was opened).
+  if [ "$DELETE_REMOTE_BRANCH" = 1 ]; then
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      branch_is_ours "$b" || continue
+      _branch_is_merged "origin/$b" "$base" "$merged_prs" "$b" || continue
+      delete_remote_branch "$b"
+      log "cleanup: deleted merged remote branch $b"
+      removed=$(( removed + 1 ))
+    done < <(git for-each-ref --format='%(refname:lstrip=3)' "refs/remotes/origin/${BRANCH_PREFIX}" 2>/dev/null)
+  fi
+
+  [ "$removed" -gt 0 ] && log "cleanup: swept $removed merged branch(es)"
+  return 0
+}
+# <<< cleanup helpers <<<
+
 # --- Core: process a single issue -------------------------------------------
 # Returns 0 on success (PR opened), 1 on failure.
 process_issue() {
@@ -871,7 +1085,7 @@ process_issue() {
   slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' \
           | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)"
   [ -n "$slug" ] || slug="issue"
-  branch="copilot/${num}-${slug}"
+  branch="${BRANCH_PREFIX}${num}-${slug}"
   commit_msg="Resolve #${num}: ${title}"
   pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
@@ -1048,6 +1262,13 @@ EOF
     try_auto_merge "$pr_url" "$num" "$log_file"
     gh issue edit "$num" --add-label "$DONE_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
     log "issue #$num: DONE -> $pr_url"
+    # If the PR already merged (auto-merge did an immediate merge) the remote
+    # branch is dead weight; drop it now when configured. PRs that merge later
+    # (GitHub native auto-merge, or a human merge) are handled by the periodic
+    # sweep in the main loop instead.
+    if [ "$(gh pr view "$pr_url" --json state --jq '.state' 2>/dev/null)" = "MERGED" ]; then
+      delete_remote_branch "$branch"
+    fi
     cleanup_workspace "$branch"
     return 0
   fi
@@ -1669,6 +1890,11 @@ while true; do
   self_update
 
   process_issue_files
+
+  # Reclaim disk and keep git tidy: sweep branches and worktrees whose PR has
+  # merged (local and, when enabled, remote). Safe — only the loop's own merged
+  # branches are removed, never the default branch or un-pushed work.
+  sweep_merged_branches
 
   # Before starting any new task, make sure no open PR is left with merge
   # conflicts; claim one atomically if found and re-check before doing anything

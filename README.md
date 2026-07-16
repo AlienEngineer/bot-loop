@@ -54,6 +54,17 @@ worktree so the shared checkout is never touched. Force this on or off with
 There is also an optional terminal UI, [`copilot-loop-tui.sh`](./copilot-loop-tui.sh),
 that spawns, monitors, and stops several loop instances ("bots") side by side.
 
+### Branch and worktree cleanup
+
+Every issue runs on its own branch (`copilot/<n>-<slug>`) and, in worktree mode,
+its own worktree. Once a PR merges these are dead weight, so each pass the loop
+sweeps them: it removes any of its own local branches and worktrees whose PR has
+merged and, when the repository does not delete head branches on merge, deletes
+the merged remote branch too. It never touches the default branch or a branch
+that still has un-pushed work. Turn the sweep off with `--no-cleanup-merged`, and
+control remote-branch deletion with `--delete-remote-branch` /
+`--no-delete-remote-branch` (default: auto).
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
@@ -73,6 +84,8 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Force per-issue worktrees on/off |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | Merge each PR automatically |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge`, `squash`, or `rebase` |
+| `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | Sweep merged branches/worktrees each pass (default: on) |
+| `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | Delete a merged issue's remote branch (default: auto) |
 
 Env-only settings: `MAX_ATTEMPTS` (attempts per issue, default 2) and
 `SELF_UPDATE` (set to `0` to stop the loop pulling and re-execing itself when the
