@@ -23,14 +23,16 @@
 # Configuration (override via environment variables):
 #   TRIGGER_LABEL   Label that marks an issue as ready   (default: ready)
 #   SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
-#   REPO_DIR        Repository to operate in              (default: script dir)
+#   REPO_DIR        Repository to operate in              (default: current git repo)
 #   COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
 #
 set -uo pipefail
 
 # --- Configuration -----------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
+# Operate on the current directory's repository by default, not the script's
+# install location (it may be a symlink on PATH). Resolve to the git top-level
+# so running from a subdirectory still targets the whole repo.
+REPO_DIR="${REPO_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
