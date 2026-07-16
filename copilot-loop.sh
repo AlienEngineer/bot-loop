@@ -230,6 +230,21 @@ ensure_label() {
   gh label create "$name" --color "$color" --description "$desc" >/dev/null 2>&1 || true
 }
 
+# >>> gh-host helpers >>>
+# Echo the hostname embedded in a git remote URL, for both SSH and HTTPS forms:
+#   https://bmw.ghe.com/unit/x.git    -> bmw.ghe.com
+#   git@bmw.ghe.com:unit/x.git        -> bmw.ghe.com
+#   ssh://git@code.connected.bmw/o/r  -> code.connected.bmw
+# Empty output when no host can be parsed. Used to target `gh` calls that do NOT
+# resolve a host from the repo (e.g. `gh api user`) at the host that actually
+# owns this repo, so a machine logged in to several hosts (a personal github.com
+# account plus one or more enterprise hosts) never resolves the wrong account.
+_gh_host_from_url() {
+  printf '%s' "$1" \
+    | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#^[^/@]*@##; s#[/:].*$##'
+}
+# <<< gh-host helpers <<<
+
 # >>> terminal-title helpers >>>
 # Emit the OSC escape that sets a terminal's window/tab title to $1. Pure (writes
 # only the sequence to stdout), so it can be unit tested.
@@ -580,6 +595,28 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository
 git remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote configured"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
 
+# `gh auth status` only proves *some* account is logged in. This machine may be
+# logged in to several hosts at once (a personal github.com account plus one or
+# more enterprise hosts); the account that resolves for THIS repo's host can
+# still lack access, or the repo's host may not be logged in at all — e.g. an
+# origin on an enterprise host, or an SSH host alias gh cannot map to a login.
+# When that happens `gh repo view` fails, yet the loop used to carry on: REPO_SLUG
+# became "unknown" and every `gh issue list` silently returned nothing, so the
+# loop just slept forever and looked "broken". Fail fast instead, naming the
+# host and account so the mismatch is obvious and actionable.
+if ! gh repo view --json nameWithOwner >/dev/null 2>&1; then
+  _pf_url="$(git remote get-url origin 2>/dev/null)"
+  _pf_host="$(_gh_host_from_url "$_pf_url")"
+  log "FATAL: gh cannot access this repository from $REPO_DIR"
+  log "  origin remote: ${_pf_url:-<none>}"
+  log "  repo host:     ${_pf_host:-<unknown>}"
+  log "  gh account:    $(gh api --hostname "${_pf_host:-github.com}" user --jq '.login' 2>/dev/null || echo '<no access on this host>')"
+  log "  The gh account for this host cannot see the repo (wrong account, missing access, or the host is not logged in)."
+  log "  Fix: run 'gh auth status' to list hosts/accounts, then 'gh auth login --hostname ${_pf_host:-HOST}'"
+  log "       (or 'gh auth switch') for an account that can access this repo."
+  exit 1
+fi
+
 mkdir -p "$LOG_DIR"
 
 # Lock file for GitHub operations (issue fetching/claiming).
@@ -632,6 +669,9 @@ trap cleanup EXIT
 trap 'log "interrupted"; exit 130' INT TERM
 
 ORIGIN_URL="$(git remote get-url origin 2>/dev/null)"
+# Host that owns this repo, used to pin repo-independent `gh` calls (below) to
+# the right account when several hosts are logged in.
+GH_HOST_ORIGIN="$(_gh_host_from_url "$ORIGIN_URL")"
 REPO_SLUG="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)"
 [ -n "$REPO_SLUG" ] || REPO_SLUG="unknown"
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)"
@@ -691,13 +731,21 @@ esac
 WORKTREE_BASE="$(dirname "$REPO_DIR")/copilot-loop-worktrees"
 
 # Our own login, used to tell the user's replies apart from the loop's own
-# comments when deciding whether a "needs-info" issue is ready to resume.
-BOT_LOGIN="$(gh api user --jq '.login' 2>/dev/null)"
+# comments when deciding whether a "needs-info" issue is ready to resume. Pin the
+# query to the repo's host so a machine logged in to several hosts reports the
+# identity that actually comments on this repo (github.com's `gh api user` would
+# otherwise be returned for an enterprise repo, breaking reply detection).
+if [ -n "$GH_HOST_ORIGIN" ]; then
+  BOT_LOGIN="$(gh api --hostname "$GH_HOST_ORIGIN" user --jq '.login' 2>/dev/null)"
+else
+  BOT_LOGIN="$(gh api user --jq '.login' 2>/dev/null)"
+fi
 [ -n "$BOT_LOGIN" ] || log "WARNING: could not determine gh login; reply detection disabled"
 
 log "starting copilot-loop"
 log "============================================================"
 log "  GitHub repo: $REPO_SLUG"
+log "  gh account:  ${BOT_LOGIN:-<unknown>} @ ${GH_HOST_ORIGIN:-github.com}"
 log "  origin url:  $ORIGIN_URL"
 log "  local dir:   $REPO_DIR"
 log "============================================================"

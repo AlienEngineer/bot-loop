@@ -16,7 +16,7 @@ so bots never work on the same issue.
 ## Requirements
 
 - `git`
-- `gh` — the GitHub CLI, authenticated (`gh auth login`)
+- `gh` — the GitHub CLI, authenticated (`gh auth login`) for the host **and account** that can access the repo you point it at. If the repo lives on a GitHub Enterprise host, log in to that host too: `gh auth login --hostname your.enterprise.host`.
 - `copilot` — the GitHub Copilot CLI
 
 ## Quick start
@@ -115,6 +115,30 @@ Each issue moves through these labels:
 | `needs-info` | Copilot asked a question; waiting for a human reply. A reply resumes the issue. |
 | `copilot-done` | Resolved successfully and a PR was opened. |
 | `copilot-failed` | Failed after `MAX_ATTEMPTS` attempts. A later human reply resumes it for another attempt. |
+
+## Troubleshooting
+
+**The loop starts but never picks up any issues (just keeps logging "no ready
+issues; sleeping").** This almost always means `gh` is not authenticated for the
+account or host that owns the target repo. `gh auth status` passing is not
+enough — this machine may be logged in to several hosts at once (e.g. a personal
+`github.com` account plus one or more enterprise hosts), and the account that
+resolves for the repo's host may have no access, or the repo's host may not be
+logged in at all (for example when `origin` points at a GitHub Enterprise host
+or an SSH host alias).
+
+The loop now verifies this at startup: if `gh` cannot see the repo it exits
+immediately with a `FATAL: gh cannot access this repository` message that names
+the origin host and the account in use. To fix it:
+
+```sh
+gh auth status                               # list the hosts/accounts you are logged in to
+gh auth login --hostname your.enterprise.host   # log in to the repo's host, or
+gh auth switch                               # switch to an account that can access it
+```
+
+The startup banner also prints the resolved `gh account:  <login> @ <host>`, so
+you can confirm the loop is acting as the expected account on the expected host.
 
 ## Running the tests
 
