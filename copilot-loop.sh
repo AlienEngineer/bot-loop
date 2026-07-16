@@ -26,7 +26,8 @@
 #   6b. Otherwise commit, sync the branch with the latest default branch, then
 #       push and open a PR that closes the issue.
 #   7. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
-#   8. If no issues are found, sleep and repeat.
+#   8. If no issues are found, sleep and repeat. While sleeping, press 'f' to
+#      wake immediately and check for work.
 #
 # Requirements: git, gh (authenticated), copilot.
 #
@@ -126,6 +127,26 @@ run_copilot() {
     copilot "$@" 2>&1 | tee -a "$log_file"
     COPILOT_RC="${PIPESTATUS[0]}"
   fi
+}
+
+# Sleep for the given number of seconds, but wake early if the user presses
+# 'f'. Returns 0 if the full time elapsed, 1 if the user asked to start now.
+# Falls back to a plain sleep when stdin is not a terminal (e.g. detached or
+# piped), where keypresses cannot be read.
+interruptible_sleep() {
+  local seconds="$1"
+  if [ ! -t 0 ]; then
+    sleep "$seconds"
+    return 0
+  fi
+  local key
+  local end=$(( $(date +%s) + seconds ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if read -rsn1 -t 1 key && [ "$key" = "f" ]; then
+      return 1
+    fi
+  done
+  return 0
 }
 
 # --- Argument parsing --------------------------------------------------------
@@ -620,8 +641,14 @@ while true; do
                   --limit 1000 --json number --jq 'min_by(.number).number // empty' 2>/dev/null)"
 
   if [ -z "$next_issue" ]; then
-    log "no ready issues; sleeping ${SLEEP_MINUTES}m"
-    sleep "$((SLEEP_MINUTES * 60))"
+    if [ -t 0 ]; then
+      log "no ready issues; sleeping ${SLEEP_MINUTES}m (press 'f' to start now)"
+    else
+      log "no ready issues; sleeping ${SLEEP_MINUTES}m"
+    fi
+    if ! interruptible_sleep "$((SLEEP_MINUTES * 60))"; then
+      log "'f' pressed; waking to look for work"
+    fi
     continue
   fi
 
