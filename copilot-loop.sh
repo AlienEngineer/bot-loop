@@ -30,8 +30,9 @@
 #      for merge conflicts. If one is found, merge the base branch into it and
 #      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
 #   2. Pick the next issue to work on (protected by GitHub lock):
-#        a. an issue awaiting a reply ("needs-info") whose latest comment came
-#           from a human (the user answered a question) -> resume it; else
+#        a. an issue awaiting a reply ("needs-info") or a failed issue
+#           ("copilot-failed") whose latest comment came from a human (the user
+#           answered a question or gave more guidance) -> resume it; else
 #        b. the oldest open issue with the trigger label (default: "ready").
 #   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
 #      (done atomically by the claiming functions to prevent race conditions).
@@ -43,7 +44,10 @@
 #       the user to reply (no PR opened, not counted as a failure).
 #   6b. Otherwise commit, sync the branch with the latest default branch, then
 #       push and open a PR that closes the issue.
-#   7. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
+#   7. On success label the issue "copilot-done". On failure retry automatically
+#      up to MAX_ATTEMPTS times (re-queuing via the trigger label); once the
+#      attempts are exhausted label it "copilot-failed". A later user reply on a
+#      failed issue resumes it for another attempt.
 #   8. If no issues are found, sleep and repeat. While sleeping, press 'f' to
 #      wake immediately and check for work.
 #
@@ -67,6 +71,8 @@
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET
+# Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
+# (default: 2).
 #
 set -uo pipefail
 
@@ -96,6 +102,10 @@ CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
 # Hidden marker appended to comments the loop posts when asking the user a
 # question, so they are easy to recognise in the thread.
 QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
+
+# Hidden marker on every failure comment so the loop can count how many times an
+# issue has already failed and cap the automatic retries at MAX_ATTEMPTS.
+FAILURE_MARKER="<!-- copilot-loop:failed -->"
 
 # --- Helpers -----------------------------------------------------------------
 log() {
@@ -143,6 +153,8 @@ work:
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET
+Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
+(default: 2).
 EOF
 }
 
@@ -213,6 +225,13 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 QUIET="${QUIET:-0}"
 ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
+
+# Total attempts (initial + automatic retries) before an issue is marked failed.
+# Env-only (no flag). Normalise to a positive integer so a bad override can never
+# disable the cap.
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
+case "$MAX_ATTEMPTS" in ''|*[!0-9]*) MAX_ATTEMPTS=2 ;; esac
+[ "$MAX_ATTEMPTS" -ge 1 ] || MAX_ATTEMPTS=1
 
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
@@ -317,9 +336,10 @@ process_issue() {
 
   log "issue #$num on $REPO_SLUG: $title"
 
-  # Note: Issue has already been claimed (in-progress label added, trigger label removed)
-  # by the atomic claim_next_ready_issue() or claim_next_reply_issue() function in the
-  # main loop. We don't re-claim here to avoid redundant API calls.
+  # Note: the issue has already been claimed atomically under the GitHub lock by
+  # claim_next_ready_issue() / claim_next_reply_issue() in the main loop
+  # (in-progress added; the trigger, needs-info, or copilot-failed label
+  # removed). We don't re-claim here to avoid redundant API calls.
 
   # Start from a clean, up-to-date default branch. Drop any leftover changes
   # from a previous run so nothing blocks the switch or update.
@@ -441,23 +461,48 @@ EOF
   return 1
 }
 
-# Mark an issue failed, comment with the error details (or a log tail as a
-# fallback), and clean up the branch.
+# Count how many times this issue has already failed, by counting the hidden
+# FAILURE_MARKER stamped on each failure comment. Always echoes a number.
+_count_failures() {
+  local num="$1" n
+  n="$(gh issue view "$num" --json comments \
+        --jq '[.comments[] | select(.body != null and (.body | contains("'"$FAILURE_MARKER"'")))] | length' 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# Handle a failed issue: comment with the error details (or a log tail as a
+# fallback) and clean up the branch. While under the MAX_ATTEMPTS cap the issue
+# is re-queued (trigger label re-added) for another automatic try; once the
+# attempts are exhausted it is marked "copilot-failed". A later user reply
+# resumes such an issue for a fresh attempt (see next_reply_issue).
 _fail_issue() {
   local num="$1" log_file="$2" reason="$3" details="${4:-}"
-  log "issue #$num: FAILED - $reason"
   # Prefer explicit details (the exact failing command's output) over the raw
   # log tail, which is mostly Copilot chatter and buries the real cause.
-  local block
+  local block prior attempts note
   if [ -n "$details" ]; then
     block="$details"
   else
     block="$(tail -n 20 "$log_file" 2>/dev/null)"
   fi
+
+  # This failure is attempt N; each earlier failure left a FAILURE_MARKER.
+  prior="$(_count_failures "$num")"
+  attempts=$(( prior + 1 ))
+  if [ "$attempts" -lt "$MAX_ATTEMPTS" ]; then note="will retry"; else note="giving up"; fi
+  log "issue #$num: FAILED (attempt $attempts/$MAX_ATTEMPTS, $note) - $reason"
+
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
-  gh issue comment "$num" --body "$(printf 'copilot-loop failed: %s\n\n```\n%s\n```' \
-    "$reason" "$block")" >/dev/null 2>&1 || true
-  gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
+  gh issue comment "$num" --body "$(printf 'copilot-loop failed (attempt %d/%d, %s): %s\n\n```\n%s\n```\n\n%s' \
+    "$attempts" "$MAX_ATTEMPTS" "$note" "$reason" "$block" "$FAILURE_MARKER")" >/dev/null 2>&1 || true
+
+  if [ "$attempts" -lt "$MAX_ATTEMPTS" ]; then
+    # Hand the issue back to the queue for another automatic attempt.
+    gh issue edit "$num" --add-label "$TRIGGER_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
+  else
+    gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
+  fi
   git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
   git branch -D "$branch" >/dev/null 2>&1 || true
 }
@@ -591,16 +636,22 @@ claim_next_ready_issue() {
 }
 
 # Atomically find and claim the next reply issue, protected by GitHub lock.
-# Returns the issue number on success, empty string if none available.
+# Handles both "needs-info" (a pending question) and "copilot-failed" (retries
+# exhausted) issues whose latest comment came from a human. Returns the issue
+# number on success, empty string if none available.
 claim_next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   
   local nums n last_author issue=""
   acquire_github_lock || return 1
   
-  # Sorted ascending so oldest replied issue resumes first.
-  nums="$(gh issue list --state open --label "$NEEDS_INFO_LABEL" \
-           --limit 1000 --json number --jq 'sort_by(.number)[].number' 2>/dev/null)"
+  # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
+  # Sorted ascending (by number == creation order) so oldest replied issue first.
+  nums="$( { gh issue list --state open --label "$NEEDS_INFO_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$FAILED_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
+           | sort -n -u )"
   for n in $nums; do
     last_author="$(gh issue view "$n" --json comments \
                     --jq '.comments[-1].author.login // empty' 2>/dev/null)"
@@ -609,6 +660,7 @@ claim_next_reply_issue() {
       issue="$n"
       gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
       gh issue edit "$issue" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
+      gh issue edit "$issue" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
       break
     fi
   done
@@ -618,18 +670,23 @@ claim_next_reply_issue() {
   [ -n "$issue" ]
 }
 
-# Echo the number of an issue that is waiting on the user ("needs-info") and has
-# since received a reply — i.e. its most recent comment was written by someone
-# other than this bot. Returns 1 (no output) when there is nothing to resume.
+# Echo the number of an issue that is waiting on the user — either "needs-info"
+# (a pending question) or "copilot-failed" (retries exhausted) — and has since
+# received a reply, i.e. its most recent comment was written by someone other
+# than this bot. Oldest first. Returns 1 (no output) when nothing to resume.
 # NOTE: This function is now used only for display/checking; actual claiming is
 # done atomically by claim_next_reply_issue().
 next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   local nums n last_author
+  # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
   # Sorted ascending (by number == creation order) so the oldest replied issue
   # resumes first. High --limit avoids dropping old issues to gh's default cap.
-  nums="$(gh issue list --state open --label "$NEEDS_INFO_LABEL" \
-            --limit 1000 --json number --jq 'sort_by(.number)[].number' 2>/dev/null)"
+  nums="$( { gh issue list --state open --label "$NEEDS_INFO_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$FAILED_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
+           | sort -n -u )"
   for n in $nums; do
     last_author="$(gh issue view "$n" --json comments \
                     --jq '.comments[-1].author.login // empty' 2>/dev/null)"
