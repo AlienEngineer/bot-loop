@@ -42,6 +42,7 @@ assert_eq "inline sentence"         "$(issue_wait_for 'This one must wait for #1
 
 # --- issue_open_blockers: gate against open dependencies ---------------------
 # Mock gh: `gh issue view <n> --json state --jq '.state'` -> state by number.
+# shellcheck disable=SC2329  # invoked indirectly by the eval'd helpers
 gh() {
   local n="$3"
   case "$n" in
