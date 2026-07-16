@@ -198,6 +198,28 @@ ensure_label() {
   gh label create "$name" --color "$color" --description "$desc" >/dev/null 2>&1 || true
 }
 
+# >>> terminal-title helpers >>>
+# Emit the OSC escape that sets a terminal's window/tab title to $1. Pure (writes
+# only the sequence to stdout), so it can be unit tested.
+terminal_title_seq() {
+  printf '\033]0;%s\007' "$1"
+}
+
+# Make the branch being worked on visible on the terminal tab/window title.
+# Inside tmux, rename the current window (shown as a tab on the status line);
+# otherwise emit an OSC escape to the attached terminal. Best-effort: only
+# touches a real terminal (stdout is a TTY) and never fails the caller.
+set_terminal_title() {
+  local title="$1"
+  if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    tmux rename-window "$title" 2>/dev/null || true
+    return 0
+  fi
+  [ -t 1 ] || return 0
+  terminal_title_seq "$title"
+}
+# <<< terminal-title helpers <<<
+
 usage() {
   cat <<'EOF'
 Usage: ./copilot-loop.sh [options]
@@ -659,6 +681,11 @@ process_issue() {
     _fail_issue "$num" "$log_file" "could not create work branch $branch"
     return 1
   fi
+
+  # Surface the freshly created branch before Copilot starts: log it and set the
+  # terminal tab/window title (and tmux window name) to the branch name.
+  log "issue #$num: working on branch $branch"
+  set_terminal_title "$branch"
 
   # Build the prompt for Copilot. Include the existing comment thread so any
   # earlier question/answer exchange is available as context.
@@ -1138,6 +1165,10 @@ resolve_pr_conflicts() {
     _fail_pr "$num" "$log_file" "could not check out PR head branch '$head'"
     return 1
   fi
+
+  # Surface the PR branch on the terminal tab/window title before Copilot starts.
+  log "PR #$num: working on branch $head"
+  set_terminal_title "$head"
 
   # Merge the base branch. A clean merge means the conflict was already resolved
   # upstream; otherwise git leaves conflict markers for Copilot to fix.
