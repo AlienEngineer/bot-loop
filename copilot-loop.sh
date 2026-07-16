@@ -150,9 +150,20 @@ process_issue() {
   gh issue edit "$num" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
   gh issue edit "$num" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
 
-  # Start from a clean, up-to-date default branch.
+  # Start from a clean, up-to-date default branch. Drop any leftover changes
+  # from a previous run so nothing blocks the switch or update.
+  git reset --hard >/dev/null 2>&1 || true
+  git clean -fd >/dev/null 2>&1 || true
   git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
-  git pull --ff-only origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+  # Pull the latest changes and resolve any conflicts. The local default branch
+  # is a throwaway mirror (all work happens on copilot/* branches), so if it has
+  # drifted and cannot fast-forward we hard-reset onto the remote rather than
+  # silently working from a stale tree.
+  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+  if ! git merge --ff-only "origin/${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+    git reset --hard "origin/${DEFAULT_BRANCH}" >/dev/null 2>&1 \
+      || git reset --hard FETCH_HEAD >/dev/null 2>&1 || true
+  fi
   # Fresh branch (reset if a stale one lingers from a previous failed run).
   git switch -c "$branch" >/dev/null 2>&1 || git switch -C "$branch" >/dev/null 2>&1
 
