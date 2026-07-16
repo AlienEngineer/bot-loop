@@ -7,6 +7,9 @@
 # available it sleeps and checks again.
 #
 # Flow per iteration:
+#   0. Before starting any new task, check open PRs targeting the default branch
+#      for merge conflicts. If one is found, merge the base branch into it and
+#      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
 #   1. Pick the next issue to work on:
 #        a. an issue awaiting a reply ("needs-info") whose latest comment came
 #           from a human (the user answered a question) -> resume it; else
@@ -49,6 +52,9 @@ INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
 FAILED_LABEL="copilot-failed"
 NEEDS_INFO_LABEL="needs-info"
+# Marks a PR whose conflicts the loop tried and failed to resolve, so it is not
+# retried forever. Remove it by hand to let the loop try again.
+CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
 
 # Hidden marker appended to comments the loop posts when asking the user a
 # question, so they are easy to recognise in the thread.
@@ -120,6 +126,7 @@ ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot
 ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the copilot loop"
 ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce changes"
 ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
+ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The copilot loop could not resolve this PR's merge conflicts"
 
 # --- Core: process a single issue -------------------------------------------
 # Returns 0 on success (PR opened), 1 on failure.
@@ -257,6 +264,23 @@ _fail_issue() {
   git branch -D "$branch" >/dev/null 2>&1 || true
 }
 
+# Mark a PR conflict-resolution attempt failed: comment a log tail, label the PR
+# so it is not retried forever, and restore a clean working tree on the default
+# branch.
+_fail_pr() {
+  local num="$1" log_file="$2" reason="$3" tail_out
+  log "PR #$num: FAILED to resolve conflicts - $reason"
+  tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
+  # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
+  gh pr comment "$num" --body "$(printf 'copilot-loop could not resolve merge conflicts: %s\n\n```\n%s\n```' \
+    "$reason" "$tail_out")" >/dev/null 2>&1 || true
+  gh pr edit "$num" --add-label "$CONFLICT_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
+  git merge --abort >/dev/null 2>&1 || true
+  git reset --hard >/dev/null 2>&1
+  git clean -fd >/dev/null 2>&1
+  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
+}
+
 # Copilot needs more information: post its question to the issue, mark it
 # "needs-info", and leave it for the user to answer. Discards any work in
 # progress so the branch is clean for the eventual resume.
@@ -297,8 +321,119 @@ next_reply_issue() {
   return 1
 }
 
+# --- Core: resolve merge conflicts on a single PR ---------------------------
+# Merges the PR's base branch into its head branch; if that conflicts, hands the
+# conflicted files to Copilot to resolve, then commits and pushes so the PR
+# becomes mergeable again. Returns 0 on success, 1 on failure.
+resolve_pr_conflicts() {
+  local num="$1"
+  local head base title log_file conflicts copilot_rc
+
+  head="$(gh pr view "$num" --json headRefName --jq '.headRefName' 2>/dev/null)"
+  base="$(gh pr view "$num" --json baseRefName --jq '.baseRefName' 2>/dev/null)"
+  title="$(gh pr view "$num" --json title --jq '.title' 2>/dev/null)"
+  [ -n "$base" ] || base="$DEFAULT_BRANCH"
+  log_file="$LOG_DIR/pr-${num}-$(date '+%Y%m%d-%H%M%S').log"
+
+  if [ -z "$head" ]; then
+    log "PR #$num: could not determine head branch, skipping"
+    gh pr edit "$num" --add-label "$CONFLICT_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  log "PR #$num has conflicts with $base: $title"
+
+  # Get an up-to-date view of both branches and check out the PR head fresh.
+  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
+  git fetch origin >>"$log_file" 2>&1 || true
+  if ! git switch -C "$head" "origin/$head" >>"$log_file" 2>&1; then
+    _fail_pr "$num" "$log_file" "could not check out PR head branch '$head'"
+    return 1
+  fi
+
+  # Merge the base branch. A clean merge means the conflict was already resolved
+  # upstream; otherwise git leaves conflict markers for Copilot to fix.
+  if git merge --no-edit "origin/$base" >>"$log_file" 2>&1; then
+    log "PR #$num: merged $base with no conflicts to resolve"
+  else
+    conflicts="$(git diff --name-only --diff-filter=U 2>/dev/null)"
+    log "PR #$num: resolving conflicts in: $(printf '%s' "$conflicts" | tr '\n' ' ')"
+
+    local prompt
+    prompt="$(cat <<EOF
+You are working in a git repository. Merging branch "${base}" into branch
+"${head}" (pull request #${num}) produced conflicts that must be resolved.
+
+These files contain git conflict markers (<<<<<<<, =======, >>>>>>>):
+${conflicts}
+
+Resolve every conflict so the result is correct and preserves the intent of both
+branches, then remove all conflict markers. Run any build or test commands needed
+to verify your work. Do NOT run git commit, git merge, git push, or create
+branches — those steps are handled automatically outside this session. Only edit
+files to resolve the conflicts and verify.
+EOF
+)"
+    local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+    [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+
+    log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
+    copilot "${copilot_args[@]}" >>"$log_file" 2>&1
+    copilot_rc=$?
+    log "PR #$num: copilot exited with code $copilot_rc"
+
+    # Bail out if Copilot left conflict markers behind in any conflicted file.
+    local f unresolved=""
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ -f "$f" ] && grep -qE '^(<{7}|>{7})' "$f" && unresolved="$unresolved $f"
+    done <<< "$conflicts"
+    if [ -n "$unresolved" ]; then
+      _fail_pr "$num" "$log_file" "conflict markers still present in:$unresolved"
+      return 1
+    fi
+
+    git add -A
+    git commit --no-edit >/dev/null 2>&1 \
+      || git commit -m "Merge $base into $head to resolve conflicts (#$num)" >/dev/null 2>&1
+  fi
+
+  if ! git push origin "HEAD:$head" >>"$log_file" 2>&1; then
+    _fail_pr "$num" "$log_file" "git push failed"
+    return 1
+  fi
+
+  gh pr comment "$num" \
+    --body "copilot-loop resolved the merge conflicts with \`$base\`." >/dev/null 2>&1 || true
+  log "PR #$num: conflicts resolved and pushed"
+  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
+  git branch -D "$head" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Echo the number of the lowest-numbered open PR targeting the default branch
+# whose merge is CONFLICTING, skipping any already marked unresolved. Returns 1
+# (no output) when no PR needs conflict resolution.
+next_conflicted_pr() {
+  local jq_filter
+  jq_filter='[.[] | select(.mergeable == "CONFLICTING")'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$CONFLICT_UNRESOLVED_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | .number] | sort | .[0] // empty'
+  gh pr list --state open --base "$DEFAULT_BRANCH" \
+    --json number,mergeable,labels --jq "$jq_filter" 2>/dev/null
+}
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  # Before starting any new task, make sure no open PR is left with merge
+  # conflicts; resolve one if found and re-check before doing anything else.
+  conflicted_pr="$(next_conflicted_pr || true)"
+  if [ -n "$conflicted_pr" ]; then
+    log "PR #$conflicted_pr has conflicts, resolving before starting new tasks"
+    resolve_pr_conflicts "$conflicted_pr" || true
+    continue
+  fi
+
   # Prefer resuming an issue where the user has answered a pending question.
   next_issue="$(next_reply_issue || true)"
   if [ -n "$next_issue" ]; then
