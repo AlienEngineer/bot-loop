@@ -7,27 +7,26 @@
 # available it sleeps and checks again.
 #
 # Flow per iteration:
-#   0. Turn any markdown files in issues/ into GitHub issues (labelled ready).
-#   1. Find the oldest open issue with the trigger label (default: "ready").
-#   2. Claim it: remove trigger label, add "in-progress" (prevents re-pickup).
-#   0. Before starting any new task, check open PRs targeting the default branch
+#   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
+#      trigger label) so file-based tasks enter the queue below.
+#   1. Before starting any new task, check open PRs targeting the default branch
 #      for merge conflicts. If one is found, merge the base branch into it and
 #      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
-#   1. Pick the next issue to work on:
+#   2. Pick the next issue to work on:
 #        a. an issue awaiting a reply ("needs-info") whose latest comment came
 #           from a human (the user answered a question) -> resume it; else
 #        b. the oldest open issue with the trigger label (default: "ready").
-#   2. Claim it: add "in-progress", remove the trigger/"needs-info" labels.
-#   3. Create a fresh branch off the default branch.
-#   4. Run `copilot -p` (all tools, file access restricted to this repo),
+#   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels.
+#   4. Create a fresh branch off the default branch.
+#   5. Run `copilot -p` (all tools, file access restricted to this repo),
 #      passing the issue's comment thread so any prior Q&A is available.
-#   5a. If Copilot needs more information it writes a question file; post the
+#   6a. If Copilot needs more information it writes a question file; post the
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
-#   5b. Otherwise commit, sync the branch with the latest default branch, then
+#   6b. Otherwise commit, sync the branch with the latest default branch, then
 #       push and open a PR that closes the issue.
-#   6. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
-#   7. If no issues are found, sleep and repeat.
+#   7. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
+#   8. If no issues are found, sleep and repeat.
 #
 # Requirements: git, gh (authenticated), copilot.
 #
@@ -401,6 +400,8 @@ EOF
       log "issue files: FAILED to create issue for \"$title\" (kept $(basename "$pushing"))"
     fi
   done
+}
+
 # Mark a PR conflict-resolution attempt failed: comment a log tail, label the PR
 # so it is not retried forever, and restore a clean working tree on the default
 # branch.
