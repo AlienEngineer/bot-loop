@@ -49,7 +49,11 @@
 #      the repo is used with git worktrees each issue runs in its own worktree so
 #      the shared checkout is left untouched.
 #   5. Run `copilot -p` (all tools, file access restricted to this repo),
-#      passing the issue's comment thread so any prior Q&A is available.
+#      passing the issue's comment thread so any prior Q&A is available. When
+#      triage is enabled (TRIAGE_MODEL) the issue is first classified by that
+#      cheap model as trivial/normal/complex and the coding model is picked from
+#      TRIAGE_MAP, so cheap issues run on a cheap model; any failure falls back
+#      to the global COPILOT_MODEL.
 #   6a. If Copilot needs more information it writes a question file; post the
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
@@ -82,6 +86,16 @@
 #   --commit-model <model>   Model used to write the commit message from the
 #                            staged diff; unset/"off" uses a deterministic
 #                            "Resolve #<n>: <title>" message        (default: off)
+#   --triage-model <model>   Cheap model that classifies each issue as
+#                            trivial/normal/complex before coding, so the coding
+#                            model can be chosen per difficulty; unset/"off"
+#                            disables triage (current behaviour)     (default: off)
+#   --triage-map <map>       class=model pairs (comma-separated) mapping a triage
+#                            class to the coding model, e.g.
+#                            "trivial=gpt-5-mini,complex=claude-opus-4.5"; an
+#                            unmapped class falls back to --model. Defaults to
+#                            "trivial=<triage-model>" when triage is on and this
+#                            is unset                                (default: unset)
 #   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
 #   --quiet                  Do not stream Copilot's output to stdout; write it
 #                            only to the per-run log files (the original
@@ -99,7 +113,8 @@
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
-#   ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
+#   TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
+#   MERGE_METHOD
 # Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 # (default: 2).
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
@@ -142,6 +157,17 @@ COPILOT_MODEL="${COPILOT_MODEL:-}"
 # gpt-5-mini to have the message written from the diff, or "off" to force the
 # deterministic fallback.
 COMMIT_MODEL="${COMMIT_MODEL:-}"
+# Optional cheap model used to CLASSIFY each issue as trivial/normal/complex
+# before coding, so the expensive coding model is reserved for hard issues (the
+# COMMIT_MODEL idea applied to routing). Empty/"off" disables triage and every
+# issue runs on COPILOT_MODEL exactly as before.
+TRIAGE_MODEL="${TRIAGE_MODEL:-}"
+# Maps a difficulty class to the coding model, as comma-separated "class=model"
+# pairs, e.g. "trivial=gpt-5-mini,complex=claude-opus-4.5". A class with no entry
+# (or an empty value) falls back to COPILOT_MODEL. When triage is enabled but
+# this is unset it defaults to routing trivial issues to TRIAGE_MODEL so turning
+# triage on lowers cost with zero extra configuration.
+TRIAGE_MAP="${TRIAGE_MAP:-}"
 ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
@@ -242,6 +268,16 @@ work:
   --commit-model <model>   Model used to write the commit message from the
                            staged diff; unset/"off" uses a deterministic
                            "Resolve #<n>: <title>" message         (default: off)
+  --triage-model <model>   Cheap model that classifies each issue as
+                           trivial/normal/complex before coding so the coding
+                           model can be chosen per difficulty; unset/"off"
+                           disables triage (current behaviour)      (default: off)
+  --triage-map <map>       Comma-separated class=model pairs mapping a triage
+                           class to the coding model, e.g.
+                           "trivial=gpt-5-mini,complex=claude-opus-4.5". An
+                           unmapped class falls back to --model; defaults to
+                           "trivial=<triage-model>" when triage is on and this is
+                           unset                                    (default: unset)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
   --quiet                  Do not stream Copilot's output to stdout; write it
                            only to the per-run log files (the original
@@ -263,7 +299,8 @@ work:
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
-  ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
+  TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
+  MERGE_METHOD
 Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 (default: 2).
 EOF
@@ -339,6 +376,91 @@ EOF
   fi
 }
 
+# --- Triage: pick the coding model per issue difficulty ----------------------
+# normalize_triage_class and parse_triage_map are pure and covered by
+# tests/triage.test.sh (extracted between the markers), so keep the marker
+# comments intact.
+# >>> triage helpers >>>
+# Normalize a raw difficulty answer (possibly multi-word, mixed case, punctuated,
+# or using a synonym) to one canonical class: trivial, normal, or complex. Echoes
+# the class, or nothing when no known keyword is present so the caller can fall
+# back to the default model.
+normalize_triage_class() {
+  local raw="$1" word
+  word="$(printf '%s' "$raw" \
+          | tr '[:upper:]' '[:lower:]' \
+          | grep -oE 'trivial|simple|easy|complex|complicated|hard|difficult|normal|medium|moderate|standard' \
+          | head -n1)"
+  case "$word" in
+    trivial|simple|easy)                printf 'trivial\n' ;;
+    complex|complicated|hard|difficult) printf 'complex\n' ;;
+    normal|medium|moderate|standard)    printf 'normal\n' ;;
+    *)                                  return 0 ;;
+  esac
+}
+
+# Look up the coding model for a difficulty class in a TRIAGE_MAP string of
+# comma-separated "class=model" pairs (e.g. "trivial=gpt-5-mini, complex=o1").
+# Class keys match case-insensitively; the model value is echoed verbatim (model
+# ids are case-sensitive) with surrounding whitespace trimmed. The first entry
+# for a class wins. Echoes nothing when the class is absent or its value is
+# empty, so the caller falls back to the global default model.
+# Usage: parse_triage_map <map> <class>
+parse_triage_map() {
+  local map="$1" class="$2" lc_class pair key val
+  lc_class="$(printf '%s' "$class" | tr '[:upper:]' '[:lower:]')"
+  while IFS= read -r pair; do
+    case "$pair" in *=*) ;; *) continue ;; esac
+    key="$(printf '%s' "${pair%%=*}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    val="$(printf '%s' "${pair#*=}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    if [ "$key" = "$lc_class" ]; then
+      [ -n "$val" ] && printf '%s\n' "$val"
+      return 0
+    fi
+  done < <(printf '%s\n' "$map" | tr ',' '\n')
+  return 0
+}
+# <<< triage helpers <<<
+
+# Classify an issue's difficulty with the cheap TRIAGE_MODEL so the coding model
+# can be chosen per difficulty (see parse_triage_map / TRIAGE_MAP). Echoes one
+# normalized class (trivial|normal|complex) on success, or nothing when triage is
+# disabled, the model is unavailable, times out, or its answer is unrecognised --
+# the caller then falls back to the global model. Only the issue text is sent (no
+# repo access needed) and the call is time-boxed, so triage can never block or
+# fail the loop. Never returns non-zero.
+triage_issue() {
+  local num="$1" title="$2" body="$3" log_file="${4:-/dev/null}"
+  local prompt raw class capped
+
+  [ -n "$TRIAGE_MODEL" ] || return 0
+
+  # Cap the body so a huge issue cannot blow up the triage prompt or its cost;
+  # the difficulty is clear from the opening description.
+  capped="$(printf '%s' "$body" | head -c 4000)"
+
+  prompt="$(cat <<EOF
+Classify the difficulty of this software task for an autonomous coding agent.
+Answer with ONE word only, no punctuation or explanation, exactly one of:
+  trivial - a tiny, low-risk change (typo, doc tweak, one-line or config fix)
+  normal  - an average change with clear scope touching a few files
+  complex - a large, ambiguous, or cross-cutting change needing careful design
+
+Issue #${num}: ${title}
+
+${capped}
+EOF
+)"
+
+  # Cheapest model, no color/logs; time-boxed. Append provider noise to the log
+  # for debugging but keep stdout to just the class. Fall back on any failure.
+  raw="$(_run_with_timeout 60 copilot -p "$prompt" \
+           --model "$TRIAGE_MODEL" --allow-all-tools --no-color --log-level none 2>>"$log_file")"
+  class="$(normalize_triage_class "$raw")"
+  [ -n "$class" ] && printf '%s' "$class"
+  return 0
+}
+
 # Sleep for the given number of seconds, but wake early if the user presses
 # 'f'. Returns 0 if the full time elapsed, 1 if the user asked to start now.
 # Falls back to a plain sleep when stdin is not a terminal (e.g. detached or
@@ -374,6 +496,10 @@ while [ $# -gt 0 ]; do
     --model=*)         COPILOT_MODEL="${1#*=}" ;;
     --commit-model)    need_arg $# "$1"; COMMIT_MODEL="$2"; shift ;;
     --commit-model=*)  COMMIT_MODEL="${1#*=}" ;;
+    --triage-model)    need_arg $# "$1"; TRIAGE_MODEL="$2"; shift ;;
+    --triage-model=*)  TRIAGE_MODEL="${1#*=}" ;;
+    --triage-map)      need_arg $# "$1"; TRIAGE_MAP="$2"; shift ;;
+    --triage-map=*)    TRIAGE_MAP="${1#*=}" ;;
     --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
     --issues-dir=*)    ISSUES_DIR="${1#*=}" ;;
     --quiet)           QUIET=1 ;;
@@ -407,6 +533,18 @@ ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
 # message.
 COMMIT_MODEL="${COMMIT_MODEL:-}"
 case "$COMMIT_MODEL" in off|none|0) COMMIT_MODEL="" ;; esac
+
+# Triage: a cheap model classifies each issue and a class->model map routes the
+# coding model per difficulty. "off"/"none"/"0" disables triage (current
+# behaviour). When triage is on but no map was given, default to sending trivial
+# issues to the triage model itself so enabling triage lowers cost with zero
+# extra config; normal/complex then fall back to COPILOT_MODEL.
+TRIAGE_MODEL="${TRIAGE_MODEL:-}"
+case "$TRIAGE_MODEL" in off|none|0) TRIAGE_MODEL="" ;; esac
+TRIAGE_MAP="${TRIAGE_MAP:-}"
+if [ -n "$TRIAGE_MODEL" ] && [ -z "$TRIAGE_MAP" ]; then
+  TRIAGE_MAP="trivial=${TRIAGE_MODEL}"
+fi
 
 # Auto-merge each PR instead of leaving it for review. Normalise the various
 # truthy/falsy spellings to 1/0; anything unset or unrecognised means off.
@@ -750,8 +888,29 @@ EOF
   # and file access stays restricted to that checkout (we deliberately do not
   # pass --allow-all-paths); WORK_DIR is additionally allowed so Copilot can
   # write the question file there when its workspace is a separate worktree.
+  # Choose the coding model. When triage is enabled, classify the issue with the
+  # cheap TRIAGE_MODEL and map the class to a coding model via TRIAGE_MAP; on any
+  # failure, or a class with no mapping, fall back to the global COPILOT_MODEL so
+  # triage can only ever lower cost, never break or block the run.
+  local coding_model="$COPILOT_MODEL" triage_class mapped_model
+  if [ -n "$TRIAGE_MODEL" ]; then
+    log "issue #$num: triaging with $TRIAGE_MODEL"
+    triage_class="$(triage_issue "$num" "$title" "$body" "$log_file")"
+    if [ -n "$triage_class" ]; then
+      mapped_model="$(parse_triage_map "$TRIAGE_MAP" "$triage_class")"
+      if [ -n "$mapped_model" ]; then
+        coding_model="$mapped_model"
+        log "issue #$num: triaged as '$triage_class' -> model '$mapped_model'"
+      else
+        log "issue #$num: triaged as '$triage_class' -> default model ${COPILOT_MODEL:-auto}"
+      fi
+    else
+      log "issue #$num: triage inconclusive -> default model ${COPILOT_MODEL:-auto}"
+    fi
+  fi
+
   local -a copilot_args=(-p "$prompt" --allow-all-tools --add-dir "$WORK_DIR" --no-color --log-level none)
-  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+  [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
 
   log "issue #$num: running copilot (log: $log_file)"
   cd "$WORKSPACE_DIR" 2>/dev/null || true
