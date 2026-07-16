@@ -91,8 +91,29 @@
 #   USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
 # Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 # (default: 2).
+# Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
+# default branch and restarting when this script changes upstream (default:
+# auto, on when the script is tracked in the repo it operates on).
 #
 set -uo pipefail
+
+# Preserve the original invocation so self-update can re-exec the loop with the
+# same options after pulling a newer copy of this script (see self_update).
+SELF_ARGS=("$@")
+
+# Resolve this script to an absolute, symlink-free path now, before any later cd
+# changes the working directory. self_update() compares this file against its
+# upstream copy and overwrites it in place, so it must point at the real tracked
+# file even when invoked via a relative path or a symlink on PATH.
+SCRIPT_PATH="$0"
+while [ -L "$SCRIPT_PATH" ]; do
+  _link="$(readlink "$SCRIPT_PATH")"
+  case "$_link" in
+    /*) SCRIPT_PATH="$_link" ;;
+    *)  SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$_link" ;;
+  esac
+done
+SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)/$(basename "$SCRIPT_PATH")"
 
 # --- Configuration -----------------------------------------------------------
 # Every option below can be supplied two ways: as an environment variable, or as
@@ -356,6 +377,30 @@ DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.n
 if ! git config --get-all remote.origin.fetch 2>/dev/null | grep -q .; then
   git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null \
     && log "restored missing fetch refspec for origin"
+fi
+
+# --- Self-update setup -------------------------------------------------------
+# Decide whether the loop keeps itself current by pulling the default branch and
+# re-execing when this script changed upstream (see self_update, called at the
+# top of the main loop). Auto-enable when the script is a tracked file in the
+# repo we operate on; an explicit SELF_UPDATE=1/0 always wins.
+case "$SELF_UPDATE" in
+  1|true|yes|on)   SELF_UPDATE=1 ;;
+  0|false|no|off)  SELF_UPDATE=0 ;;
+  *)
+    if git -C "$REPO_DIR" ls-files --error-unmatch -- "$SCRIPT_PATH" >/dev/null 2>&1; then
+      SELF_UPDATE=1
+    else
+      SELF_UPDATE=0
+    fi
+    ;;
+esac
+# Path of the running script relative to the repo root, used to read its upstream
+# version. Empty (self-update off) when the script is not tracked in this repo.
+SCRIPT_REL=""
+if [ "$SELF_UPDATE" = 1 ]; then
+  SCRIPT_REL="$(git -C "$REPO_DIR" ls-files --full-name -- "$SCRIPT_PATH" 2>/dev/null | head -1)"
+  [ -n "$SCRIPT_REL" ] || SELF_UPDATE=0
 fi
 
 # Decide whether to isolate each issue in its own git worktree. Auto-detect when
@@ -976,8 +1021,82 @@ next_conflicted_pr() {
     --json number,mergeable,labels --jq "$jq_filter" 2>/dev/null
 }
 
+# --- Self-update: pull the loop code and restart when it changed --------------
+# Before tackling each iteration, refresh this script from the default branch so
+# the loop always runs the latest code. When the upstream copy differs from the
+# committed baseline, fast-forward the checkout (or refresh just this file when
+# the default branch is not checked out) and re-exec. No-op when self-update is
+# off, the script is untracked, or nothing changed upstream. Never clobbers local
+# uncommitted edits to the script.
+self_update() {
+  [ "$SELF_UPDATE" = 1 ] || return 0
+  [ -n "$SCRIPT_REL" ] || return 0
+
+  git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || return 0
+  local upstream="origin/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$upstream" >/dev/null 2>&1 || return 0
+
+  # Has the script changed upstream? Compare the committed baseline (the local
+  # default branch, or HEAD when it is absent) with the upstream copy, so local
+  # uncommitted edits to the script never trigger a restart on their own.
+  local local_ref="refs/heads/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$local_ref" >/dev/null 2>&1 || local_ref="HEAD"
+  local base_hash new_hash
+  base_hash="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${local_ref}:${SCRIPT_REL}" 2>/dev/null || true)"
+  new_hash="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${upstream}:${SCRIPT_REL}" 2>/dev/null || true)"
+  [ -n "$new_hash" ] || return 0
+  [ "$new_hash" != "$base_hash" ] || return 0
+
+  log "loop code changed on $DEFAULT_BRANCH upstream; updating and restarting"
+
+  local cur_branch updated=0
+  cur_branch="$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+  if [ "$cur_branch" = "$DEFAULT_BRANCH" ]; then
+    # On the default branch: fast-forward the whole checkout. git refuses (safely)
+    # when local changes would be overwritten, leaving the running code intact.
+    git -C "$REPO_DIR" merge --ff-only "$upstream" >/dev/null 2>&1 && updated=1
+  fi
+
+  if [ "$updated" != 1 ]; then
+    # Default branch not checked out (e.g. detached in --no-worktrees mode) or the
+    # fast-forward was refused: refresh just this script, but never clobber local
+    # uncommitted edits to it.
+    local work_hash head_hash
+    work_hash="$(git hash-object "$SCRIPT_PATH" 2>/dev/null || true)"
+    head_hash="$(git -C "$REPO_DIR" rev-parse --verify --quiet "HEAD:${SCRIPT_REL}" 2>/dev/null || true)"
+    if [ -n "$head_hash" ] && [ -n "$work_hash" ] && [ "$work_hash" != "$head_hash" ]; then
+      log "local changes to $SCRIPT_REL; skipping self-update"
+      return 0
+    fi
+    local tmp="${SCRIPT_PATH}.selfupdate.$$"
+    if ! git -C "$REPO_DIR" show "${upstream}:${SCRIPT_REL}" >"$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      return 0
+    fi
+    chmod +x "$tmp" 2>/dev/null || true
+    if ! mv -f "$tmp" "$SCRIPT_PATH" 2>/dev/null; then
+      rm -f "$tmp"
+      return 0
+    fi
+    # Advance the local default branch pointer when it fast-forwards, so the next
+    # iteration sees the baseline as current instead of re-detecting the change.
+    if [ "$local_ref" = "refs/heads/${DEFAULT_BRANCH}" ] \
+       && git -C "$REPO_DIR" merge-base --is-ancestor "refs/heads/${DEFAULT_BRANCH}" "$upstream" 2>/dev/null; then
+      git -C "$REPO_DIR" branch -f "$DEFAULT_BRANCH" "$upstream" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  release_github_lock
+  log "restarting loop with updated code"
+  exec "$SCRIPT_PATH" ${SELF_ARGS[@]+"${SELF_ARGS[@]}"}
+}
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  # Keep the loop current before starting any new work: pull the default branch
+  # and re-exec if this script changed upstream.
+  self_update
+
   process_issue_files
 
   # Before starting any new task, make sure no open PR is left with merge
