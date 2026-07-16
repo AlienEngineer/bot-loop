@@ -282,8 +282,10 @@ _ask_issue() {
 next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   local nums n last_author
+  # Sorted ascending (by number == creation order) so the oldest replied issue
+  # resumes first. High --limit avoids dropping old issues to gh's default cap.
   nums="$(gh issue list --state open --label "$NEEDS_INFO_LABEL" \
-            --json number --jq '.[].number' 2>/dev/null)"
+            --limit 1000 --json number --jq 'sort_by(.number)[].number' 2>/dev/null)"
   for n in $nums; do
     last_author="$(gh issue view "$n" --json comments \
                     --jq '.comments[-1].author.login // empty' 2>/dev/null)"
@@ -305,8 +307,11 @@ while true; do
     continue
   fi
 
+  # Pick the oldest ready issue (lowest number == earliest created) so work is
+  # done in creation order. gh lists newest-first, so sort here rather than
+  # relying on list order; a high --limit avoids truncating away old issues.
   next_issue="$(gh issue list --state open --label "$TRIGGER_LABEL" \
-                  --limit 1 --json number --jq '.[0].number // empty' 2>/dev/null)"
+                  --limit 1000 --json number --jq 'min_by(.number).number // empty' 2>/dev/null)"
 
   if [ -z "$next_issue" ]; then
     log "no ready issues; sleeping ${SLEEP_MINUTES}m"
