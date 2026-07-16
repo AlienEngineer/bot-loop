@@ -23,6 +23,10 @@
 #   cd ../instance-2
 #   ./copilot-loop.sh
 #
+# Before each iteration the loop keeps itself current: it pulls the default
+# branch and, if this script changed upstream, re-execs so the loop always runs
+# the latest code. Set SELF_UPDATE=0 to turn this off.
+#
 # Flow per iteration:
 #   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
 #      trigger label) so file-based tasks enter the queue below.
@@ -46,7 +50,9 @@
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
 #   6b. Otherwise commit, sync the branch with the latest default branch, then
-#       push and open a PR that closes the issue.
+#       push and open a PR that closes the issue. When --auto-merge is on the PR
+#       is set to merge automatically (GitHub auto-merge when the repo allows it,
+#       otherwise merged immediately) so no manual review is required.
 #   7. On success label the issue "copilot-done". On failure retry automatically
 #      up to MAX_ATTEMPTS times (re-queuing via the trigger label); once the
 #      attempts are exhausted label it "copilot-failed". A later user reply on a
@@ -73,11 +79,16 @@
 #   --worktrees / --no-worktrees
 #                            Force per-issue git worktrees on/off (default: auto,
 #                            on when the repo is used with git worktrees).
+#   --auto-merge / --no-auto-merge
+#                            Merge each PR automatically instead of leaving it for
+#                            review (default: off).
+#   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
+#                            (default: merge).
 #   -h, --help               Show help and exit.
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET,
-#   USE_WORKTREES
+#   USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
 # Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 # (default: 2).
 #
@@ -97,10 +108,19 @@ ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
 QUIET="${QUIET:-}"
+# Set SELF_UPDATE=0 to stop the loop pulling and restarting itself when this
+# script changes upstream. Left unset it is auto-enabled whenever the script is
+# a tracked file inside the repo it operates on.
+SELF_UPDATE="${SELF_UPDATE:-}"
 # Whether each issue gets its own git worktree instead of switching branches in
 # the shared checkout. Empty means auto-detect (see below); 1/0 force it on/off.
 # The default branch (main/master) is never checked out for work in either mode.
 USE_WORKTREES="${USE_WORKTREES:-}"
+# Merge each PR automatically instead of leaving it open for review. Off by
+# default; set AUTO_MERGE=1 (or pass --auto-merge) to turn it on.
+AUTO_MERGE="${AUTO_MERGE:-}"
+# Merge method used when AUTO_MERGE is on: merge, squash or rebase.
+MERGE_METHOD="${MERGE_METHOD:-}"
 
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
@@ -166,11 +186,17 @@ work:
   --no-worktrees           Work in the current checkout instead of per-issue
                            worktrees. The default branch is still never checked
                            out for work; the issue branch is created directly.
+  --auto-merge             Merge every PR automatically (GitHub auto-merge when
+                           the repo allows it, otherwise an immediate merge) so
+                           no manual review is needed. Default: off.
+  --no-auto-merge          Leave PRs open for manual review (the default).
+  --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
+                           (default: merge).
   -h, --help               Show this help and exit.
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET,
-  USE_WORKTREES
+  USE_WORKTREES, AUTO_MERGE, MERGE_METHOD
 Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 (default: 2).
 EOF
@@ -228,6 +254,10 @@ while [ $# -gt 0 ]; do
     --quiet)           QUIET=1 ;;
     --worktrees)       USE_WORKTREES=1 ;;
     --no-worktrees)    USE_WORKTREES=0 ;;
+    --auto-merge)      AUTO_MERGE=1 ;;
+    --no-auto-merge)   AUTO_MERGE=0 ;;
+    --merge-method)    need_arg $# "$1"; MERGE_METHOD="$2"; shift ;;
+    --merge-method=*)  MERGE_METHOD="${1#*=}" ;;
     -h|--help)         usage; exit 0 ;;
     *)                 die "unknown argument: $1 (use --help)" ;;
   esac
@@ -245,6 +275,20 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 QUIET="${QUIET:-0}"
 ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
+
+# Auto-merge each PR instead of leaving it for review. Normalise the various
+# truthy/falsy spellings to 1/0; anything unset or unrecognised means off.
+case "$AUTO_MERGE" in
+  1|true|yes|on)  AUTO_MERGE=1 ;;
+  *)              AUTO_MERGE=0 ;;
+esac
+# Merge method used by auto-merge. Default to a merge commit; reject anything
+# other than the three methods gh understands so a typo fails loudly at startup.
+MERGE_METHOD="${MERGE_METHOD:-merge}"
+case "$MERGE_METHOD" in
+  merge|squash|rebase) ;;
+  *) die "invalid --merge-method: $MERGE_METHOD (use merge, squash or rebase)" ;;
+esac
 
 # Total attempts (initial + automatic retries) before an issue is marked failed.
 # Env-only (no flag). Normalise to a positive integer so a bad override can never
@@ -357,6 +401,11 @@ if [ "$QUIET" = 1 ]; then
 else
   log "copilot output: streamed to stdout and log files (pass --quiet to hide)"
 fi
+if [ "$AUTO_MERGE" = 1 ]; then
+  log "auto-merge: on (method=$MERGE_METHOD) — PRs merge without review"
+else
+  log "auto-merge: off — PRs are left open for review (pass --auto-merge to enable)"
+fi
 
 ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up"
 ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot loop"
@@ -423,6 +472,27 @@ cleanup_workspace() {
   fi
   git branch -D "$branch" >/dev/null 2>&1 || true
   WORKSPACE_DIR=""
+}
+
+# --- Core: enable auto-merge on a freshly opened PR --------------------------
+# When AUTO_MERGE is on, ask GitHub to merge the PR without manual review.
+# Prefer GitHub's native auto-merge (it waits for any required status checks);
+# when the repository does not allow auto-merge, fall back to merging right now.
+# Best effort: a failure here never fails the issue, it just leaves the PR open.
+try_auto_merge() {
+  local pr="$1" num="$2" log_file="$3"
+  [ "$AUTO_MERGE" = 1 ] || return 0
+  if gh pr merge "$pr" --auto "--$MERGE_METHOD" >>"$log_file" 2>&1; then
+    log "issue #$num: auto-merge enabled (method=$MERGE_METHOD) on $pr"
+    return 0
+  fi
+  # Auto-merge is likely not enabled on the repository; merge immediately.
+  if gh pr merge "$pr" "--$MERGE_METHOD" >>"$log_file" 2>&1; then
+    log "issue #$num: merged immediately (method=$MERGE_METHOD) $pr"
+    return 0
+  fi
+  log "issue #$num: WARNING could not auto-merge $pr; left open for manual merge"
+  return 0
 }
 
 # --- Core: process a single issue -------------------------------------------
@@ -562,6 +632,7 @@ EOF
       _fail_issue "$num" "$log_file" "gh pr create failed"
       return 1
     fi
+    try_auto_merge "$pr_url" "$num" "$log_file"
     gh issue edit "$num" --add-label "$DONE_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
     log "issue #$num: DONE -> $pr_url"
     cleanup_workspace "$branch"
