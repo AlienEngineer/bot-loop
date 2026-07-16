@@ -87,9 +87,8 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | Sweep merged branches/worktrees each pass (default: on) |
 | `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | Delete a merged issue's remote branch (default: auto) |
 
-Env-only settings: `MAX_ATTEMPTS` (attempts per issue, default 2) and
-`SELF_UPDATE` (set to `0` to stop the loop pulling and re-execing itself when the
-script changes upstream).
+Env-only settings: `SELF_UPDATE` (set to `0` to stop the loop pulling and
+re-execing itself when the script changes upstream).
 
 Run `./copilot-loop.sh --help`, or read the header of
 [`copilot-loop.sh`](./copilot-loop.sh), for the complete and authoritative list.
@@ -127,7 +126,7 @@ Each issue moves through these labels:
 | `in-progress` | Claimed by a loop instance and being worked on. |
 | `needs-info` | Copilot asked a question; waiting for a human reply. A reply resumes the issue. |
 | `copilot-done` | Resolved successfully and a PR was opened. |
-| `copilot-failed` | Failed after `MAX_ATTEMPTS` attempts. A later human reply resumes it for another attempt. |
+| `copilot-failed` | Failed; the loop does not retry automatically. A later human reply resumes it for another attempt. |
 
 ## Troubleshooting
 

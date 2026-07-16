@@ -65,10 +65,9 @@
 #       push and open a PR that closes the issue. When --auto-merge is on the PR
 #       is set to merge automatically (GitHub auto-merge when the repo allows it,
 #       otherwise merged immediately) so no manual review is required.
-#   7. On success label the issue "copilot-done". On failure retry automatically
-#      up to MAX_ATTEMPTS times (re-queuing via the trigger label); once the
-#      attempts are exhausted label it "copilot-failed". A later user reply on a
-#      failed issue resumes it for another attempt.
+#   7. On success label the issue "copilot-done". On failure label it
+#      "copilot-failed" and stop — failures are never retried automatically. A
+#      later user reply on a failed issue resumes it for another attempt.
 #   8. Sweep merged branches: each pass removes any local work branch and worktree
 #      whose PR has merged and, when the repo does not auto-delete on merge,
 #      deletes the merged remote branch too (CLEANUP_MERGED / DELETE_REMOTE_BRANCH).
@@ -126,8 +125,6 @@
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
 #   TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
 #   MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
-# Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
-# (default: 2).
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
@@ -226,8 +223,8 @@ BRANCH_PREFIX="copilot/"
 # question, so they are easy to recognise in the thread.
 QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
 
-# Hidden marker on every failure comment so the loop can count how many times an
-# issue has already failed and cap the automatic retries at MAX_ATTEMPTS.
+# Hidden marker appended to every failure comment so they are easy to recognise
+# in the thread (mirrors QUESTION_MARKER).
 FAILURE_MARKER="<!-- copilot-loop:failed -->"
 
 # --- Helpers -----------------------------------------------------------------
@@ -348,8 +345,6 @@ Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
   TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
   MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
-Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
-(default: 2).
 EOF
 }
 
@@ -618,13 +613,6 @@ case "$CLEANUP_MERGED" in
   0|false|no|off) CLEANUP_MERGED=0 ;;
   *)              CLEANUP_MERGED=1 ;;
 esac
-
-# Total attempts (initial + automatic retries) before an issue is marked failed.
-# Env-only (no flag). Normalise to a positive integer so a bad override can never
-# disable the cap.
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
-case "$MAX_ATTEMPTS" in ''|*[!0-9]*) MAX_ATTEMPTS=2 ;; esac
-[ "$MAX_ATTEMPTS" -ge 1 ] || MAX_ATTEMPTS=1
 
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
@@ -1277,48 +1265,30 @@ EOF
   return 1
 }
 
-# Count how many times this issue has already failed, by counting the hidden
-# FAILURE_MARKER stamped on each failure comment. Always echoes a number.
-_count_failures() {
-  local num="$1" n
-  n="$(gh issue view "$num" --json comments \
-        --jq '[.comments[] | select(.body != null and (.body | contains("'"$FAILURE_MARKER"'")))] | length' 2>/dev/null)"
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
-  printf '%s' "$n"
-}
-
 # Handle a failed issue: comment with the error details (or a log tail as a
-# fallback) and clean up the branch. While under the MAX_ATTEMPTS cap the issue
-# is re-queued (trigger label re-added) for another automatic try; once the
-# attempts are exhausted it is marked "copilot-failed". A later user reply
-# resumes such an issue for a fresh attempt (see claim_next_reply_issue).
+# fallback), mark it "copilot-failed", and clean up the branch. Failures are not
+# retried automatically — the issue stays failed until a later user reply resumes
+# it for a fresh attempt (see claim_next_reply_issue).
 _fail_issue() {
   local num="$1" log_file="$2" reason="$3" details="${4:-}"
   # Prefer explicit details (the exact failing command's output) over the raw
   # log tail, which is mostly Copilot chatter and buries the real cause.
-  local block prior attempts note
+  local block
   if [ -n "$details" ]; then
     block="$details"
   else
     block="$(tail -n 20 "$log_file" 2>/dev/null)"
   fi
 
-  # This failure is attempt N; each earlier failure left a FAILURE_MARKER.
-  prior="$(_count_failures "$num")"
-  attempts=$(( prior + 1 ))
-  if [ "$attempts" -lt "$MAX_ATTEMPTS" ]; then note="will retry"; else note="giving up"; fi
-  log "issue #$num: FAILED (attempt $attempts/$MAX_ATTEMPTS, $note) - $reason"
+  log "issue #$num: FAILED - $reason"
 
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
-  gh issue comment "$num" --body "$(printf 'copilot-loop failed (attempt %d/%d, %s): %s\n\n```\n%s\n```\n\n%s' \
-    "$attempts" "$MAX_ATTEMPTS" "$note" "$reason" "$block" "$FAILURE_MARKER")" >/dev/null 2>&1 || true
+  gh issue comment "$num" --body "$(printf 'copilot-loop failed: %s\n\n```\n%s\n```\n\n%s' \
+    "$reason" "$block" "$FAILURE_MARKER")" >/dev/null 2>&1 || true
 
-  if [ "$attempts" -lt "$MAX_ATTEMPTS" ]; then
-    # Hand the issue back to the queue for another automatic attempt.
-    gh issue edit "$num" --add-label "$TRIGGER_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
-  else
-    gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
-  fi
+  # Stop here: mark the issue failed instead of re-queuing it, so a repeatedly
+  # failing issue can never be retried in an endless loop.
+  gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
   cleanup_workspace "$branch"
 }
 
@@ -1638,9 +1608,9 @@ log_ready_issues() {
 }
 
 # Atomically find and claim the next reply issue, protected by GitHub lock.
-# Handles both "needs-info" (a pending question) and "copilot-failed" (retries
-# exhausted) issues whose latest comment came from a human. Returns the issue
-# number on success, empty string if none available.
+# Handles both "needs-info" (a pending question) and "copilot-failed" (a failed
+# issue) whose latest comment came from a human. Returns the issue number on
+# success, empty string if none available.
 claim_next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   
