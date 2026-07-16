@@ -7,6 +7,7 @@
 # available it sleeps and checks again.
 #
 # Flow per iteration:
+#   0. Turn any markdown files in issues/ into GitHub issues (labelled ready).
 #   1. Find the oldest open issue with the trigger label (default: "ready").
 #   2. Claim it: remove trigger label, add "in-progress" (prevents re-pickup).
 #   3. Create a fresh branch off the default branch.
@@ -25,6 +26,7 @@
 #   SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
 #   REPO_DIR        Repository to operate in              (default: current git repo)
 #   COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
+#   ISSUES_DIR      Folder scanned for issue markdown files (default: <repo>/issues)
 #
 set -uo pipefail
 
@@ -44,6 +46,7 @@ FAILED_LABEL="copilot-failed"
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
 LOCK_DIR="$WORK_DIR/lock"
+ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
 
 # --- Helpers -----------------------------------------------------------------
 log() {
@@ -199,8 +202,79 @@ _fail_issue() {
   git branch -D "$branch" >/dev/null 2>&1 || true
 }
 
+# --- Issue files: create GitHub issues from markdown in issues/ --------------
+# Each *.md file in ISSUES_DIR becomes one GitHub issue: the first H1 line is
+# the title and everything after it is the body. A file is claimed by renaming
+# "<name>.md" -> "<name>_pushing.md" before the issue is created, then deleted
+# once the issue exists. Created issues always get the trigger label so the
+# loop below picks them up. If ISSUES_DIR is missing it is created with a
+# TEMPLATE.md example, which is never turned into an issue.
+process_issue_files() {
+  if [ ! -d "$ISSUES_DIR" ]; then
+    mkdir -p "$ISSUES_DIR" || { log "issue files: could not create $ISSUES_DIR"; return; }
+    cat >"$ISSUES_DIR/TEMPLATE.md" <<'EOF'
+# Title
+
+Describe the task here. The first "# " heading becomes the issue title and
+everything below it becomes the issue body.
+
+Copy this file to a new name ending in .md and edit it; the copilot loop opens
+a GitHub issue from it (labelled "ready") and then deletes the file.
+EOF
+    log "issue files: created $ISSUES_DIR with TEMPLATE.md"
+    return
+  fi
+
+  local f base pushing title body
+  for f in "$ISSUES_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+
+    # Never turn the template into an issue.
+    [ "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')" = "template.md" ] && continue
+
+    # Claim the file by renaming it, unless a previous run already claimed it.
+    case "$base" in
+      *_pushing.md) pushing="$f" ;;
+      *)
+        pushing="${f%.md}_pushing.md"
+        if ! mv "$f" "$pushing" 2>/dev/null; then
+          log "issue files: could not claim $base"
+          continue
+        fi
+        log "issue files: claimed $base -> $(basename "$pushing")"
+        ;;
+    esac
+
+    # Title: first H1 heading; fall back to the file name.
+    title="$(grep -m1 -E '^#[[:space:]]+' "$pushing" | sed -E 's/^#[[:space:]]+//; s/[[:space:]]+$//')"
+    if [ -z "$title" ]; then
+      title="$(basename "$pushing" .md)"
+      title="${title%_pushing}"
+    fi
+
+    # Body: everything after the first H1; the whole file if there is no H1.
+    if grep -qE '^#[[:space:]]+' "$pushing"; then
+      body="$(awk 'seen{print} /^#[[:space:]]+/{seen=1}' "$pushing")"
+    else
+      body="$(cat "$pushing")"
+    fi
+    # Drop leading blank lines from the body.
+    body="$(printf '%s\n' "$body" | sed -e '/./,$!d')"
+
+    if gh issue create --title "$title" --body "$body" --label "$TRIGGER_LABEL" >/dev/null 2>&1; then
+      rm -f "$pushing"
+      log "issue files: created issue \"$title\" and removed $(basename "$pushing")"
+    else
+      log "issue files: FAILED to create issue for \"$title\" (kept $(basename "$pushing"))"
+    fi
+  done
+}
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  process_issue_files
+
   next_issue="$(gh issue list --state open --label "$TRIGGER_LABEL" \
                   --limit 1 --json number --jq '.[0].number // empty' 2>/dev/null)"
 
