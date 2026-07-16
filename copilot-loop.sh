@@ -305,6 +305,11 @@ log "  origin url:  $ORIGIN_URL"
 log "  local dir:   $REPO_DIR"
 log "============================================================"
 log "default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL sleep=${SLEEP_MINUTES}m"
+if [ "$QUIET" = 1 ]; then
+  log "copilot output: log files only (--quiet); stdout hidden"
+else
+  log "copilot output: streamed to stdout and log files (pass --quiet to hide)"
+fi
 
 ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up"
 ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot loop"
