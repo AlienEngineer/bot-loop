@@ -38,6 +38,9 @@
 #           ("copilot-failed") whose latest comment came from a human (the user
 #           answered a question or gave more guidance) -> resume it; else
 #        b. the oldest open issue with the trigger label (default: "ready").
+#      Issues that declare a dependency ("Wait for: #N" in the body) are held
+#      back until every issue they name is closed (see "Issue dependencies:
+#      Wait for: #N" further down).
 #   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
 #      (done atomically by the claiming functions to prevent race conditions).
 #   4. Create a fresh branch for the issue, based on the latest default branch.
@@ -853,6 +856,10 @@ everything below it becomes the issue body.
 
 Copy this file to a new name ending in .md and edit it; the copilot loop opens
 a GitHub issue from it (labelled "ready") and then deletes the file.
+
+Add a line like "Wait for: #1" to hold this issue until issue #1 is closed
+(resolved and merged). List several ("Wait for: #1, #2") and use "Blocked by:"
+or "Depends on:" if you prefer.
 EOF
     log "issue files: created $ISSUES_DIR with TEMPLATE.md"
     return
@@ -933,26 +940,84 @@ _ask_issue() {
   cleanup_workspace "$branch"
 }
 
+# --- Issue dependencies: "Wait for: #N" --------------------------------------
+# An issue can declare that it must not be started until one or more other
+# issues are finished by putting a line like "Wait for: #1" in its body. The
+# loop then keeps that issue in the queue until every issue it names is CLOSED.
+# A PR that closes the blocker, once merged, closes the issue, so CLOSED is
+# exactly "resolved and merged". "Blocked by:" and "Depends on:" are accepted
+# as synonyms, several "#N" may be listed on one line, and matching is
+# case-insensitive.
+#
+# The two functions below are covered by tests/wait-for.test.sh, which extracts
+# them between the markers, so keep the marker comments intact.
+# >>> wait-for helpers >>>
+# Echo, one per line (ascending, de-duplicated), the issue numbers a body
+# declares it is waiting for. Empty output means no declared dependencies.
+issue_wait_for() {
+  local body="$1"
+  printf '%s\n' "$body" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -nE 's/^.*(wait[[:space:]]+for|blocked[[:space:]]+by|depends[[:space:]]+on)[[:space:]]*:?[[:space:]]*//p' \
+    | grep -oE '#[0-9]+' \
+    | tr -d '#' \
+    | sort -n -u
+}
+
+# Echo, one per line, the still-open issues that block the given issue: those it
+# declares it is waiting for that are not yet CLOSED. Self-references and issue
+# numbers that cannot be looked up are ignored so the queue can never wedge on a
+# stale or bad reference. Empty output means nothing is blocking.
+# Usage: issue_open_blockers <self-number> <body>
+issue_open_blockers() {
+  local self="$1" body="$2" dep state
+  for dep in $(issue_wait_for "$body"); do
+    [ "$dep" = "$self" ] && continue
+    state="$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null)"
+    [ "$state" = "OPEN" ] && printf '%s\n' "$dep"
+  done
+}
+# <<< wait-for helpers <<<
+
+# Format a whitespace-separated list of issue numbers as "#1, #2" for logs.
+_fmt_blockers() {
+  local b out=""
+  for b in $1; do
+    if [ -n "$out" ]; then out="$out, #$b"; else out="#$b"; fi
+  done
+  printf '%s' "$out"
+}
+
 # Atomically find and claim the next ready issue, protected by GitHub lock.
 # Returns the issue number on success, empty string if none available.
 # This prevents multiple instances from selecting the same issue.
 claim_next_ready_issue() {
-  local issue
+  local nums n body blockers issue=""
   acquire_github_lock || return 1
-  
-  # Pick the oldest ready issue (lowest number == earliest created).
-  issue="$(gh issue list --state open --label "$TRIGGER_LABEL" \
-             --limit 1000 --json number --jq 'min_by(.number).number // empty' 2>/dev/null)"
-  
-  if [ -n "$issue" ]; then
+
+  # Ready issues oldest first (lowest number == earliest created). Walk them in
+  # order and claim the first that is not blocked by an unresolved dependency
+  # (see issue_open_blockers). A blocked issue keeps its trigger label so it is
+  # reconsidered on a later pass once its blockers close.
+  nums="$(gh issue list --state open --label "$TRIGGER_LABEL" \
+            --limit 1000 --json number --jq 'sort_by(.number) | .[].number' 2>/dev/null)"
+  for n in $nums; do
+    body="$(gh issue view "$n" --json body --jq '.body' 2>/dev/null)"
+    blockers="$(issue_open_blockers "$n" "$body")"
+    if [ -n "$blockers" ]; then
+      log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
+      continue
+    fi
     # Claim it immediately: add in-progress, remove trigger labels.
     # Do this WHILE HOLDING THE LOCK so no other instance can select it.
+    issue="$n"
     gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
-    printf '%s\n' "$issue"
-  fi
-  
+    break
+  done
+
   release_github_lock
+  [ -n "$issue" ] && printf '%s\n' "$issue"
   [ -n "$issue" ]
 }
 
@@ -980,7 +1045,7 @@ log_ready_issues() {
 claim_next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   
-  local nums n last_author issue=""
+  local nums n last_author body blockers issue=""
   acquire_github_lock || return 1
   
   # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
@@ -993,14 +1058,21 @@ claim_next_reply_issue() {
   for n in $nums; do
     last_author="$(gh issue view "$n" --json comments \
                     --jq '.comments[-1].author.login // empty' 2>/dev/null)"
-    if [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ]; then
-      # Found one; claim it before releasing the lock
-      issue="$n"
-      gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
-      gh issue edit "$issue" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
-      gh issue edit "$issue" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
-      break
+    [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ] || continue
+    # Honour the same dependency gate as fresh issues: do not resume an issue
+    # while an issue it declares it is waiting for is still open.
+    body="$(gh issue view "$n" --json body --jq '.body' 2>/dev/null)"
+    blockers="$(issue_open_blockers "$n" "$body")"
+    if [ -n "$blockers" ]; then
+      log "issue #$n: replied but blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
+      continue
     fi
+    # Found one; claim it before releasing the lock
+    issue="$n"
+    gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
+    break
   done
   
   release_github_lock
