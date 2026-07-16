@@ -29,13 +29,19 @@
 # Requirements: git, gh (authenticated), copilot.
 #
 # Usage:
-#   ./copilot-loop.sh
+#   ./copilot-loop.sh [--quiet]
+#
+# Options:
+#   --quiet   Do not stream Copilot's output to stdout; write it only to the
+#             per-run log files (the original behaviour). By default the loop
+#             streams Copilot's output live to stdout as well as the log files.
 #
 # Configuration (override via environment variables):
 #   TRIGGER_LABEL   Label that marks an issue as ready   (default: ready)
 #   SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
 #   REPO_DIR        Repository to operate in              (default: current git repo)
 #   COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
+#   QUIET           Same as --quiet when set to 1          (default: 0)
 #
 set -uo pipefail
 
@@ -47,6 +53,9 @@ REPO_DIR="${REPO_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
+# Stream Copilot's output live to stdout in addition to the per-run log files.
+# Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
+QUIET="${QUIET:-0}"
 
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
@@ -79,6 +88,51 @@ ensure_label() {
   local name="$1" color="$2" desc="$3"
   gh label create "$name" --color "$color" --description "$desc" >/dev/null 2>&1 || true
 }
+
+usage() {
+  cat <<'EOF'
+Usage: ./copilot-loop.sh [--quiet]
+
+Autonomous loop that resolves labelled GitHub issues with the Copilot CLI.
+
+Options:
+  --quiet     Do not stream Copilot's output to stdout; write it only to the
+              per-run log files (the original behaviour). By default the loop
+              streams Copilot's output live to stdout as well as the log files.
+  -h, --help  Show this help and exit.
+
+Configuration via environment variables:
+  TRIGGER_LABEL   Label that marks an issue as ready   (default: ready)
+  SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
+  REPO_DIR        Repository to operate in              (default: current git repo)
+  COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
+  QUIET           Same as --quiet when set to 1          (default: 0)
+EOF
+}
+
+# Run copilot with the given args, always capturing output to $log_file. Unless
+# QUIET is set, the output is also streamed live to stdout via tee. Sets the
+# global COPILOT_RC to copilot's own exit code (not tee's).
+run_copilot() {
+  local log_file="$1"; shift
+  if [ "$QUIET" = 1 ]; then
+    copilot "$@" >>"$log_file" 2>&1
+    COPILOT_RC=$?
+  else
+    copilot "$@" 2>&1 | tee -a "$log_file"
+    COPILOT_RC="${PIPESTATUS[0]}"
+  fi
+}
+
+# --- Argument parsing --------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet)   QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *)         die "unknown argument: $1 (use --help)" ;;
+  esac
+  shift
+done
 
 # --- Preflight ---------------------------------------------------------------
 for bin in git gh copilot; do
@@ -199,8 +253,8 @@ EOF
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
   log "issue #$num: running copilot (log: $log_file)"
-  copilot "${copilot_args[@]}" >"$log_file" 2>&1
-  local copilot_rc=$?
+  run_copilot "$log_file" "${copilot_args[@]}"
+  local copilot_rc=$COPILOT_RC
   log "issue #$num: copilot exited with code $copilot_rc"
 
   # Copilot asked for more information instead of coding: relay the question to
@@ -378,8 +432,8 @@ EOF
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
-    copilot "${copilot_args[@]}" >>"$log_file" 2>&1
-    copilot_rc=$?
+    run_copilot "$log_file" "${copilot_args[@]}"
+    copilot_rc=$COPILOT_RC
     log "PR #$num: copilot exited with code $copilot_rc"
 
     # Bail out if Copilot left conflict markers behind in any conflicted file.
