@@ -911,6 +911,23 @@ claim_next_ready_issue() {
   [ -n "$issue" ]
 }
 
+# Log the open issues currently carrying the trigger label (the ready queue),
+# oldest first, so the operator can see the backlog before the next issue is
+# claimed. Informational only and silent when the queue is empty (the later
+# "no ready issues" message covers that case); safe to call without the lock.
+log_ready_issues() {
+  local lines count
+  lines="$(gh issue list --state open --label "$TRIGGER_LABEL" \
+             --limit 1000 --json number,title \
+             --jq 'sort_by(.number) | .[] | "#\(.number) \(.title)"' 2>/dev/null)"
+  [ -n "$lines" ] || return 0
+  count="$(printf '%s\n' "$lines" | wc -l | tr -d ' ')"
+  log "ready issues ($count):"
+  printf '%s\n' "$lines" | while IFS= read -r line; do
+    log "  $line"
+  done
+}
+
 # Atomically find and claim the next reply issue, protected by GitHub lock.
 # Handles both "needs-info" (a pending question) and "copilot-failed" (retries
 # exhausted) issues whose latest comment came from a human. Returns the issue
@@ -1099,6 +1116,10 @@ while true; do
     process_issue "$next_issue" || true
     continue
   fi
+
+  # Show the ready queue before pulling the next issue off it, so the operator
+  # can see the backlog that is about to be worked.
+  log_ready_issues
 
   # Pick the oldest ready issue and claim it atomically.
   # This prevents multiple instances from selecting the same issue.
