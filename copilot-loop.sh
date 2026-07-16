@@ -82,11 +82,19 @@ cleanup() {
 trap cleanup EXIT
 trap 'log "interrupted"; exit 130' INT TERM
 
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null)"
+REPO_SLUG="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)"
+[ -n "$REPO_SLUG" ] || REPO_SLUG="unknown"
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)"
 [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="main"
 
 log "starting copilot-loop"
-log "repo=$REPO_DIR default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL sleep=${SLEEP_MINUTES}m"
+log "============================================================"
+log "  GitHub repo: $REPO_SLUG"
+log "  origin url:  $ORIGIN_URL"
+log "  local dir:   $REPO_DIR"
+log "============================================================"
+log "default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL sleep=${SLEEP_MINUTES}m"
 
 ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up"
 ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot loop"
@@ -109,7 +117,7 @@ process_issue() {
   pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
 
-  log "issue #$num: $title"
+  log "issue #$num on $REPO_SLUG: $title"
 
   # Claim the issue up-front so it is never picked up twice, even on a crash.
   gh issue edit "$num" --add-label "$INPROGRESS_LABEL" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1
