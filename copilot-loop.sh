@@ -7,24 +7,26 @@
 # available it sleeps and checks again.
 #
 # Flow per iteration:
-#   0. Before starting any new task, check open PRs targeting the default branch
+#   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
+#      trigger label) so file-based tasks enter the queue below.
+#   1. Before starting any new task, check open PRs targeting the default branch
 #      for merge conflicts. If one is found, merge the base branch into it and
 #      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
-#   1. Pick the next issue to work on:
+#   2. Pick the next issue to work on:
 #        a. an issue awaiting a reply ("needs-info") whose latest comment came
 #           from a human (the user answered a question) -> resume it; else
 #        b. the oldest open issue with the trigger label (default: "ready").
-#   2. Claim it: add "in-progress", remove the trigger/"needs-info" labels.
-#   3. Create a fresh branch off the default branch.
-#   4. Run `copilot -p` (all tools, file access restricted to this repo),
+#   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels.
+#   4. Create a fresh branch off the default branch.
+#   5. Run `copilot -p` (all tools, file access restricted to this repo),
 #      passing the issue's comment thread so any prior Q&A is available.
-#   5a. If Copilot needs more information it writes a question file; post the
+#   6a. If Copilot needs more information it writes a question file; post the
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
-#   5b. Otherwise commit, sync the branch with the latest default branch, then
+#   6b. Otherwise commit, sync the branch with the latest default branch, then
 #       push and open a PR that closes the issue.
-#   6. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
-#   7. If no issues are found, sleep and repeat.
+#   7. Label the issue "copilot-done" (success) or "copilot-failed" (failure).
+#   8. If no issues are found, sleep and repeat.
 #
 # Requirements: git, gh (authenticated), copilot.
 #
@@ -41,6 +43,7 @@
 #   SLEEP_MINUTES   Idle sleep when no work is found      (default: 5)
 #   REPO_DIR        Repository to operate in              (default: current git repo)
 #   COPILOT_MODEL   Model passed to copilot --model       (default: unset/auto)
+#   ISSUES_DIR      Folder scanned for issue markdown files (default: <repo>/issues)
 #   QUIET           Same as --quiet when set to 1          (default: 0)
 #
 set -uo pipefail
@@ -72,6 +75,7 @@ QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
 LOCK_DIR="$WORK_DIR/lock"
+ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
 
 # --- Helpers -----------------------------------------------------------------
 log() {
@@ -329,6 +333,75 @@ _fail_issue() {
   git branch -D "$branch" >/dev/null 2>&1 || true
 }
 
+# --- Issue files: create GitHub issues from markdown in issues/ --------------
+# Each *.md file in ISSUES_DIR becomes one GitHub issue: the first H1 line is
+# the title and everything after it is the body. A file is claimed by renaming
+# "<name>.md" -> "<name>_pushing.md" before the issue is created, then deleted
+# once the issue exists. Created issues always get the trigger label so the
+# loop below picks them up. If ISSUES_DIR is missing it is created with a
+# TEMPLATE.md example, which is never turned into an issue.
+process_issue_files() {
+  if [ ! -d "$ISSUES_DIR" ]; then
+    mkdir -p "$ISSUES_DIR" || { log "issue files: could not create $ISSUES_DIR"; return; }
+    cat >"$ISSUES_DIR/TEMPLATE.md" <<'EOF'
+# Title
+
+Describe the task here. The first "# " heading becomes the issue title and
+everything below it becomes the issue body.
+
+Copy this file to a new name ending in .md and edit it; the copilot loop opens
+a GitHub issue from it (labelled "ready") and then deletes the file.
+EOF
+    log "issue files: created $ISSUES_DIR with TEMPLATE.md"
+    return
+  fi
+
+  local f base pushing title body
+  for f in "$ISSUES_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+
+    # Never turn the template into an issue.
+    [ "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')" = "template.md" ] && continue
+
+    # Claim the file by renaming it, unless a previous run already claimed it.
+    case "$base" in
+      *_pushing.md) pushing="$f" ;;
+      *)
+        pushing="${f%.md}_pushing.md"
+        if ! mv "$f" "$pushing" 2>/dev/null; then
+          log "issue files: could not claim $base"
+          continue
+        fi
+        log "issue files: claimed $base -> $(basename "$pushing")"
+        ;;
+    esac
+
+    # Title: first H1 heading; fall back to the file name.
+    title="$(grep -m1 -E '^#[[:space:]]+' "$pushing" | sed -E 's/^#[[:space:]]+//; s/[[:space:]]+$//')"
+    if [ -z "$title" ]; then
+      title="$(basename "$pushing" .md)"
+      title="${title%_pushing}"
+    fi
+
+    # Body: everything after the first H1; the whole file if there is no H1.
+    if grep -qE '^#[[:space:]]+' "$pushing"; then
+      body="$(awk 'seen{print} /^#[[:space:]]+/{seen=1}' "$pushing")"
+    else
+      body="$(cat "$pushing")"
+    fi
+    # Drop leading blank lines from the body.
+    body="$(printf '%s\n' "$body" | sed -e '/./,$!d')"
+
+    if gh issue create --title "$title" --body "$body" --label "$TRIGGER_LABEL" >/dev/null 2>&1; then
+      rm -f "$pushing"
+      log "issue files: created issue \"$title\" and removed $(basename "$pushing")"
+    else
+      log "issue files: FAILED to create issue for \"$title\" (kept $(basename "$pushing"))"
+    fi
+  done
+}
+
 # Mark a PR conflict-resolution attempt failed: comment a log tail, label the PR
 # so it is not retried forever, and restore a clean working tree on the default
 # branch.
@@ -490,6 +563,8 @@ next_conflicted_pr() {
 
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  process_issue_files
+
   # Before starting any new task, make sure no open PR is left with merge
   # conflicts; resolve one if found and re-check before doing anything else.
   conflicted_pr="$(next_conflicted_pr || true)"
