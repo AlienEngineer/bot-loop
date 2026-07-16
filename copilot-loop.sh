@@ -29,7 +29,8 @@
 #
 # Flow per iteration:
 #   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
-#      trigger label) so file-based tasks enter the queue below.
+#      trigger label, or per a "Label:" directive in the file) so file-based
+#      tasks enter the queue below.
 #   1. Before starting any new task, check open PRs targeting the default branch
 #      for merge conflicts. If one is found, merge the base branch into it and
 #      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
@@ -897,9 +898,40 @@ _fail_issue() {
 # Each *.md file in ISSUES_DIR becomes one GitHub issue: the first H1 line is
 # the title and everything after it is the body. A file is claimed by renaming
 # "<name>.md" -> "<name>_pushing.md" before the issue is created, then deleted
-# once the issue exists. Created issues always get the trigger label so the
-# loop below picks them up. If ISSUES_DIR is missing it is created with a
+# once the issue exists. By default created issues get the trigger label so the
+# loop below picks them up; a "Label:" directive in the body overrides this (see
+# issue_labels), including "Label: none" to file an unlabelled backlog issue that
+# the loop leaves alone. If ISSUES_DIR is missing it is created with a
 # TEMPLATE.md example, which is never turned into an issue.
+#
+# issue_labels is pure and covered by tests/issue-labels.test.sh (extracted
+# between the markers), so keep the marker comments intact.
+# >>> issue-label helpers >>>
+# Decide the label(s) for an issue created from a markdown file. Reads an
+# optional "Label:"/"Labels:" directive (first matching line wins, the key is
+# case-insensitive) from the body and echoes the labels to apply as a
+# comma-separated list. With no directive it echoes the given default (the
+# trigger label) so existing files keep entering the queue. A value of "none",
+# "no-label", "no_label", "nolabel", "-", or empty means "create with no label"
+# and echoes nothing. Label values are kept verbatim because GitHub label names
+# are case-sensitive.
+# Usage: issue_labels <body> <default-label>
+issue_labels() {
+  local body="$1" default="$2" line val
+  line="$(printf '%s\n' "$body" | grep -m1 -iE '^[[:space:]]*labels?[[:space:]]*:' 2>/dev/null)"
+  if [ -z "$line" ]; then
+    printf '%s\n' "$default"
+    return
+  fi
+  val="$(printf '%s\n' "$line" \
+         | sed -E 's/^[[:space:]]*[Ll][Aa][Bb][Ee][Ll][Ss]?[[:space:]]*:[[:space:]]*//; s/[[:space:]]+$//')"
+  case "$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')" in
+    ''|none|no-label|no_label|nolabel|-) return ;;
+    *) printf '%s\n' "$val" ;;
+  esac
+}
+# <<< issue-label helpers <<<
+
 process_issue_files() {
   if [ ! -d "$ISSUES_DIR" ]; then
     mkdir -p "$ISSUES_DIR" || { log "issue files: could not create $ISSUES_DIR"; return; }
@@ -911,6 +943,10 @@ everything below it becomes the issue body.
 
 Copy this file to a new name ending in .md and edit it; the copilot loop opens
 a GitHub issue from it (labelled "ready") and then deletes the file.
+
+Add a line like "Label: bug" to override the label, or "Label: none" to file the
+issue with no label at all (an unlabelled backlog item the loop leaves alone).
+List several with "Labels: bug, enhancement".
 
 Add a line like "Wait for: #1" to hold this issue until issue #1 is closed
 (resolved and merged). List several ("Wait for: #1, #2") and use "Blocked by:"
@@ -957,7 +993,31 @@ EOF
     # Drop leading blank lines from the body.
     body="$(printf '%s\n' "$body" | sed -e '/./,$!d')"
 
-    if gh issue create --title "$title" --body "$body" --label "$TRIGGER_LABEL" >/dev/null 2>&1; then
+    # Labels: honour an optional "Label:"/"Labels:" directive, defaulting to the
+    # trigger label so existing files still enter the queue. An empty result
+    # means the issue is created with no label at all. Custom labels are ensured
+    # up front so gh does not fail on a not-yet-existing label.
+    local labels l
+    local -a label_args=()
+    labels="$(issue_labels "$body" "$TRIGGER_LABEL")"
+    if [ -n "$labels" ]; then
+      local OLDIFS="$IFS"; IFS=','
+      for l in $labels; do
+        l="$(printf '%s' "$l" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        [ -n "$l" ] || continue
+        ensure_label "$l" "ededed" "Applied by copilot-loop from an issue file"
+        label_args+=(--label "$l")
+      done
+      IFS="$OLDIFS"
+    fi
+
+    local created=0
+    if [ "${#label_args[@]}" -gt 0 ]; then
+      gh issue create --title "$title" --body "$body" "${label_args[@]}" >/dev/null 2>&1 && created=1
+    else
+      gh issue create --title "$title" --body "$body" >/dev/null 2>&1 && created=1
+    fi
+    if [ "$created" -eq 1 ]; then
       rm -f "$pushing"
       log "issue files: created issue \"$title\" and removed $(basename "$pushing")"
     else
