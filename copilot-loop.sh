@@ -595,7 +595,7 @@ claim_next_ready_issue() {
 claim_next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   
-  local nums n last_author issue
+  local nums n last_author issue=""
   acquire_github_lock || return 1
   
   # Sorted ascending so oldest replied issue resumes first.
