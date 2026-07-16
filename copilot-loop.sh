@@ -6,18 +6,36 @@
 # GitHub Copilot CLI to resolve, then opens a pull request. When no work is
 # available it sleeps and checks again.
 #
+# MULTI-INSTANCE SUPPORT: Multiple instances of this script can run concurrently
+# without interfering with each other. Each instance will work on a different issue,
+# and synchronization is handled via a GitHub lock file (.copilot-loop/github.lock)
+# that protects issue selection and claiming operations. This allows you to:
+# - Run multiple instances on the same machine (with different REPO_DIR)
+# - Run multiple instances in parallel for the same repository
+# - Use git worktrees for each instance to avoid file system conflicts
+#
+# Example multi-instance setup with worktrees:
+#   # Main working tree
+#   ./copilot-loop.sh
+#
+#   # In another terminal, create a worktree and run another instance:
+#   git worktree add ../instance-2
+#   cd ../instance-2
+#   ./copilot-loop.sh
+#
 # Flow per iteration:
 #   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
 #      trigger label) so file-based tasks enter the queue below.
 #   1. Before starting any new task, check open PRs targeting the default branch
 #      for merge conflicts. If one is found, merge the base branch into it and
 #      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
-#   2. Pick the next issue to work on:
+#   2. Pick the next issue to work on (protected by GitHub lock):
 #        a. an issue awaiting a reply ("needs-info") or a failed issue
 #           ("copilot-failed") whose latest comment came from a human (the user
 #           answered a question or gave more guidance) -> resume it; else
 #        b. the oldest open issue with the trigger label (default: "ready").
-#   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels.
+#   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
+#      (done atomically by the claiming functions to prevent race conditions).
 #   4. Create a fresh branch off the default branch.
 #   5. Run `copilot -p` (all tools, file access restricted to this repo),
 #      passing the issue's comment thread so any prior Q&A is available.
@@ -231,12 +249,32 @@ gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth log
 
 mkdir -p "$LOG_DIR"
 
-# Single-instance lock.
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  die "another copilot-loop appears to be running (lock: $LOCK_DIR)"
-fi
+# Lock file for GitHub operations (issue fetching/claiming).
+# Multiple instances can run concurrently but must synchronize around GitHub API calls.
+GITHUB_LOCK_FILE="$WORK_DIR/github.lock"
+
+# Acquire a lock by creating a lock file. Waits until available.
+# Caller must ensure lock is released with release_github_lock().
+acquire_github_lock() {
+  local max_wait=30 waited=0
+  while ! mkdir "$GITHUB_LOCK_FILE" 2>/dev/null; do
+    if [ $waited -ge $max_wait ]; then
+      log "WARNING: GitHub lock timeout after ${max_wait}s, proceeding anyway"
+      return 1
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+# Release the GitHub lock.
+release_github_lock() {
+  rm -rf "$GITHUB_LOCK_FILE" 2>/dev/null || true
+}
+
 cleanup() {
-  rm -rf "$LOCK_DIR"
+  release_github_lock
   log "shutting down"
 }
 trap cleanup EXIT
@@ -298,12 +336,10 @@ process_issue() {
 
   log "issue #$num on $REPO_SLUG: $title"
 
-  # Claim the issue up-front so it is never picked up twice, even on a crash.
-  # (Separate calls so removing an absent label can't skip the add.)
-  gh issue edit "$num" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
-  gh issue edit "$num" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
-  gh issue edit "$num" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
-  gh issue edit "$num" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
+  # Note: the issue has already been claimed atomically under the GitHub lock by
+  # claim_next_ready_issue() / claim_next_reply_issue() in the main loop
+  # (in-progress added; the trigger, needs-info, or copilot-failed label
+  # removed). We don't re-claim here to avoid redundant API calls.
 
   # Start from a clean, up-to-date default branch. Drop any leftover changes
   # from a previous run so nothing blocks the switch or update.
@@ -576,10 +612,70 @@ _ask_issue() {
   git branch -D "$branch" >/dev/null 2>&1 || true
 }
 
+# Atomically find and claim the next ready issue, protected by GitHub lock.
+# Returns the issue number on success, empty string if none available.
+# This prevents multiple instances from selecting the same issue.
+claim_next_ready_issue() {
+  local issue
+  acquire_github_lock || return 1
+  
+  # Pick the oldest ready issue (lowest number == earliest created).
+  issue="$(gh issue list --state open --label "$TRIGGER_LABEL" \
+             --limit 1000 --json number --jq 'min_by(.number).number // empty' 2>/dev/null)"
+  
+  if [ -n "$issue" ]; then
+    # Claim it immediately: add in-progress, remove trigger labels.
+    # Do this WHILE HOLDING THE LOCK so no other instance can select it.
+    gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
+    printf '%s\n' "$issue"
+  fi
+  
+  release_github_lock
+  [ -n "$issue" ]
+}
+
+# Atomically find and claim the next reply issue, protected by GitHub lock.
+# Handles both "needs-info" (a pending question) and "copilot-failed" (retries
+# exhausted) issues whose latest comment came from a human. Returns the issue
+# number on success, empty string if none available.
+claim_next_reply_issue() {
+  [ -n "$BOT_LOGIN" ] || return 1
+  
+  local nums n last_author issue=""
+  acquire_github_lock || return 1
+  
+  # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
+  # Sorted ascending (by number == creation order) so oldest replied issue first.
+  nums="$( { gh issue list --state open --label "$NEEDS_INFO_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$FAILED_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
+           | sort -n -u )"
+  for n in $nums; do
+    last_author="$(gh issue view "$n" --json comments \
+                    --jq '.comments[-1].author.login // empty' 2>/dev/null)"
+    if [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ]; then
+      # Found one; claim it before releasing the lock
+      issue="$n"
+      gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+      gh issue edit "$issue" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
+      gh issue edit "$issue" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
+      break
+    fi
+  done
+  
+  release_github_lock
+  [ -n "$issue" ] && printf '%s\n' "$issue"
+  [ -n "$issue" ]
+}
+
 # Echo the number of an issue that is waiting on the user — either "needs-info"
 # (a pending question) or "copilot-failed" (retries exhausted) — and has since
 # received a reply, i.e. its most recent comment was written by someone other
 # than this bot. Oldest first. Returns 1 (no output) when nothing to resume.
+# NOTE: This function is now used only for display/checking; actual claiming is
+# done atomically by claim_next_reply_issue().
 next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   local nums n last_author
@@ -718,18 +814,17 @@ while true; do
   fi
 
   # Prefer resuming an issue where the user has answered a pending question.
-  next_issue="$(next_reply_issue || true)"
+  # Atomically select and claim to prevent race conditions with other instances.
+  next_issue="$(claim_next_reply_issue || true)"
   if [ -n "$next_issue" ]; then
     log "issue #$next_issue: user replied, resuming"
     process_issue "$next_issue" || true
     continue
   fi
 
-  # Pick the oldest ready issue (lowest number == earliest created) so work is
-  # done in creation order. gh lists newest-first, so sort here rather than
-  # relying on list order; a high --limit avoids truncating away old issues.
-  next_issue="$(gh issue list --state open --label "$TRIGGER_LABEL" \
-                  --limit 1000 --json number --jq 'min_by(.number).number // empty' 2>/dev/null)"
+  # Pick the oldest ready issue and claim it atomically.
+  # This prevents multiple instances from selecting the same issue.
+  next_issue="$(claim_next_ready_issue || true)"
 
   if [ -z "$next_issue" ]; then
     if [ -t 0 ]; then
