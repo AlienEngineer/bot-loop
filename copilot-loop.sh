@@ -39,8 +39,8 @@
 #           answered a question or gave more guidance) -> resume it; else
 #        b. the oldest open issue with the trigger label (default: "ready").
 #      Issues that declare a dependency ("Wait for: #N" in the body) are held
-#      back until every issue they name is closed (see "Issue dependencies:
-#      Wait for: #N" further down).
+#      back (and labelled "pending" while they wait) until every issue they name
+#      is closed (see "Issue dependencies: Wait for: #N" further down).
 #   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
 #      (done atomically by the claiming functions to prevent race conditions).
 #   4. Create a fresh branch for the issue, based on the latest default branch.
@@ -162,6 +162,10 @@ INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
 FAILED_LABEL="copilot-failed"
 NEEDS_INFO_LABEL="needs-info"
+# Marks an open issue held back because it declares a still-open dependency
+# ("Wait for: #N"), so the wait is visible in GitHub. Reconciled every pass and
+# removed once every dependency closes (or the issue is claimed for work).
+PENDING_LABEL="pending"
 # Marks a PR whose conflicts the loop tried and failed to resolve, so it is not
 # retried forever. Remove it by hand to let the loop try again.
 CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
@@ -559,6 +563,7 @@ ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot
 ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the copilot loop"
 ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce changes"
 ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
+ensure_label "$PENDING_LABEL"    "d4c5f9" "Waiting for another issue to be resolved before it can start"
 ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The copilot loop could not resolve this PR's merge conflicts"
 
 # --- Workspace isolation -----------------------------------------------------
@@ -886,7 +891,7 @@ a GitHub issue from it (labelled "ready") and then deletes the file.
 
 Add a line like "Wait for: #1" to hold this issue until issue #1 is closed
 (resolved and merged). List several ("Wait for: #1, #2") and use "Blocked by:"
-or "Depends on:" if you prefer.
+or "Depends on:" if you prefer. While it waits the issue is labelled "pending".
 EOF
     log "issue files: created $ISSUES_DIR with TEMPLATE.md"
     return
@@ -974,7 +979,9 @@ _ask_issue() {
 # A PR that closes the blocker, once merged, closes the issue, so CLOSED is
 # exactly "resolved and merged". "Blocked by:" and "Depends on:" are accepted
 # as synonyms, several "#N" may be listed on one line, and matching is
-# case-insensitive.
+# case-insensitive. While an issue is held back this way it is labelled
+# "pending" so the wait is visible in GitHub; the label is removed once every
+# dependency closes (or the issue is claimed for work).
 #
 # The two functions below are covered by tests/wait-for.test.sh, which extracts
 # them between the markers, so keep the marker comments intact.
@@ -1015,6 +1022,57 @@ _fmt_blockers() {
   printf '%s' "$out"
 }
 
+# --- Pending label: mark issues waiting on a dependency ----------------------
+# An issue held back by an open dependency ("Wait for: #N") is labelled
+# "pending" so the wait is visible in GitHub without reading the body. The
+# label is reconciled every loop pass and removed as soon as every dependency
+# has closed (or the issue is claimed for work).
+#
+# pending_action is pure and covered by tests/pending-label.test.sh (extracted
+# between the markers), so keep the marker comments intact.
+# >>> pending-label helpers >>>
+# Decide what to do with the pending label for one issue. Inputs: <blockers>
+# (non-empty when the issue is waiting on at least one open dependency) and
+# <has_pending> ("true" when it already carries the label). Echoes "add" when
+# it should gain the label, "remove" when it should lose it, and nothing when
+# it is already in the right state.
+pending_action() {
+  local blockers="$1" has_pending="$2"
+  if [ -n "$blockers" ] && [ "$has_pending" != "true" ]; then
+    printf 'add\n'
+  elif [ -z "$blockers" ] && [ "$has_pending" = "true" ]; then
+    printf 'remove\n'
+  fi
+}
+# <<< pending-label helpers <<<
+
+# Reconcile the pending label across the whole open working set (issues carrying
+# the trigger, needs-info or failed label) so it always reflects reality: mark
+# an issue "pending" while it waits for an open dependency and unmark it once
+# nothing blocks it. Only issues whose state actually changed are edited, and gh
+# failures never abort the loop. Relies on issue_open_blockers and pending_action.
+reconcile_pending_labels() {
+  local nums n body blockers has_pending
+  nums="$( { gh issue list --state open --label "$TRIGGER_LABEL"    --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$NEEDS_INFO_LABEL" --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$FAILED_LABEL"     --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
+           | sort -n -u )"
+  for n in $nums; do
+    body="$(gh issue view "$n" --json body --jq '.body' 2>/dev/null)"
+    blockers="$(issue_open_blockers "$n" "$body")"
+    has_pending="$(gh issue view "$n" --json labels \
+                    --jq 'any(.labels[]; .name == "'"$PENDING_LABEL"'")' 2>/dev/null)"
+    case "$(pending_action "$blockers" "$has_pending")" in
+      add)
+        gh issue edit "$n" --add-label "$PENDING_LABEL" >/dev/null 2>&1 || true
+        log "issue #$n: waiting for $(_fmt_blockers "$blockers") to close; marked $PENDING_LABEL" ;;
+      remove)
+        gh issue edit "$n" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
+        log "issue #$n: dependencies resolved; removed $PENDING_LABEL" ;;
+    esac
+  done
+}
+
 # Atomically find and claim the next ready issue, protected by GitHub lock.
 # Returns the issue number on success, empty string if none available.
 # This prevents multiple instances from selecting the same issue.
@@ -1040,6 +1098,7 @@ claim_next_ready_issue() {
     issue="$n"
     gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
     break
   done
 
@@ -1099,6 +1158,7 @@ claim_next_reply_issue() {
     gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
     break
   done
   
@@ -1329,6 +1389,11 @@ while true; do
     resolve_pr_conflicts "$conflicted_pr" || true
     continue
   fi
+
+  # Keep the "pending" label in sync with each open issue's dependency state
+  # before picking work, so an issue waiting on another ("Wait for: #N") is
+  # visibly marked and one whose blockers have closed is unmarked.
+  reconcile_pending_labels
 
   # Prefer resuming an issue where the user has answered a pending question.
   # Atomically select and claim to prevent race conditions with other instances.
