@@ -36,7 +36,10 @@
 #        b. the oldest open issue with the trigger label (default: "ready").
 #   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
 #      (done atomically by the claiming functions to prevent race conditions).
-#   4. Create a fresh branch off the default branch.
+#   4. Create a fresh branch for the issue, based on the latest default branch.
+#      The default branch (main/master) is never checked out for the work; when
+#      the repo is used with git worktrees each issue runs in its own worktree so
+#      the shared checkout is left untouched.
 #   5. Run `copilot -p` (all tools, file access restricted to this repo),
 #      passing the issue's comment thread so any prior Q&A is available.
 #   6a. If Copilot needs more information it writes a question file; post the
@@ -67,10 +70,14 @@
 #                            only to the per-run log files (the original
 #                            behaviour). By default the loop streams Copilot's
 #                            output live to stdout as well as the log files.
+#   --worktrees / --no-worktrees
+#                            Force per-issue git worktrees on/off (default: auto,
+#                            on when the repo is used with git worktrees).
 #   -h, --help               Show help and exit.
 #
 # Environment variables (equivalent to the flags above):
-#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET
+#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET,
+#   USE_WORKTREES
 # Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 # (default: 2).
 #
@@ -90,6 +97,10 @@ ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
 QUIET="${QUIET:-}"
+# Whether each issue gets its own git worktree instead of switching branches in
+# the shared checkout. Empty means auto-detect (see below); 1/0 force it on/off.
+# The default branch (main/master) is never checked out for work in either mode.
+USE_WORKTREES="${USE_WORKTREES:-}"
 
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
@@ -149,10 +160,17 @@ work:
                            only to the per-run log files (the original
                            behaviour). By default the loop streams Copilot's
                            output live to stdout as well as the log files.
+  --worktrees              Give every issue its own git worktree (never touch
+                           the shared checkout). Default: auto (on when the repo
+                           is used with git worktrees).
+  --no-worktrees           Work in the current checkout instead of per-issue
+                           worktrees. The default branch is still never checked
+                           out for work; the issue branch is created directly.
   -h, --help               Show this help and exit.
 
 Environment variables (equivalent to the flags above):
-  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET
+  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, ISSUES_DIR, QUIET,
+  USE_WORKTREES
 Plus MAX_ATTEMPTS (env-only, no flag): attempts per issue before giving up
 (default: 2).
 EOF
@@ -208,6 +226,8 @@ while [ $# -gt 0 ]; do
     --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
     --issues-dir=*)    ISSUES_DIR="${1#*=}" ;;
     --quiet)           QUIET=1 ;;
+    --worktrees)       USE_WORKTREES=1 ;;
+    --no-worktrees)    USE_WORKTREES=0 ;;
     -h|--help)         usage; exit 0 ;;
     *)                 die "unknown argument: $1 (use --help)" ;;
   esac
@@ -293,6 +313,28 @@ if ! git config --get-all remote.origin.fetch 2>/dev/null | grep -q .; then
   git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null \
     && log "restored missing fetch refspec for origin"
 fi
+
+# Decide whether to isolate each issue in its own git worktree. Auto-detect when
+# not forced: use worktrees if we are running inside a linked worktree, or if the
+# repository already has more than one worktree. This keeps the shared checkout
+# untouched and guarantees the default branch is never used for the work. Each
+# issue still gets its own branch in either mode.
+case "$USE_WORKTREES" in
+  1|true|yes|on)  USE_WORKTREES=1 ;;
+  0|false|no|off) USE_WORKTREES=0 ;;
+  *)
+    USE_WORKTREES=0
+    if [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
+      USE_WORKTREES=1
+    elif [ "$(git worktree list --porcelain 2>/dev/null | grep -c '^worktree ')" -gt 1 ]; then
+      USE_WORKTREES=1
+    fi
+    ;;
+esac
+# Where per-issue worktrees are created (only used when USE_WORKTREES=1). A
+# sibling of REPO_DIR so it never lands inside the tracked working tree.
+WORKTREE_BASE="$(dirname "$REPO_DIR")/copilot-loop-worktrees"
+
 # Our own login, used to tell the user's replies apart from the loop's own
 # comments when deciding whether a "needs-info" issue is ready to resume.
 BOT_LOGIN="$(gh api user --jq '.login' 2>/dev/null)"
@@ -305,6 +347,11 @@ log "  origin url:  $ORIGIN_URL"
 log "  local dir:   $REPO_DIR"
 log "============================================================"
 log "default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL sleep=${SLEEP_MINUTES}m"
+if [ "$USE_WORKTREES" = 1 ]; then
+  log "isolation: per-issue git worktrees under $WORKTREE_BASE (default branch never checked out)"
+else
+  log "isolation: per-issue branches in the current checkout (default branch never checked out)"
+fi
 if [ "$QUIET" = 1 ]; then
   log "copilot output: log files only (--quiet); stdout hidden"
 else
@@ -317,6 +364,66 @@ ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the copilot loop"
 ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce changes"
 ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
 ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The copilot loop could not resolve this PR's merge conflicts"
+
+# --- Workspace isolation -----------------------------------------------------
+# Every issue (and every PR conflict fix) runs in its own branch, prepared here.
+# The default branch (main/master) is NEVER checked out for the work: the branch
+# is created directly from a start commit-ish (normally origin/<default>).
+#
+# Two modes, selected by USE_WORKTREES:
+#   1 -> a dedicated git worktree per branch, so the shared checkout is untouched
+#        (required when the repo is used with git worktrees, where the default
+#        branch may already be checked out elsewhere and cannot be switched to).
+#   0 -> the branch is checked out in REPO_DIR itself.
+# Both set WORKSPACE_DIR to the directory Copilot and git should operate in.
+WORKSPACE_DIR=""
+
+# Map a branch name to its worktree directory (slashes flattened to dashes).
+_worktree_path() {
+  printf '%s/%s' "$WORKTREE_BASE" "$(printf '%s' "$1" | tr '/' '-')"
+}
+
+# prepare_workspace <branch> <start-ref>
+# Create (or reset) <branch> at <start-ref> and set WORKSPACE_DIR. Returns 1 if
+# the branch/worktree could not be created.
+prepare_workspace() {
+  local branch="$1" start="$2"
+  cleanup_workspace "$branch"
+  if [ "$USE_WORKTREES" = 1 ]; then
+    local wt; wt="$(_worktree_path "$branch")"
+    mkdir -p "$WORKTREE_BASE" 2>/dev/null || true
+    if ! git worktree add --force -B "$branch" "$wt" "$start" >/dev/null 2>&1; then
+      return 1
+    fi
+    WORKSPACE_DIR="$wt"
+  else
+    git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
+    git -C "$REPO_DIR" clean -fd >/dev/null 2>&1 || true
+    if ! git -C "$REPO_DIR" switch -C "$branch" "$start" >/dev/null 2>&1; then
+      return 1
+    fi
+    WORKSPACE_DIR="$REPO_DIR"
+  fi
+}
+
+# cleanup_workspace <branch>
+# Tear down the workspace for <branch> and delete the local branch. Never checks
+# out the default branch; in-place mode parks on a detached HEAD so the branch
+# can be deleted.
+cleanup_workspace() {
+  local branch="$1"
+  if [ "$USE_WORKTREES" = 1 ]; then
+    local wt; wt="$(_worktree_path "$branch")"
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    git worktree prune >/dev/null 2>&1 || true
+  else
+    git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
+    git -C "$REPO_DIR" clean -fd >/dev/null 2>&1 || true
+    git -C "$REPO_DIR" switch --detach >/dev/null 2>&1 || true
+  fi
+  git branch -D "$branch" >/dev/null 2>&1 || true
+  WORKSPACE_DIR=""
+}
 
 # --- Core: process a single issue -------------------------------------------
 # Returns 0 on success (PR opened), 1 on failure.
@@ -346,22 +453,17 @@ process_issue() {
   # (in-progress added; the trigger, needs-info, or copilot-failed label
   # removed). We don't re-claim here to avoid redundant API calls.
 
-  # Start from a clean, up-to-date default branch. Drop any leftover changes
-  # from a previous run so nothing blocks the switch or update.
-  git reset --hard >/dev/null 2>&1 || true
-  git clean -fd >/dev/null 2>&1 || true
-  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
-  # Pull the latest changes and resolve any conflicts. The local default branch
-  # is a throwaway mirror (all work happens on copilot/* branches), so if it has
-  # drifted and cannot fast-forward we hard-reset onto the remote rather than
-  # silently working from a stale tree.
-  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
-  if ! git merge --ff-only "origin/${DEFAULT_BRANCH}" >/dev/null 2>&1; then
-    git reset --hard "origin/${DEFAULT_BRANCH}" >/dev/null 2>&1 \
-      || git reset --hard FETCH_HEAD >/dev/null 2>&1 || true
+  # Base the issue branch on the latest default branch WITHOUT checking the
+  # default branch out (it may be checked out in another worktree, and the issue
+  # requires we never work on main/master). Fetch first so origin/<default> is
+  # current, then create the branch/worktree straight from it.
+  git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+  local start="origin/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
+  if ! prepare_workspace "$branch" "$start"; then
+    _fail_issue "$num" "$log_file" "could not create work branch $branch"
+    return 1
   fi
-  # Fresh branch (reset if a stale one lingers from a previous failed run).
-  git switch -c "$branch" >/dev/null 2>&1 || git switch -C "$branch" >/dev/null 2>&1
 
   # Build the prompt for Copilot. Include the existing comment thread so any
   # earlier question/answer exchange is available as context.
@@ -393,14 +495,18 @@ when you genuinely cannot proceed without their input.
 EOF
 )"
 
-  # Run Copilot non-interactively. All tools allowed, but file access stays
-  # restricted to this repo (we deliberately do not pass --allow-all-paths).
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  # Run Copilot non-interactively from the issue's workspace. All tools allowed
+  # and file access stays restricted to that checkout (we deliberately do not
+  # pass --allow-all-paths); WORK_DIR is additionally allowed so Copilot can
+  # write the question file there when its workspace is a separate worktree.
+  local -a copilot_args=(-p "$prompt" --allow-all-tools --add-dir "$WORK_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
   log "issue #$num: running copilot (log: $log_file)"
+  cd "$WORKSPACE_DIR" 2>/dev/null || true
   run_copilot "$log_file" "${copilot_args[@]}"
   local copilot_rc=$COPILOT_RC
+  cd "$REPO_DIR" 2>/dev/null || true
   log "issue #$num: copilot exited with code $copilot_rc"
 
   # Copilot asked for more information instead of coding: relay the question to
@@ -411,15 +517,15 @@ EOF
   fi
 
   # Commit whatever changed (in case Copilot did not commit itself).
-  git add -A
-  git diff --cached --quiet || git commit -m "$commit_msg" >/dev/null 2>&1
+  git -C "$WORKSPACE_DIR" add -A
+  git -C "$WORKSPACE_DIR" diff --cached --quiet || git -C "$WORKSPACE_DIR" commit -m "$commit_msg" >/dev/null 2>&1
 
   # Refresh our view of the default branch so we can sync against any work that
   # landed on it while Copilot was running.
-  git fetch origin "$DEFAULT_BRANCH" >>"$log_file" 2>&1 || true
+  git -C "$WORKSPACE_DIR" fetch origin "$DEFAULT_BRANCH" >>"$log_file" 2>&1 || true
 
-  ahead="$(git rev-list --count "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null \
-          || git rev-list --count "${DEFAULT_BRANCH}..HEAD" 2>/dev/null || echo 0)"
+  ahead="$(git -C "$WORKSPACE_DIR" rev-list --count "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null \
+          || git -C "$WORKSPACE_DIR" rev-list --count "${DEFAULT_BRANCH}..HEAD" 2>/dev/null || echo 0)"
 
   if [ "${ahead:-0}" -gt 0 ]; then
     # Sync onto the latest default branch before pushing so the PR merges
@@ -428,10 +534,10 @@ EOF
     # missing (e.g. a worktree with no fetch refspec) so we never rebase onto a
     # ref that does not exist.
     local sync_target="origin/${DEFAULT_BRANCH}" rebase_out reason detail
-    git rev-parse --verify --quiet "$sync_target" >/dev/null 2>&1 || sync_target="FETCH_HEAD"
-    if ! rebase_out="$(git rebase "$sync_target" 2>&1)"; then
+    git -C "$WORKSPACE_DIR" rev-parse --verify --quiet "$sync_target" >/dev/null 2>&1 || sync_target="FETCH_HEAD"
+    if ! rebase_out="$(git -C "$WORKSPACE_DIR" rebase "$sync_target" 2>&1)"; then
       printf '%s\n' "$rebase_out" >>"$log_file"
-      git rebase --abort >/dev/null 2>&1 || true
+      git -C "$WORKSPACE_DIR" rebase --abort >/dev/null 2>&1 || true
       # Report the actual git error, and only call it a "conflict" when it is
       # one — an invalid upstream or a lock error is not a merge conflict.
       detail="$(printf '%s' "$rebase_out" | grep -iE 'fatal|error|conflict' | tail -n1)"
@@ -446,7 +552,7 @@ EOF
       return 1
     fi
     log "issue #$num: $ahead commit(s), pushing branch $branch"
-    if ! git push -u origin "$branch" >>"$log_file" 2>&1; then
+    if ! git -C "$WORKSPACE_DIR" push -u origin "$branch" >>"$log_file" 2>&1; then
       _fail_issue "$num" "$log_file" "git push failed"
       return 1
     fi
@@ -458,7 +564,7 @@ EOF
     fi
     gh issue edit "$num" --add-label "$DONE_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
     log "issue #$num: DONE -> $pr_url"
-    git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
+    cleanup_workspace "$branch"
     return 0
   fi
 
@@ -508,8 +614,7 @@ _fail_issue() {
   else
     gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
   fi
-  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
-  git branch -D "$branch" >/dev/null 2>&1 || true
+  cleanup_workspace "$branch"
 }
 
 # --- Issue files: create GitHub issues from markdown in issues/ --------------
@@ -582,8 +687,7 @@ EOF
 }
 
 # Mark a PR conflict-resolution attempt failed: comment a log tail, label the PR
-# so it is not retried forever, and restore a clean working tree on the default
-# branch.
+# so it is not retried forever, and tear down the workspace.
 _fail_pr() {
   local num="$1" log_file="$2" reason="$3" tail_out
   log "PR #$num: FAILED to resolve conflicts - $reason"
@@ -592,10 +696,7 @@ _fail_pr() {
   gh pr comment "$num" --body "$(printf 'copilot-loop could not resolve merge conflicts: %s\n\n```\n%s\n```' \
     "$reason" "$tail_out")" >/dev/null 2>&1 || true
   gh pr edit "$num" --add-label "$CONFLICT_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
-  git merge --abort >/dev/null 2>&1 || true
-  git reset --hard >/dev/null 2>&1
-  git clean -fd >/dev/null 2>&1
-  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
+  cleanup_workspace "$head"
 }
 
 # Copilot needs more information: post its question to the issue, mark it
@@ -611,10 +712,7 @@ _ask_issue() {
   gh issue edit "$num" --add-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
   gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
   rm -f "$qf"
-  git reset --hard >/dev/null 2>&1
-  git clean -fd >/dev/null 2>&1
-  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
-  git branch -D "$branch" >/dev/null 2>&1 || true
+  cleanup_workspace "$branch"
 }
 
 # Atomically find and claim the next ready issue, protected by GitHub lock.
@@ -725,20 +823,21 @@ resolve_pr_conflicts() {
 
   log "PR #$num has conflicts with $base: $title"
 
-  # Get an up-to-date view of both branches and check out the PR head fresh.
-  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
-  git fetch origin >>"$log_file" 2>&1 || true
-  if ! git switch -C "$head" "origin/$head" >>"$log_file" 2>&1; then
+  # Base a fresh workspace on the PR head branch, without ever checking out the
+  # default branch. Then merge the base branch into it so any conflicts surface
+  # here for Copilot to resolve.
+  git -C "$REPO_DIR" fetch origin >>"$log_file" 2>&1 || true
+  if ! prepare_workspace "$head" "origin/$head"; then
     _fail_pr "$num" "$log_file" "could not check out PR head branch '$head'"
     return 1
   fi
 
   # Merge the base branch. A clean merge means the conflict was already resolved
   # upstream; otherwise git leaves conflict markers for Copilot to fix.
-  if git merge --no-edit "origin/$base" >>"$log_file" 2>&1; then
+  if git -C "$WORKSPACE_DIR" merge --no-edit "origin/$base" >>"$log_file" 2>&1; then
     log "PR #$num: merged $base with no conflicts to resolve"
   else
-    conflicts="$(git diff --name-only --diff-filter=U 2>/dev/null)"
+    conflicts="$(git -C "$WORKSPACE_DIR" diff --name-only --diff-filter=U 2>/dev/null)"
     log "PR #$num: resolving conflicts in: $(printf '%s' "$conflicts" | tr '\n' ' ')"
 
     local prompt
@@ -760,27 +859,29 @@ EOF
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
+    cd "$WORKSPACE_DIR" 2>/dev/null || true
     run_copilot "$log_file" "${copilot_args[@]}"
     copilot_rc=$COPILOT_RC
+    cd "$REPO_DIR" 2>/dev/null || true
     log "PR #$num: copilot exited with code $copilot_rc"
 
     # Bail out if Copilot left conflict markers behind in any conflicted file.
     local f unresolved=""
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      [ -f "$f" ] && grep -qE '^(<{7}|>{7})' "$f" && unresolved="$unresolved $f"
+      [ -f "$WORKSPACE_DIR/$f" ] && grep -qE '^(<{7}|>{7})' "$WORKSPACE_DIR/$f" && unresolved="$unresolved $f"
     done <<< "$conflicts"
     if [ -n "$unresolved" ]; then
       _fail_pr "$num" "$log_file" "conflict markers still present in:$unresolved"
       return 1
     fi
 
-    git add -A
-    git commit --no-edit >/dev/null 2>&1 \
-      || git commit -m "Merge $base into $head to resolve conflicts (#$num)" >/dev/null 2>&1
+    git -C "$WORKSPACE_DIR" add -A
+    git -C "$WORKSPACE_DIR" commit --no-edit >/dev/null 2>&1 \
+      || git -C "$WORKSPACE_DIR" commit -m "Merge $base into $head to resolve conflicts (#$num)" >/dev/null 2>&1
   fi
 
-  if ! git push origin "HEAD:$head" >>"$log_file" 2>&1; then
+  if ! git -C "$WORKSPACE_DIR" push origin "HEAD:$head" >>"$log_file" 2>&1; then
     _fail_pr "$num" "$log_file" "git push failed"
     return 1
   fi
@@ -788,8 +889,7 @@ EOF
   gh pr comment "$num" \
     --body "copilot-loop resolved the merge conflicts with \`$base\`." >/dev/null 2>&1 || true
   log "PR #$num: conflicts resolved and pushed"
-  git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
-  git branch -D "$head" >/dev/null 2>&1 || true
+  cleanup_workspace "$head"
   return 0
 }
 
