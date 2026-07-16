@@ -166,6 +166,14 @@ REPO_SLUG="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null
 [ -n "$REPO_SLUG" ] || REPO_SLUG="unknown"
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)"
 [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="main"
+# Linked worktrees (and some manually-added remotes) can have no fetch refspec,
+# so `git fetch origin` never populates origin/* remote-tracking refs and every
+# `origin/<branch>` reference fails with "invalid upstream". Restore the standard
+# refspec so remote-tracking refs always resolve.
+if ! git config --get-all remote.origin.fetch 2>/dev/null | grep -q .; then
+  git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null \
+    && log "restored missing fetch refspec for origin"
+fi
 # Our own login, used to tell the user's replies apart from the loop's own
 # comments when deciding whether a "needs-info" issue is ready to resume.
 BOT_LOGIN="$(gh api user --jq '.login' 2>/dev/null)"
@@ -293,9 +301,25 @@ EOF
   if [ "${ahead:-0}" -gt 0 ]; then
     # Sync onto the latest default branch before pushing so the PR merges
     # cleanly and does not fall behind commits that landed during the run.
-    if ! git rebase "origin/${DEFAULT_BRANCH}" >>"$log_file" 2>&1; then
+    # Prefer the remote-tracking ref, but fall back to FETCH_HEAD if it is
+    # missing (e.g. a worktree with no fetch refspec) so we never rebase onto a
+    # ref that does not exist.
+    local sync_target="origin/${DEFAULT_BRANCH}" rebase_out reason detail
+    git rev-parse --verify --quiet "$sync_target" >/dev/null 2>&1 || sync_target="FETCH_HEAD"
+    if ! rebase_out="$(git rebase "$sync_target" 2>&1)"; then
+      printf '%s\n' "$rebase_out" >>"$log_file"
       git rebase --abort >/dev/null 2>&1 || true
-      _fail_issue "$num" "$log_file" "failed to sync with ${DEFAULT_BRANCH} (rebase conflict)"
+      # Report the actual git error, and only call it a "conflict" when it is
+      # one — an invalid upstream or a lock error is not a merge conflict.
+      detail="$(printf '%s' "$rebase_out" | grep -iE 'fatal|error|conflict' | tail -n1)"
+      if printf '%s' "$rebase_out" | grep -qi 'conflict'; then
+        reason="failed to sync with ${DEFAULT_BRANCH} (rebase conflict)"
+      elif [ -n "$detail" ]; then
+        reason="failed to sync with ${DEFAULT_BRANCH}: ${detail}"
+      else
+        reason="failed to sync with ${DEFAULT_BRANCH}"
+      fi
+      _fail_issue "$num" "$log_file" "$reason" "$rebase_out"
       return 1
     fi
     log "issue #$num: $ahead commit(s), pushing branch $branch"
@@ -319,15 +343,22 @@ EOF
   return 1
 }
 
-# Mark an issue failed, comment with a log tail, and clean up the branch.
+# Mark an issue failed, comment with the error details (or a log tail as a
+# fallback), and clean up the branch.
 _fail_issue() {
-  local num="$1" log_file="$2" reason="$3"
+  local num="$1" log_file="$2" reason="$3" details="${4:-}"
   log "issue #$num: FAILED - $reason"
-  local tail_out
-  tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
+  # Prefer explicit details (the exact failing command's output) over the raw
+  # log tail, which is mostly Copilot chatter and buries the real cause.
+  local block
+  if [ -n "$details" ]; then
+    block="$details"
+  else
+    block="$(tail -n 20 "$log_file" 2>/dev/null)"
+  fi
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
   gh issue comment "$num" --body "$(printf 'copilot-loop failed: %s\n\n```\n%s\n```' \
-    "$reason" "$tail_out")" >/dev/null 2>&1 || true
+    "$reason" "$block")" >/dev/null 2>&1 || true
   gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
   git switch "$DEFAULT_BRANCH" >/dev/null 2>&1
   git branch -D "$branch" >/dev/null 2>&1 || true
