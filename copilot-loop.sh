@@ -32,8 +32,10 @@
 #      trigger label, or per a "Label:" directive in the file) so file-based
 #      tasks enter the queue below.
 #   1. Before starting any new task, check open PRs targeting the default branch
-#      for merge conflicts. If one is found, merge the base branch into it and
-#      let Copilot resolve the conflicts, then push — so PRs stay mergeable.
+#      for merge conflicts. GitHub computes mergeability asynchronously, so the
+#      loop first waits (bounded) for any PR still reported UNKNOWN to be
+#      evaluated, then — if a PR is conflicting — merges the base branch into it
+#      and lets Copilot resolve the conflicts, then pushes, so PRs stay mergeable.
 #   2. Pick the next issue to work on (protected by GitHub lock):
 #        a. an issue awaiting a reply ("needs-info") or a failed issue
 #           ("copilot-failed") whose latest comment came from a human (the user
@@ -135,6 +137,10 @@
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
+# Plus MERGEABILITY_WAIT_ATTEMPTS / MERGEABILITY_WAIT_SECONDS (env-only): bound
+# the wait for GitHub to finish computing PR mergeability before the conflict
+# check, so a still-UNKNOWN (not yet evaluated) conflict is not skipped. Defaults
+# 5 attempts, 3s apart; set MERGEABILITY_WAIT_ATTEMPTS=0 to disable the wait.
 #
 set -uo pipefail
 
@@ -209,6 +215,14 @@ DELETE_REMOTE_BRANCH="${DELETE_REMOTE_BRANCH:-}"
 # Periodically remove local branches, worktrees and remote branches whose PR has
 # merged. On by default; set to 0 (or pass --no-cleanup-merged) to disable.
 CLEANUP_MERGED="${CLEANUP_MERGED:-}"
+# GitHub computes a PR's mergeable state asynchronously, so just after a push or a
+# base-branch move it reports UNKNOWN for a while. Before the per-iteration
+# conflict check the loop waits for that computation to settle, so a PR that is
+# really in conflict but not yet evaluated is not skipped. Env-only (no flag):
+# MERGEABILITY_WAIT_ATTEMPTS bounds the wait (0 disables it), and
+# MERGEABILITY_WAIT_SECONDS is the pause between polls.
+MERGEABILITY_WAIT_ATTEMPTS="${MERGEABILITY_WAIT_ATTEMPTS:-}"
+MERGEABILITY_WAIT_SECONDS="${MERGEABILITY_WAIT_SECONDS:-}"
 
 INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
@@ -676,6 +690,15 @@ case "$CLEANUP_MERGED" in
   0|false|no|off) CLEANUP_MERGED=0 ;;
   *)              CLEANUP_MERGED=1 ;;
 esac
+
+# Bounded wait for GitHub's async mergeability computation before the conflict
+# check (see the "mergeability helpers"). Defaults give a freshly updated PR time
+# to be evaluated without stalling the loop; 0 attempts disables the wait. Force
+# both to non-negative integers so a bad value never breaks the arithmetic.
+MERGEABILITY_WAIT_ATTEMPTS="${MERGEABILITY_WAIT_ATTEMPTS:-5}"
+case "$MERGEABILITY_WAIT_ATTEMPTS" in ''|*[!0-9]*) MERGEABILITY_WAIT_ATTEMPTS=5 ;; esac
+MERGEABILITY_WAIT_SECONDS="${MERGEABILITY_WAIT_SECONDS:-3}"
+case "$MERGEABILITY_WAIT_SECONDS" in ''|*[!0-9]*) MERGEABILITY_WAIT_SECONDS=3 ;; esac
 
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
@@ -1883,6 +1906,48 @@ EOF
   return 0
 }
 
+# >>> mergeability helpers >>>
+# GitHub computes a PR's mergeable state asynchronously: right after a PR is
+# opened, pushed to, or its base branch moves, `mergeable` is reported as UNKNOWN
+# until a background job finishes. next_conflicted_pr only matches CONFLICTING, so
+# a PR that is really in conflict but not yet evaluated would be skipped and the
+# loop would start a ready issue with the conflict still open. Waiting here for
+# GitHub to finish computing makes the "resolve conflicts before picking up new
+# work" guarantee reliable instead of racing the evaluation.
+
+# Echo the numbers (one per line) of open PRs targeting the default branch whose
+# mergeability GitHub has not finished computing (UNKNOWN). Empty output means
+# every open PR has been evaluated.
+unknown_mergeability_prs() {
+  gh pr list --state open --base "$DEFAULT_BRANCH" \
+    --json number,mergeable \
+    --jq '.[] | select(.mergeable == "UNKNOWN") | .number' 2>/dev/null
+}
+
+# Block (bounded) until no open PR is left with UNKNOWN mergeability, so the
+# conflict check that follows sees accurate state. Each pass nudges GitHub to
+# (re)compute every still-unknown PR by viewing it — the documented way to force
+# the background evaluation. MERGEABILITY_WAIT_ATTEMPTS=0 disables the wait and a
+# PR stuck UNKNOWN never blocks the loop past the attempt budget.
+ensure_pr_mergeability_known() {
+  local attempts="$MERGEABILITY_WAIT_ATTEMPTS" delay="$MERGEABILITY_WAIT_SECONDS"
+  local i unknown count n
+  [ "$attempts" -gt 0 ] 2>/dev/null || return 0
+  for (( i=1; i<=attempts; i++ )); do
+    unknown="$(unknown_mergeability_prs)"
+    [ -n "$unknown" ] || return 0
+    count="$(printf '%s\n' "$unknown" | grep -c .)"
+    log "waiting for GitHub to compute mergeability of $count open PR(s) before the conflict check (attempt $i/$attempts)"
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      gh pr view "$n" --json mergeable >/dev/null 2>&1 || true
+    done <<< "$unknown"
+    [ "$i" -lt "$attempts" ] && sleep "$delay"
+  done
+  return 0
+}
+# <<< mergeability helpers <<<
+
 # >>> conflict-pr helpers >>>
 # Echo the number of the lowest-numbered open PR targeting the default branch
 # whose merge is CONFLICTING, skipping any already marked unresolved or already
@@ -2002,6 +2067,10 @@ while true; do
   # Before starting any new task, make sure no open PR is left with merge
   # conflicts; claim one atomically if found and re-check before doing anything
   # else. Claiming under the lock stops two instances resolving the same PR.
+  # First let GitHub finish computing PR mergeability so this check sees accurate
+  # state instead of skipping a still-UNKNOWN PR (which would let the loop start a
+  # ready issue with a conflict still open).
+  ensure_pr_mergeability_known
   conflicted_pr="$(claim_next_conflicted_pr || true)"
   if [ -n "$conflicted_pr" ]; then
     log "PR #$conflicted_pr has conflicts, resolving before starting new tasks"
