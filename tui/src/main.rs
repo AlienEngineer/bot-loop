@@ -63,6 +63,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') | KeyCode::Home => app.first(),
         KeyCode::Char('G') | KeyCode::End => app.last(),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
         _ => {}
     }
 }

@@ -83,7 +83,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         spans.push(Span::raw("  "));
     }
     spans.push(Span::styled(
-        "j/k move · g/G top/bottom · r refresh · q quit",
+        "j/k move · g/G top/bottom · s start · r refresh · q quit",
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);

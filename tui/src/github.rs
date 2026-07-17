@@ -34,6 +34,11 @@ impl Issue {
         self.labels.iter().map(|l| l.name.as_str()).collect()
     }
 
+    /// Whether the issue already carries a label with the given name.
+    pub fn has_label(&self, name: &str) -> bool {
+        self.labels.iter().any(|l| l.name == name)
+    }
+
     /// The author login, or an empty string when unknown.
     pub fn author_login(&self) -> &str {
         self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
@@ -42,6 +47,22 @@ impl Issue {
 
 /// The `gh` JSON fields requested for each issue.
 const GH_JSON_FIELDS: &str = "number,title,labels,author";
+
+/// The label the loop watches for, when `TRIGGER_LABEL` is unset.
+pub const READY_LABEL: &str = "ready";
+
+/// Resolve the trigger label from an optional env value, mirroring the loop's
+/// `TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"`. Empty falls back to the default.
+fn resolve_label(env: Option<String>) -> String {
+    env.filter(|s| !s.is_empty())
+        .unwrap_or_else(|| READY_LABEL.to_string())
+}
+
+/// The label to add when marking an issue ready, honouring `TRIGGER_LABEL` so
+/// the TUI and `copilot-loop.sh` stay in sync.
+pub fn ready_label() -> String {
+    resolve_label(std::env::var("TRIGGER_LABEL").ok())
+}
 
 /// Parse the JSON array produced by `gh issue list --json ...`.
 pub fn parse_issues(json: &str) -> Result<Vec<Issue>> {
@@ -76,6 +97,58 @@ pub fn fetch_issues(limit: u32) -> Result<Vec<Issue>> {
     }
 
     parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Build the `gh issue edit` arguments to add a label. Pure for testing.
+fn add_label_args(number: u64, label: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        number.to_string(),
+        "--add-label".to_string(),
+        label.to_string(),
+    ]
+}
+
+/// Build the `gh label create` arguments used to ensure the label exists. Pure
+/// for testing. Mirrors `ensure_label` in `copilot-loop.sh` (same colour/desc).
+fn create_label_args(label: &str) -> Vec<String> {
+    vec![
+        "label".to_string(),
+        "create".to_string(),
+        label.to_string(),
+        "--color".to_string(),
+        "0e8a16".to_string(),
+        "--description".to_string(),
+        "Ready for the copilot loop to pick up".to_string(),
+    ]
+}
+
+/// Add a label to an issue using the `gh` CLI.
+///
+/// First ensures the label exists (`gh issue edit --add-label` fails on an
+/// unknown label), ignoring the "already exists" error the same way the loop's
+/// `ensure_label` does. Then runs `gh issue edit <number> --add-label <label>`.
+/// Returns an error when `gh` is missing, not authenticated, or the edit fails.
+pub fn add_label(number: u64, label: &str) -> Result<()> {
+    // Best-effort create; a failure here (usually "already exists") is ignored
+    // so a genuine problem surfaces on the edit below instead.
+    let _ = Command::new("gh").args(create_label_args(label)).output();
+
+    let output = Command::new("gh")
+        .args(add_label_args(number, label))
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue edit` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -117,6 +190,45 @@ mod tests {
     #[test]
     fn reports_invalid_json() {
         assert!(parse_issues("not json").is_err());
+    }
+
+    #[test]
+    fn detects_labels_by_name() {
+        let json = r#"[{"number":1,"title":"t","labels":[{"name":"ready"}]}]"#;
+        let issue = &parse_issues(json).unwrap()[0];
+        assert!(issue.has_label("ready"));
+        assert!(!issue.has_label("in-progress"));
+    }
+
+    #[test]
+    fn resolve_label_defaults_and_overrides() {
+        assert_eq!(resolve_label(None), "ready");
+        assert_eq!(resolve_label(Some(String::new())), "ready");
+        assert_eq!(resolve_label(Some("custom".to_string())), "custom");
+    }
+
+    #[test]
+    fn builds_add_label_args() {
+        assert_eq!(
+            add_label_args(96, "ready"),
+            vec!["issue", "edit", "96", "--add-label", "ready"]
+        );
+    }
+
+    #[test]
+    fn builds_create_label_args() {
+        assert_eq!(
+            create_label_args("ready"),
+            vec![
+                "label",
+                "create",
+                "ready",
+                "--color",
+                "0e8a16",
+                "--description",
+                "Ready for the copilot loop to pick up",
+            ]
+        );
     }
 
     #[test]
