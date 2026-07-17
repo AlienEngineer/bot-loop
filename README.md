@@ -99,6 +99,13 @@ Press `m` to open a popup and pick which model the background loop runs on
 pick. The picker's list defaults to a small built-in set — override it with
 `$COPILOT_MODELS` (a comma- or space-separated list).
 
+Press `t` to open a popup listing the repository's closed issues alongside how
+much each one cost to resolve. The spend is the sum of the `AI Credits` the loop
+posted on the issue (its `<!-- copilot-loop:usage -->` comments), shown per row
+with the grand total in the popup's title; issues closed by hand — with no
+recorded spend — show a `—`. Navigate with `j`/`k`; `Esc` (or `t`/`q`) closes it
+(#145).
+
 ```sh
 cd tui
 cargo run
@@ -107,7 +114,8 @@ cargo run
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
 start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
 the background loop, `m` pick the model, `o`
-show/hide the output panel, `p` show the resolving-PRs popup, `r` refresh, `q` (or
+show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
+issues and their cost, `r` refresh, `q` (or
 `Esc`) quit. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
