@@ -88,7 +88,11 @@ While workers run the header shows a turning spinner next to `loop: running`,
 how many workers are running, and the issues they are working (`working #96, #97`,
 or `waiting for work` when idle), and the list refreshes on its own so
 `in-progress` issues — flagged with a spinner in their row — appear as the
-workers claim them, without a manual refresh (#115).
+workers claim them, without a manual refresh (#115). The workers also handle pull
+requests (resolving merge conflicts and fixing failing checks); since PRs are not
+in the issue list, the header calls that out with its own spinner and a
+`resolving PR #12` note, and the status line announces each PR a worker starts, so
+it is always clear a worker is busy on a PR (#133).
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to

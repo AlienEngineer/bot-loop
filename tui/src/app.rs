@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
 
-use crate::github::{self, Issue, Label};
+use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
 use crate::models;
 use crate::runner::{self, LoopRunner};
@@ -97,6 +97,13 @@ pub struct App {
     /// Monotonic id for the next worker, so each gets its own capture log
     /// (`loop-<id>.log`) even as workers come and go (#134).
     next_worker_id: usize,
+    /// Open pull requests the loop is currently working (carry the in-progress
+    /// label). PRs are absent from `gh issue list`, so these are tracked
+    /// separately so the TUI can show PR work is happening (#133).
+    in_progress_prs: Vec<PullRequest>,
+    /// In-progress PR numbers seen at the last refresh, mirroring
+    /// `known_in_progress` so a newly started PR is announced once (#133).
+    known_in_progress_prs: Vec<u64>,
 }
 
 impl App {
@@ -127,6 +134,8 @@ impl App {
             close_confirm: None,
             known_in_progress: Vec::new(),
             next_worker_id: 1,
+            in_progress_prs: Vec::new(),
+            known_in_progress_prs: Vec::new(),
         }
     }
 
@@ -151,6 +160,7 @@ impl App {
 
     /// Re-fetch issues from GitHub, updating the status line on error.
     pub fn refresh(&mut self) {
+        self.refresh_in_progress_prs();
         match github::fetch_issues(self.limit) {
             Ok(issues) => {
                 self.status = if issues.is_empty() {
@@ -164,6 +174,17 @@ impl App {
         }
     }
 
+    /// Best-effort refresh of the in-progress PR list (#133).
+    ///
+    /// Swallows errors so a `gh pr list` hiccup never clobbers the issue view or
+    /// its status line — the PR indicator simply keeps its last value until the
+    /// next tick. Leaves the list unchanged on failure rather than blanking it.
+    fn refresh_in_progress_prs(&mut self) {
+        if let Ok(prs) = github::fetch_in_progress_prs() {
+            self.in_progress_prs = prs;
+        }
+    }
+
     /// Silently re-fetch issues so the list (and its in-progress labels) tracks
     /// the running loop without a manual refresh (#115), announcing when the
     /// loop *starts* on a new issue so the user gets feedback (#119).
@@ -174,6 +195,7 @@ impl App {
     /// footer — a manual `r` still surfaces failures. The one time it does set
     /// the status is the discrete "loop started #N" event (#119).
     pub fn auto_refresh(&mut self) {
+        self.refresh_in_progress_prs();
         if let Ok(issues) = github::fetch_issues(self.limit) {
             self.set_issues(issues);
             if let Some(message) = self.take_started_feedback() {
@@ -191,15 +213,23 @@ impl App {
         let current = self.in_progress_numbers();
         let started = newly_started(&current, &self.known_in_progress);
         self.known_in_progress = current;
-        started_message(&started, &self.issues)
+
+        let current_prs = self.in_progress_pr_numbers();
+        let started_prs = newly_started(&current_prs, &self.known_in_progress_prs);
+        self.known_in_progress_prs = current_prs;
+
+        let issue_msg = started_message(&started, &self.issues);
+        let pr_msg = pr_started_message(&started_prs, &self.in_progress_prs);
+        combine_feedback(issue_msg, pr_msg)
     }
 
     /// Baseline the in-progress set to what is already labelled, so a later
-    /// [`auto_refresh`] only announces issues the loop *newly* starts. Called
-    /// when the loop starts so pre-existing in-progress labels are not
-    /// mistaken for fresh work (#119).
+    /// [`auto_refresh`] only announces issues (and PRs) the loop *newly* starts.
+    /// Called when the loop starts so pre-existing in-progress labels are not
+    /// mistaken for fresh work (#119, #133).
     fn seed_in_progress_baseline(&mut self) {
         self.known_in_progress = self.in_progress_numbers();
+        self.known_in_progress_prs = self.in_progress_pr_numbers();
     }
 
     /// The currently selected issue, if any.
@@ -361,6 +391,12 @@ impl App {
             .filter(|issue| issue.is_in_progress())
             .map(|issue| issue.number)
             .collect()
+    }
+
+    /// Numbers of the pull requests the loop is currently working (carry the
+    /// in-progress label), in list order (#133).
+    pub fn in_progress_pr_numbers(&self) -> Vec<u64> {
+        self.in_progress_prs.iter().map(|pr| pr.number).collect()
     }
 
     /// Whether the model picker popup is currently open.
@@ -576,6 +612,13 @@ impl App {
     pub fn set_repo_root(&mut self, repo_root: PathBuf) {
         self.repo_root = repo_root;
     }
+
+    /// Seed the in-progress PR list directly (tests only), standing in for a
+    /// `gh pr list` fetch.
+    #[cfg(test)]
+    pub fn set_in_progress_prs(&mut self, prs: Vec<PullRequest>) {
+        self.in_progress_prs = prs;
+    }
 }
 
 /// Issue numbers present in `current` but not `known` — the ones the loop has
@@ -596,6 +639,13 @@ fn issue_title(issues: &[Issue], number: u64) -> Option<&str> {
         .map(|issue| issue.title.as_str())
 }
 
+/// The title of the pull request with `number`, if present. Pure for testing.
+fn pr_title(prs: &[PullRequest], number: u64) -> Option<&str> {
+    prs.iter()
+        .find(|pr| pr.number == number)
+        .map(|pr| pr.title.as_str())
+}
+
 /// Build the "loop started" feedback line for the issues that just entered the
 /// in-progress state, or `None` when none did. A single issue shows its title
 /// for context; several are listed by number. Pure for testing (#119).
@@ -614,6 +664,40 @@ fn started_message(started: &[u64], issues: &[Issue]) -> Option<String> {
                 .join(", ");
             Some(format!("Loop started working on {list}."))
         }
+    }
+}
+
+/// Build the "loop started resolving" feedback line for the PRs that just
+/// entered the in-progress state, or `None` when none did. Mirrors
+/// [`started_message`] for pull requests: a single PR shows its title, several
+/// are listed by number. Pure for testing (#133).
+fn pr_started_message(started: &[u64], prs: &[PullRequest]) -> Option<String> {
+    match started {
+        [] => None,
+        [number] => Some(match pr_title(prs, *number) {
+            Some(title) => format!("Loop started resolving PR #{number}: {title}"),
+            None => format!("Loop started resolving PR #{number}."),
+        }),
+        many => {
+            let list = many
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("Loop started resolving PRs {list}."))
+        }
+    }
+}
+
+/// Join the issue and PR "started" lines into one status message, or `None`
+/// when both are empty. Keeps each announcement on the same status line so a
+/// tick that starts both an issue and a PR reports both. Pure for testing.
+fn combine_feedback(issue_msg: Option<String>, pr_msg: Option<String>) -> Option<String> {
+    match (issue_msg, pr_msg) {
+        (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -739,6 +823,44 @@ mod tests {
     }
 
     #[test]
+    fn pr_started_message_wording_by_count() {
+        let prs =
+            github::parse_pull_requests(r#"[{"number":12,"title":"resolve conflicts"}]"#).unwrap();
+
+        assert!(pr_started_message(&[], &prs).is_none());
+        assert_eq!(
+            pr_started_message(&[12], &prs).as_deref(),
+            Some("Loop started resolving PR #12: resolve conflicts")
+        );
+        // A number with no matching PR falls back to just the number.
+        assert_eq!(
+            pr_started_message(&[99], &prs).as_deref(),
+            Some("Loop started resolving PR #99.")
+        );
+        assert_eq!(
+            pr_started_message(&[12, 15], &prs).as_deref(),
+            Some("Loop started resolving PRs #12, #15.")
+        );
+    }
+
+    #[test]
+    fn combine_feedback_joins_or_passes_through() {
+        assert_eq!(combine_feedback(None, None), None);
+        assert_eq!(
+            combine_feedback(Some("a".into()), None).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            combine_feedback(None, Some("b".into())).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            combine_feedback(Some("a".into()), Some("b".into())).as_deref(),
+            Some("a · b")
+        );
+    }
+
+    #[test]
     fn take_started_feedback_announces_each_start_once() {
         let json = r#"[
             {"number":10,"title":"a","labels":[{"name":"in-progress"}]},
@@ -764,6 +886,49 @@ mod tests {
 
         app.seed_in_progress_baseline();
         assert!(app.take_started_feedback().is_none());
+    }
+
+    #[test]
+    fn in_progress_pr_numbers_lists_the_worked_prs() {
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        assert_eq!(app.in_progress_pr_numbers(), vec![12, 15]);
+    }
+
+    #[test]
+    fn take_started_feedback_announces_pr_starts() {
+        // A PR the loop begins resolving is announced once, mirroring issues
+        // (#133). PRs are seeded via the test setter standing in for `gh`.
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"resolve conflicts"}]"#).unwrap(),
+        );
+
+        assert_eq!(
+            app.take_started_feedback().as_deref(),
+            Some("Loop started resolving PR #12: resolve conflicts")
+        );
+        // No change on the next check: the start is not re-announced.
+        assert!(app.take_started_feedback().is_none());
+    }
+
+    #[test]
+    fn take_started_feedback_reports_issue_and_pr_together() {
+        // A tick that starts both an issue and a PR reports both on one line.
+        let json = r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"b"}]"#).unwrap(),
+        );
+
+        let feedback = app
+            .take_started_feedback()
+            .expect("both should be announced");
+        assert!(feedback.contains("Loop started working on #10"));
+        assert!(feedback.contains("Loop started resolving PR #12"));
     }
 
     #[test]

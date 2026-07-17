@@ -51,8 +51,22 @@ impl Issue {
     }
 }
 
+/// A pull request the loop is working, mapped from `gh pr list --json ...`.
+///
+/// Only the fields the TUI needs to name the PR are modelled; the loop keys a
+/// PR as "being worked" off the same [`IN_PROGRESS_LABEL`] it adds to issues, so
+/// the query filters on that label rather than carrying it here (#133).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+}
+
 /// The `gh` JSON fields requested for each issue.
 const GH_JSON_FIELDS: &str = "number,title,labels,author";
+
+/// The `gh` JSON fields requested for each in-progress pull request.
+const GH_PR_JSON_FIELDS: &str = "number,title";
 
 /// The label the loop watches for, when `TRIGGER_LABEL` is unset.
 pub const READY_LABEL: &str = "ready";
@@ -108,6 +122,41 @@ pub fn fetch_issues(limit: u32) -> Result<Vec<Issue>> {
     }
 
     parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the JSON array produced by `gh pr list --json ...`.
+pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
+    serde_json::from_str(json).context("failed to parse `gh pr list` JSON output")
+}
+
+/// Fetch the open pull requests the loop is currently working, i.e. those
+/// carrying the in-progress label (#133).
+///
+/// PRs are not returned by `gh issue list`, so a PR the loop is resolving
+/// (conflicts or failing checks) is invisible to the issue view. Listing the
+/// in-progress ones lets the TUI show that work is happening. Returns an error
+/// when `gh` is missing, not authenticated, or the command otherwise fails.
+pub fn fetch_in_progress_prs() -> Result<Vec<PullRequest>> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            IN_PROGRESS_LABEL,
+            "--json",
+            GH_PR_JSON_FIELDS,
+        ])
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("`gh pr list` failed: {}", stderr.trim().replace('\n', " "));
+    }
+
+    parse_pull_requests(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Build the `gh issue edit` arguments to add a label. Pure for testing.
@@ -283,6 +332,34 @@ mod tests {
     #[test]
     fn reports_invalid_json() {
         assert!(parse_issues("not json").is_err());
+    }
+
+    #[test]
+    fn parses_a_list_of_pull_requests() {
+        let json = r#"[
+            {"number": 12, "title": "resolve conflicts"},
+            {"number": 15, "title": "fix failing checks"}
+        ]"#;
+        let prs = parse_pull_requests(json).expect("should parse");
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 12);
+        assert_eq!(prs[0].title, "resolve conflicts");
+        assert_eq!(prs[1].number, 15);
+    }
+
+    #[test]
+    fn parses_an_empty_pull_request_list() {
+        assert!(parse_pull_requests("[]").expect("should parse").is_empty());
+    }
+
+    #[test]
+    fn pull_request_parsing_ignores_extra_fields() {
+        // Real `gh pr list --json` output carries fields the TUI does not model.
+        let json = r#"[{"number": 12, "title": "t", "mergeable": "CONFLICTING",
+                        "labels": [{"name": "in-progress"}]}]"#;
+        let prs = parse_pull_requests(json).expect("should ignore unknown fields");
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 12);
     }
 
     #[test]
