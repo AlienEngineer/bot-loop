@@ -151,6 +151,62 @@ pub fn add_label(number: u64, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the `gh issue create` arguments for a new issue. Pure for testing.
+///
+/// Only `--title` and `--body` are passed, so GitHub applies no labels by
+/// default — exactly the "basic information" issue #102 asks for.
+fn create_issue_args(title: &str, body: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        body.to_string(),
+    ]
+}
+
+/// Extract the trailing issue number from `gh issue create` output, whose last
+/// line is the new issue's URL (e.g. `https://github.com/o/r/issues/123`). Pure
+/// for testing.
+fn parse_created_number(stdout: &str) -> Option<u64> {
+    let url = stdout.trim().lines().last()?.trim();
+    url.rsplit('/').next()?.parse().ok()
+}
+
+/// Create a new GitHub issue with the given title and body using the `gh` CLI.
+///
+/// Runs `gh issue create --title <title> --body <body>`. Passing no `--label`
+/// means GitHub adds none, matching issue #102's "no label by default". Returns
+/// the new issue number parsed from the URL `gh` prints. Errors when the title
+/// is empty, `gh` is missing or unauthenticated, or the command fails.
+pub fn create_issue(title: &str, body: &str) -> Result<u64> {
+    if title.trim().is_empty() {
+        anyhow::bail!("issue title must not be empty");
+    }
+
+    let output = Command::new("gh")
+        .args(create_issue_args(title, body))
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue create` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_created_number(&stdout).with_context(|| {
+        format!(
+            "could not parse issue number from `gh` output: {}",
+            stdout.trim()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +285,43 @@ mod tests {
                 "Ready for the copilot loop to pick up",
             ]
         );
+    }
+
+    #[test]
+    fn builds_create_issue_args_with_no_label() {
+        let args = create_issue_args("My title", "A body");
+        assert_eq!(
+            args,
+            vec!["issue", "create", "--title", "My title", "--body", "A body"]
+        );
+        // No label flag is ever passed, so GitHub adds none by default (#102).
+        assert!(!args.iter().any(|a| a.contains("label")));
+    }
+
+    #[test]
+    fn parses_created_issue_number_from_url() {
+        let out = "https://github.com/owner/repo/issues/123\n";
+        assert_eq!(parse_created_number(out), Some(123));
+    }
+
+    #[test]
+    fn parses_created_number_from_last_line() {
+        // `gh` may print notices before the URL; the URL is the final line.
+        let out = "Creating issue in owner/repo\n\nhttps://github.com/owner/repo/issues/7\n";
+        assert_eq!(parse_created_number(out), Some(7));
+    }
+
+    #[test]
+    fn create_number_is_none_without_a_url() {
+        assert_eq!(parse_created_number(""), None);
+        assert_eq!(parse_created_number("no url here"), None);
+    }
+
+    #[test]
+    fn create_issue_rejects_an_empty_title() {
+        // Bails before invoking `gh`, so this makes no network/CLI call.
+        let err = create_issue("   ", "body").unwrap_err();
+        assert!(err.to_string().contains("title must not be empty"));
     }
 
     #[test]
