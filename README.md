@@ -92,6 +92,12 @@ Press `m` to open a popup and pick which model the background loop runs on
 pick. The picker's list defaults to a small built-in set — override it with
 `$COPILOT_MODELS` (a comma- or space-separated list).
 
+Press `a` to toggle auto-merge (#135). When on, the loop is started with
+`--auto-merge` so each PR merges without manual review (GitHub auto-merge when the
+repo allows it, otherwise an immediate merge); the header shows `auto-merge: on`.
+Like the model, the setting takes effect the next time the loop starts, so a
+running loop keeps its behaviour until restarted.
+
 ```sh
 cd tui
 cargo run
@@ -99,7 +105,7 @@ cargo run
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
 start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
-the background loop, `m` pick the model, `o`
+the background loop, `a` toggle auto-merge, `m` pick the model, `o`
 show/hide the output panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.

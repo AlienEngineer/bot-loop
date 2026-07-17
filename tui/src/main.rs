@@ -114,6 +114,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
         KeyCode::Char('x') => app.request_close(),
         KeyCode::Char('l') => app.toggle_loop(),
+        KeyCode::Char('a') => app.toggle_auto_merge(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         _ => {}

@@ -82,6 +82,7 @@ fn header_spans(
     loop_running: bool,
     working: &[u64],
     model_label: &str,
+    auto_merge: bool,
     spinner: &str,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -128,6 +129,14 @@ fn header_spans(
         format!("  ·  model: {model_label}"),
         Style::new().fg(Color::Magenta),
     ));
+    spans.push(Span::styled(
+        format!("  ·  auto-merge: {}", if auto_merge { "on" } else { "off" }),
+        Style::new().fg(if auto_merge {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    ));
     spans
 }
 
@@ -138,6 +147,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         loop_running,
         &app.in_progress_numbers(),
         app.current_model_label(),
+        app.auto_merge(),
         spinner_frame(),
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -238,7 +248,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         "l start-loop"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · s ready · x close · {loop_key} · m models · o output · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · s ready · x close · {loop_key} · a auto-merge · m models · o output · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -562,6 +572,18 @@ mod tests {
     }
 
     #[test]
+    fn footer_advertises_the_auto_merge_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("a auto-merge"));
+    }
+
+    #[test]
     fn renders_the_close_confirmation_popup_when_open() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
@@ -601,25 +623,34 @@ mod tests {
 
     #[test]
     fn header_shows_spinner_and_working_issue_when_loop_runs() {
-        let text = spans_text(&header_spans(3, Some(96), true, &[96], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, Some(96), true, &[96], "auto", false, "⠋"));
         assert!(text.contains("⠋ loop: running"));
         assert!(text.contains("working #96"));
         assert!(text.contains("model: auto"));
+        assert!(text.contains("auto-merge: off"));
     }
 
     #[test]
     fn header_says_waiting_when_loop_runs_without_an_issue() {
-        let text = spans_text(&header_spans(3, None, true, &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, true, &[], "auto", false, "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("waiting for work"));
     }
 
     #[test]
     fn header_hides_loop_details_when_off() {
-        let text = spans_text(&header_spans(3, Some(96), false, &[96], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, Some(96), false, &[96], "auto", false, "⠋"));
         assert!(text.contains("loop: off"));
         assert!(!text.contains("working"));
         assert!(!text.contains("⠋"));
+    }
+
+    #[test]
+    fn header_reflects_auto_merge_state() {
+        let on = spans_text(&header_spans(1, None, false, &[], "auto", true, "⠋"));
+        assert!(on.contains("auto-merge: on"));
+        let off = spans_text(&header_spans(1, None, false, &[], "auto", false, "⠋"));
+        assert!(off.contains("auto-merge: off"));
     }
 
     #[test]
