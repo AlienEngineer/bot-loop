@@ -1883,6 +1883,7 @@ EOF
   return 0
 }
 
+# >>> conflict-pr helpers >>>
 # Echo the number of the lowest-numbered open PR targeting the default branch
 # whose merge is CONFLICTING, skipping any already marked unresolved or already
 # claimed (in-progress) by another instance. Returns 1 (no output) when no PR
@@ -1913,6 +1914,7 @@ claim_next_conflicted_pr() {
   [ -n "$pr" ] && printf '%s\n' "$pr"
   [ -n "$pr" ]
 }
+# <<< conflict-pr helpers <<<
 
 # --- Self-update: pull the loop code and restart when it changed --------------
 # Before tackling each iteration, refresh this script from the default branch so
