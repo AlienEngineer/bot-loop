@@ -119,16 +119,23 @@ impl App {
         }
     }
 
-    /// Replace the issue list, keeping the selection in bounds.
+    /// Replace the issue list, keeping the selection on the same issue.
+    ///
+    /// Selection is preserved by issue number so a background refresh (or the
+    /// list reordering) does not make the highlight jump to a different issue;
+    /// when that issue is gone the prior index is reused, clamped in bounds.
     pub fn set_issues(&mut self, issues: Vec<Issue>) {
+        let previous_number = self.selected().map(|issue| issue.number);
         self.issues = issues;
         if self.issues.is_empty() {
             self.state.select(None);
-        } else {
-            let max = self.issues.len() - 1;
-            let selected = self.state.selected().unwrap_or(0).min(max);
-            self.state.select(Some(selected));
+            return;
         }
+        let max = self.issues.len() - 1;
+        let selected = previous_number
+            .and_then(|number| self.issues.iter().position(|i| i.number == number))
+            .unwrap_or_else(|| self.state.selected().unwrap_or(0).min(max));
+        self.state.select(Some(selected));
     }
 
     /// Re-fetch issues from GitHub, updating the status line on error.
@@ -143,6 +150,19 @@ impl App {
                 self.set_issues(issues);
             }
             Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// Silently re-fetch issues so the list (and its in-progress labels) tracks
+    /// the running loop without a manual refresh (#115).
+    ///
+    /// Unlike [`refresh`], this leaves the status line untouched on success and
+    /// swallows errors: it runs on a timer while the loop works, so a transient
+    /// `gh` hiccup must not clobber the current status or spam the footer — a
+    /// manual `r` still surfaces failures.
+    pub fn auto_refresh(&mut self) {
+        if let Ok(issues) = github::fetch_issues(self.limit) {
+            self.set_issues(issues);
         }
     }
 
@@ -221,6 +241,16 @@ impl App {
     /// Whether the background loop is currently running.
     pub fn loop_running(&mut self) -> bool {
         self.runner.is_running()
+    }
+
+    /// Numbers of the issues the loop is currently working, i.e. those carrying
+    /// the in-progress label, in list order (#115).
+    pub fn in_progress_numbers(&self) -> Vec<u64> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.is_in_progress())
+            .map(|issue| issue.number)
+            .collect()
     }
 
     /// Whether the model picker popup is currently open.
@@ -503,6 +533,31 @@ mod tests {
         assert_eq!(app.state.selected(), Some(1)); // clamped from 4
         app.set_issues(Vec::new());
         assert_eq!(app.state.selected(), None);
+    }
+
+    #[test]
+    fn set_issues_keeps_selection_on_the_same_issue() {
+        let mut app = app_with(5); // numbers 0..=4
+        app.next(); // highlight number 1
+        assert_eq!(app.selected().map(|i| i.number), Some(1));
+
+        // A refresh that drops number 0 shifts indices but must keep #1 selected.
+        let json = r#"[{"number":1,"title":"t1"},{"number":2,"title":"t2"}]"#;
+        app.set_issues(parse_issues(json).unwrap());
+
+        assert_eq!(app.selected().map(|i| i.number), Some(1));
+        assert_eq!(app.state.selected(), Some(0)); // #1 is now the first row
+    }
+
+    #[test]
+    fn in_progress_numbers_lists_working_issues_in_order() {
+        let json = r#"[
+            {"number":10,"title":"a","labels":[{"name":"in-progress"}]},
+            {"number":11,"title":"b","labels":[{"name":"ready"}]},
+            {"number":12,"title":"c","labels":[{"name":"in-progress"}]}
+        ]"#;
+        let app = App::new(parse_issues(json).unwrap());
+        assert_eq!(app.in_progress_numbers(), vec![10, 12]);
     }
 
     #[test]

@@ -39,6 +39,12 @@ impl Issue {
         self.labels.iter().any(|l| l.name == name)
     }
 
+    /// Whether the loop is currently working this issue (carries the
+    /// in-progress label the loop adds while it runs).
+    pub fn is_in_progress(&self) -> bool {
+        self.has_label(IN_PROGRESS_LABEL)
+    }
+
     /// The author login, or an empty string when unknown.
     pub fn author_login(&self) -> &str {
         self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
@@ -50,6 +56,11 @@ const GH_JSON_FIELDS: &str = "number,title,labels,author";
 
 /// The label the loop watches for, when `TRIGGER_LABEL` is unset.
 pub const READY_LABEL: &str = "ready";
+
+/// The label the loop adds to an issue while it is actively working on it,
+/// mirroring `INPROGRESS_LABEL` in `copilot-loop.sh`. The TUI keys its
+/// "which issue is the loop working" display off this label (#115).
+pub const IN_PROGRESS_LABEL: &str = "in-progress";
 
 /// Resolve the trigger label from an optional env value, mirroring the loop's
 /// `TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"`. Empty falls back to the default.
@@ -254,6 +265,15 @@ mod tests {
         let issue = &parse_issues(json).unwrap()[0];
         assert!(issue.has_label("ready"));
         assert!(!issue.has_label("in-progress"));
+    }
+
+    #[test]
+    fn detects_in_progress_issues() {
+        let json = r#"[{"number":1,"title":"t","labels":[{"name":"in-progress"}]},
+                       {"number":2,"title":"t","labels":[{"name":"ready"}]}]"#;
+        let issues = parse_issues(json).unwrap();
+        assert!(issues[0].is_in_progress());
+        assert!(!issues[1].is_in_progress());
     }
 
     #[test]
