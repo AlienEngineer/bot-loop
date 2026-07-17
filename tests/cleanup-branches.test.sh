@@ -186,9 +186,29 @@ assert_false "opt-out: merged local branch removed"  loc "copilot/8-merged"
 assert_true  "opt-out: remote branch preserved"      rem "copilot/8-merged"
 DELETE_REMOTE_BRANCH=1
 
+# --- Defence-in-depth: remove_local_branch refuses an in-use worktree ---------
+# The sweep already skips locked worktrees before calling remove_local_branch,
+# but the destructive primitive must be safe on its own too: a concurrent run
+# can lock a worktree in the window between the sweep's check and this call
+# (#106). A direct call must leave a locked worktree (and its branch) intact,
+# yet still remove an unlocked one.
+wt10="$root/wt-10"
+wt11="$root/wt-11"
+git worktree add -q "$wt10" -b "copilot/10-inuse" main
+git worktree lock "$wt10" >/dev/null 2>&1 || true
+remove_local_branch "copilot/10-inuse"
+assert_true  "10: locked worktree branch kept (direct call)"      loc "copilot/10-inuse"
+assert_eq    "10: locked worktree directory kept (direct call)"   "$([ -d "$wt10" ] && echo yes || echo no)" "yes"
+
+git worktree add -q "$wt11" -b "copilot/11-idle" main
+remove_local_branch "copilot/11-idle"
+assert_false "11: unlocked worktree branch removed (direct call)" loc "copilot/11-idle"
+assert_eq    "11: unlocked worktree directory removed (direct call)" "$([ -d "$wt11" ] && echo yes || echo no)" "no"
+
 # --- cleanup -----------------------------------------------------------------
 cd "$here" || exit 1
-git -C "$clone" worktree unlock "$wt9" >/dev/null 2>&1 || true
+git -C "$clone" worktree unlock "$wt9"  >/dev/null 2>&1 || true
+git -C "$clone" worktree unlock "$wt10" >/dev/null 2>&1 || true
 git -C "$clone" worktree prune >/dev/null 2>&1 || true
 rm -rf "$root"
 
