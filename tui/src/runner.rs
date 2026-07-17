@@ -35,13 +35,20 @@ pub fn loop_script_candidates(env_override: Option<String>, repo_root: &Path) ->
 
 /// Arguments passed to the background loop, mirroring the bash TUI's `spawn_bot`:
 /// point it at the repo and keep its log to clean status lines (the full Copilot
-/// transcript still lands under `<repo>/.copilot-loop/logs/`). Pure for testing.
-pub fn loop_args(repo_dir: &Path) -> Vec<String> {
-    vec![
+/// transcript still lands under `<repo>/.copilot-loop/logs/`). When a `model` is
+/// given it is forwarded as `--model` so the loop runs on the user's choice;
+/// `None` (auto) leaves it off so Copilot picks. Pure for testing.
+pub fn loop_args(repo_dir: &Path, model: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "--repo-dir".to_string(),
         repo_dir.display().to_string(),
         "--quiet".to_string(),
-    ]
+    ];
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args
 }
 
 /// Where the background loop's captured output is written.
@@ -111,14 +118,20 @@ impl LoopRunner {
         }
     }
 
-    /// Start the loop against `repo_dir`, capturing output to `log`. Errors when
-    /// a loop is already running or the process cannot be spawned. Returns the
-    /// new process id.
-    pub fn start(&mut self, script: &Path, repo_dir: &Path, log: &Path) -> Result<u32> {
+    /// Start the loop against `repo_dir`, capturing output to `log` and running
+    /// on `model` (`None` = auto). Errors when a loop is already running or the
+    /// process cannot be spawned. Returns the new process id.
+    pub fn start(
+        &mut self,
+        script: &Path,
+        repo_dir: &Path,
+        log: &Path,
+        model: Option<&str>,
+    ) -> Result<u32> {
         if self.is_running() {
             anyhow::bail!("a background loop is already running");
         }
-        let child = spawn_detached(script, &loop_args(repo_dir), log)?;
+        let child = spawn_detached(script, &loop_args(repo_dir, model), log)?;
         let pid = child.id();
         self.child = Some(child);
         Ok(pid)
@@ -225,7 +238,23 @@ mod tests {
     #[test]
     fn loop_args_target_repo_and_quiet() {
         assert_eq!(
-            loop_args(Path::new("/work/repo")),
+            loop_args(Path::new("/work/repo"), None),
+            vec!["--repo-dir", "/work/repo", "--quiet"]
+        );
+    }
+
+    #[test]
+    fn loop_args_forward_the_model_when_set() {
+        assert_eq!(
+            loop_args(Path::new("/work/repo"), Some("gpt-5.4")),
+            vec!["--repo-dir", "/work/repo", "--quiet", "--model", "gpt-5.4"]
+        );
+    }
+
+    #[test]
+    fn loop_args_skip_blank_models() {
+        assert_eq!(
+            loop_args(Path::new("/work/repo"), Some("   ")),
             vec!["--repo-dir", "/work/repo", "--quiet"]
         );
     }

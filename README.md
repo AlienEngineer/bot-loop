@@ -74,13 +74,20 @@ through the ready issues; it runs detached — output captured to
 `.copilot-loop/tui/loop.log` — and keeps going after you quit the TUI. The loop
 script is found at the repo root (override with `$COPILOT_LOOP_SCRIPT`).
 
+Press `m` to open a popup and pick which model the background loop runs on
+(`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
+`copilot-loop.sh` as `--model` the next time the loop starts; `auto` lets Copilot
+pick. The picker's list defaults to a small built-in set — override it with
+`$COPILOT_MODELS` (a comma- or space-separated list).
+
 ```sh
 cd tui
 cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `s`/`Enter` start (mark ready),
-`l` start/stop the background loop, `r` refresh, `q` (or `Esc`) quit.
+`l` start/stop the background loop, `m` pick the model, `r` refresh, `q` (or
+`Esc`) quit.
 
 
 ### Branch and worktree cleanup

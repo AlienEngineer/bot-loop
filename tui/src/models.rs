@@ -1,0 +1,105 @@
+//! The list of Copilot models offered in the picker.
+//!
+//! `copilot` has no stable "list models" command, so the TUI ships a small
+//! curated default list. It is overridable via `COPILOT_MODELS` (whitespace- or
+//! comma-separated) so a user is never stuck with a stale catalogue, and `auto`
+//! — "let Copilot pick" — is always present as the first, safe default.
+
+/// Environment variable overriding the built-in model list.
+pub const MODELS_ENV: &str = "COPILOT_MODELS";
+
+/// Sentinel model meaning "let Copilot choose". Selecting it passes no
+/// `--model` to the loop, matching an empty `COPILOT_MODEL`.
+pub const AUTO_MODEL: &str = "auto";
+
+/// Built-in fallback catalogue. Deliberately short and overridable; the exact
+/// set is data, not logic — the picker works with whatever list it is given.
+const DEFAULT_MODELS: &[&str] = &[
+    AUTO_MODEL,
+    "claude-opus-4.5",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "gpt-5.4",
+    "gpt-5",
+    "gpt-5-mini",
+    "o4-mini",
+    "gemini-2.5-pro",
+];
+
+/// Parse a raw model list, splitting on commas and whitespace, trimming, and
+/// dropping empties and duplicates while preserving order. `auto` is always
+/// guaranteed to be present (prepended when missing) so the default is always
+/// selectable. Pure for testing.
+pub fn parse_models(raw: &str) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    for token in raw.split([',', ' ', '\t', '\n', '\r']) {
+        let token = token.trim();
+        if token.is_empty() || models.iter().any(|m| m == token) {
+            continue;
+        }
+        models.push(token.to_string());
+    }
+    if !models.iter().any(|m| m == AUTO_MODEL) {
+        models.insert(0, AUTO_MODEL.to_string());
+    }
+    models
+}
+
+/// The models to offer, honouring `COPILOT_MODELS` then falling back to the
+/// built-in list.
+pub fn available() -> Vec<String> {
+    match std::env::var(MODELS_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => parse_models(&raw),
+        _ => DEFAULT_MODELS.iter().map(|m| m.to_string()).collect(),
+    }
+}
+
+/// Whether a model id is the "auto" sentinel (case-insensitive).
+pub fn is_auto(model: &str) -> bool {
+    model.eq_ignore_ascii_case(AUTO_MODEL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_list_leads_with_auto() {
+        let models = available();
+        assert_eq!(models.first().map(String::as_str), Some(AUTO_MODEL));
+        assert!(models.len() > 1);
+    }
+
+    #[test]
+    fn parse_splits_on_commas_and_whitespace() {
+        let models = parse_models("auto, gpt-5.4\nclaude-opus-4.5  o4-mini");
+        assert_eq!(
+            models,
+            vec!["auto", "gpt-5.4", "claude-opus-4.5", "o4-mini"]
+        );
+    }
+
+    #[test]
+    fn parse_dedupes_and_drops_empties() {
+        let models = parse_models("gpt-5,,gpt-5, ,gpt-5-mini");
+        assert_eq!(models, vec!["auto", "gpt-5", "gpt-5-mini"]);
+    }
+
+    #[test]
+    fn parse_prepends_auto_when_missing() {
+        assert_eq!(parse_models("gpt-5")[0], "auto");
+    }
+
+    #[test]
+    fn parse_keeps_existing_auto_position() {
+        let models = parse_models("gpt-5, auto, gpt-5-mini");
+        assert_eq!(models, vec!["gpt-5", "auto", "gpt-5-mini"]);
+    }
+
+    #[test]
+    fn is_auto_is_case_insensitive() {
+        assert!(is_auto("auto"));
+        assert!(is_auto("AUTO"));
+        assert!(!is_auto("gpt-5"));
+    }
+}

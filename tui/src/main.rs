@@ -5,6 +5,7 @@
 
 mod app;
 mod github;
+mod models;
 mod runner;
 mod ui;
 
@@ -57,6 +58,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The model picker popup captures keys while it is open.
+    if app.model_picker_open() {
+        handle_model_picker_key(app, key);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.next(),
@@ -66,6 +73,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
         KeyCode::Char('l') => app.toggle_loop(),
+        KeyCode::Char('m') => app.open_model_picker(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the model picker popup is open: navigate, confirm, cancel.
+fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.model_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.model_previous(),
+        KeyCode::Enter => app.confirm_model(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => app.close_model_picker(),
         _ => {}
     }
 }
