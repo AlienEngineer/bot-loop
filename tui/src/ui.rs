@@ -2,7 +2,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -26,6 +26,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_body(frame, body_area, app);
     render_footer(frame, footer_area, app, loop_running);
 
+    // The model picker floats above everything else when open.
+    if app.model_picker_open() {
+        render_model_picker(frame, frame.area(), app);
+    }
     if app.is_creating() {
         render_create_form(frame, app);
     }
@@ -58,6 +62,10 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         ("  ·  loop: off", Color::DarkGray)
     };
     spans.push(Span::styled(loop_text, Style::new().fg(loop_color)));
+    spans.push(Span::styled(
+        format!("  ·  model: {}", app.current_model_label()),
+        Style::new().fg(Color::Magenta),
+    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -151,10 +159,54 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         "l start-loop"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · s ready · {loop_key} · o output · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · s ready · {loop_key} · m models · o output · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Draw the model picker popup: a centered, bordered list of models with the
+/// current one highlighted. A [`Clear`] underneath wipes the cells so the list
+/// behind it does not show through.
+fn render_model_picker(frame: &mut Frame, area: Rect, app: &mut App) {
+    let height = (app.models.len() as u16 + 2).min(area.height.max(3));
+    let popup = centered_popup(area, 40, height);
+
+    let items: Vec<ListItem> = app
+        .models
+        .iter()
+        .map(|m| ListItem::new(Line::from(Span::raw(m.clone()))))
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select model ")
+        .title_bottom(Line::from(" j/k move · Enter select · Esc cancel ").centered())
+        .style(Style::new().bg(Color::Black));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut app.model_state);
+}
+
+/// A rectangle of `width` columns and `height` rows centered within `area`,
+/// clamped to fit. `width` is a percentage of `area`'s width.
+fn centered_popup(area: Rect, width_pct: u16, height: u16) -> Rect {
+    let [row] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [col] = Layout::horizontal([Constraint::Percentage(width_pct)])
+        .flex(Flex::Center)
+        .areas(row);
+    col
 }
 
 /// Draw the modal new-issue form centered over the list.
@@ -334,6 +386,21 @@ mod tests {
     }
 
     #[test]
+    fn header_shows_the_current_model_and_footer_hint() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
+                .unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("model: auto"));
+        assert!(text.contains("m models"));
+    }
+
+    #[test]
     fn footer_advertises_the_output_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
@@ -343,6 +410,24 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("o output"));
+    }
+
+    #[test]
+    fn renders_the_model_picker_popup_when_open() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
+                .unwrap();
+        let mut app = App::new(issues);
+        let first_model = app.models[0].clone();
+        app.open_model_picker();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Select model"));
+        assert!(text.contains(first_model.as_str()));
+        assert!(text.contains("Enter select"));
     }
 
     #[test]

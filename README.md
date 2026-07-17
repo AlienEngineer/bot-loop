@@ -79,16 +79,22 @@ right that tails the running loop's output for the selected issue (its
 `.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
 to close it.
 
+Press `m` to open a popup and pick which model the background loop runs on
+(`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
+`copilot-loop.sh` as `--model` the next time the loop starts; `auto` lets Copilot
+pick. The picker's list defaults to a small built-in set — override it with
+`$COPILOT_MODELS` (a comma- or space-separated list).
+
 ```sh
 cd tui
 cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-start (mark ready), `l` start/stop the background loop, `o` show/hide the output
-panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue form: `Tab` switches
-fields, `Enter` adds a newline (or moves from title to description), `Ctrl+S`
-creates, `Esc` cancels.
+start (mark ready), `l` start/stop the background loop, `m` pick the model, `o`
+show/hide the output panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue
+form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
+description), `Ctrl+S` creates, `Esc` cancels.
 
 
 ### Branch and worktree cleanup
