@@ -593,9 +593,14 @@ ${capped}
 EOF
 )"
 
-  # Cheapest model, no color/logs; time-boxed. Append provider noise to the log
-  # for debugging but keep stdout to just the class. Fall back on any failure.
+  # Cheapest model, no color/logs; time-boxed. Pin to the issue workspace (when
+  # one exists) so triage never runs against the shared checkout. Append provider
+  # noise to the log for debugging but keep stdout to just the class. Fall back
+  # on any failure.
+  local -a _ws_args=()
+  [ -n "${WORKSPACE_DIR:-}" ] && _ws_args=(-C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR")
   raw="$(_run_with_timeout 60 copilot -p "$prompt" \
+           ${_ws_args[@]+"${_ws_args[@]}"} \
            --model "$TRIAGE_MODEL" --allow-all-tools --no-color --log-level none 2>>"$log_file")"
   class="$(normalize_triage_class "$raw")"
   [ -n "$class" ] && printf '%s' "$class"
@@ -977,6 +982,36 @@ _worktree_path() {
   printf '%s/%s' "$WORKTREE_BASE" "$(printf '%s' "$1" | tr '/' '-')"
 }
 
+# _worktree_lock_state <branch>
+# Classify the lock on the worktree that has <branch> checked out, so cleanup
+# can tell its own (reclaimable) worktree from one a *different* live run still
+# owns (#106):
+#   unlocked  -> not locked
+#   pid:<N>   -> locked by a copilot-loop run whose pid is <N> (see the reason
+#                prepare_workspace writes)
+#   locked    -> locked without our pid marker (e.g. a manual `git worktree lock`)
+# Matches on the branch ref rather than the path so it stays correct when git
+# reports a resolved path (e.g. macOS /var -> /private/var); the lock reason is
+# emitted on the `locked` line, unquoted for our plain reason.
+_worktree_lock_state() {
+  local branch="$1" line target=0 pid
+  [ -n "$branch" ] || { printf 'unlocked'; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) target=0 ;;
+      "branch refs/heads/$branch") target=1 ;;
+      locked|"locked "*)
+        if [ "$target" = 1 ]; then
+          pid="$(printf '%s\n' "$line" | sed -n 's/.*pid \([0-9][0-9]*\).*/\1/p')"
+          if [ -n "$pid" ]; then printf 'pid:%s' "$pid"; else printf 'locked'; fi
+          return 0
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  printf 'unlocked'
+}
+
 # prepare_workspace <branch> <start-ref>
 # Create (or reset) <branch> at <start-ref> and set WORKSPACE_DIR. Returns 1 if
 # the branch/worktree could not be created.
@@ -1013,6 +1048,25 @@ cleanup_workspace() {
   local branch="$1"
   if [ "$USE_WORKTREES" = 1 ]; then
     local wt; wt="$(_worktree_path "$branch")"
+    # Never tear down a worktree a *different* live run still owns: removing it
+    # would delete an active Copilot session's working directory — the #106
+    # race. Our own lock (pid $$) and a crashed run's stale lock (a pid no
+    # longer alive) are safe to reclaim; a foreign live lock, or one placed by
+    # hand (no pid marker), is left strictly alone so the session survives.
+    local lock_state; lock_state="$(_worktree_lock_state "$branch")"
+    case "$lock_state" in
+      "pid:$$") : ;;                                   # our own lock -> reclaim
+      pid:*)
+        if kill -0 "${lock_state#pid:}" 2>/dev/null; then
+          WORKSPACE_DIR=""
+          return 0                                     # another live run owns it
+        fi
+        ;;                                             # dead pid -> reclaim
+      locked)
+        WORKSPACE_DIR=""
+        return 0                                       # locked by hand -> leave it
+        ;;
+    esac
     # Unlock first: prepare_workspace locked it while the run was live, and a
     # locked worktree cannot be removed with a single --force.
     git worktree unlock "$wt" >/dev/null 2>&1 || true
@@ -1124,6 +1178,13 @@ remove_local_branch() {
   local branch="$1" wt
   branch_is_ours "$branch" || return 0
   wt="$(_worktree_dir_for_branch "$branch")"
+  if [ -n "$wt" ] && _worktree_is_locked "$wt"; then
+    # Defence-in-depth (#106): a locked worktree belongs to a live Copilot
+    # session. Never remove it — nor delete its branch — even when this is
+    # reached directly or the lock was taken after the sweep's own guard ran.
+    log "cleanup: keeping $branch (worktree in use)"
+    return 0
+  fi
   if [ -n "$wt" ]; then
     git worktree remove --force "$wt" >/dev/null 2>&1 || true
   fi
@@ -1245,10 +1306,6 @@ process_issue() {
   commit_msg="Resolve #${num}: ${title}"
   pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
-  # Copilot writes here when it needs to ask the user something. Lives in the
-  # gitignored work dir so it is never committed; clear any stale copy.
-  question_file="$WORK_DIR/issue-${num}.question"
-  rm -f "$question_file"
 
   log "issue #$num on $REPO_SLUG: $title"
 
@@ -1268,6 +1325,15 @@ process_issue() {
     _fail_issue "$num" "$log_file" "could not create work branch $branch"
     return 1
   fi
+
+  # Copilot writes here when it needs to ask the user something instead of
+  # coding. Kept inside the per-issue workspace (never the shared checkout) under
+  # its gitignored control dir; the ask-path returns before any commit, so it is
+  # never included in a PR. A fresh worktree carries no stale copy, but clear it
+  # defensively.
+  question_file="$WORKSPACE_DIR/.copilot-loop/issue-${num}.question"
+  mkdir -p "$(dirname "$question_file")" 2>/dev/null || true
+  rm -f "$question_file"
 
   # Surface the freshly created branch before Copilot starts: log it and set the
   # terminal tab/window title (and tmux window name) to the branch name.
@@ -1302,10 +1368,11 @@ when you genuinely cannot proceed without their input.
 EOF
 )"
 
-  # Run Copilot non-interactively from the issue's workspace. All tools allowed
-  # and file access stays restricted to that checkout (we deliberately do not
-  # pass --allow-all-paths); WORK_DIR is additionally allowed so Copilot can
-  # write the question file there when its workspace is a separate worktree.
+  # Run Copilot non-interactively, pinned to the issue's workspace: -C makes that
+  # worktree Copilot's working directory and --add-dir keeps file access
+  # restricted to it (we deliberately do not pass --allow-all-paths), so Copilot
+  # only ever edits the created folder and never the shared checkout. The
+  # question file lives inside that workspace, so no other directory is granted.
   # Choose the coding model. When triage is enabled, classify the issue with the
   # cheap TRIAGE_MODEL and map the class to a coding model via TRIAGE_MAP; on any
   # failure, or a class with no mapping, fall back to the global COPILOT_MODEL so
@@ -1327,7 +1394,7 @@ EOF
     fi
   fi
 
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --add-dir "$WORK_DIR" --no-color --log-level none)
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
 
   log "issue #$num: running copilot (log: $log_file)"
@@ -1906,7 +1973,7 @@ branches — those steps are handled automatically outside this session. Only ed
 files to resolve the conflicts and verify.
 EOF
 )"
-    local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+    local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
@@ -2018,7 +2085,7 @@ fix. Do NOT run git commit, git push, or create branches — those steps are han
 automatically outside this session. Only edit files and verify.
 EOF
 )"
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
   log "PR #$num: running copilot to fix failing checks (log: $log_file)"
