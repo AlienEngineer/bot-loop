@@ -17,6 +17,15 @@ pub struct Author {
     pub login: String,
 }
 
+/// A comment on an issue. Only the body is modelled; the TUI reads the loop's
+/// per-run cost out of it (the `AI Credits` line in a usage comment) so a closed
+/// issue's total spend can be shown (#145).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Comment {
+    #[serde(default)]
+    pub body: String,
+}
+
 /// A single GitHub issue, mapped from `gh issue list --json ...`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
@@ -26,6 +35,11 @@ pub struct Issue {
     pub labels: Vec<Label>,
     #[serde(default)]
     pub author: Option<Author>,
+    /// The issue's comments, requested only for the closed-issue view so each
+    /// row's AI Credits spend can be totalled. Empty for the open list, which
+    /// does not request comments (#145).
+    #[serde(default)]
+    pub comments: Vec<Comment>,
 }
 
 impl Issue {
@@ -49,6 +63,48 @@ impl Issue {
     pub fn author_login(&self) -> &str {
         self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
     }
+
+    /// Total AI Credits the loop spent on this issue, summed across every
+    /// copilot-loop usage comment in its thread, or `None` when the issue
+    /// carries no usage comment (e.g. closed by hand or never worked) (#145).
+    pub fn credits_spent(&self) -> Option<f64> {
+        let mut total = 0.0;
+        let mut found = false;
+        for comment in &self.comments {
+            if let Some(credits) = parse_comment_credits(&comment.body) {
+                total += credits;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+}
+
+/// Parse the AI Credits figure from a single copilot-loop usage comment body, or
+/// `None` when the comment is not a usage comment (missing [`USAGE_MARKER`]) or
+/// carries no recognisable credits line. Both the current `AI Credits` label and
+/// the legacy `Premium requests` label are accepted, mirroring
+/// `parse_usage_stats` in `copilot-loop.sh`. Pure for testing (#145).
+fn parse_comment_credits(body: &str) -> Option<f64> {
+    if !body.contains(USAGE_MARKER) {
+        return None;
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        for label in ["AI Credits", "Premium requests"] {
+            if let Some(rest) = line.strip_prefix(label) {
+                let number: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(value) = number.parse::<f64>() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// A pull request the loop is working, mapped from `gh pr list --json ...`.
@@ -65,11 +121,20 @@ pub struct PullRequest {
 /// The `gh` JSON fields requested for each issue.
 const GH_JSON_FIELDS: &str = "number,title,labels,author";
 
+/// The `gh` JSON fields requested for each closed issue: the issue fields plus
+/// its comments, so the loop's per-run cost can be totalled per issue (#145).
+const GH_CLOSED_JSON_FIELDS: &str = "number,title,labels,author,comments";
+
 /// The `gh` JSON fields requested for each in-progress pull request.
 const GH_PR_JSON_FIELDS: &str = "number,title";
 
 /// The label the loop watches for, when `TRIGGER_LABEL` is unset.
 pub const READY_LABEL: &str = "ready";
+
+/// Hidden marker `copilot-loop.sh` tags every per-run cost comment with (its
+/// `USAGE_MARKER`), so the TUI can pick the loop's usage comments out of an
+/// issue's thread when totalling spend (#145).
+pub const USAGE_MARKER: &str = "<!-- copilot-loop:usage -->";
 
 /// The label the loop adds to an issue while it is actively working on it,
 /// mirroring `INPROGRESS_LABEL` in `copilot-loop.sh`. The TUI keys its
@@ -124,7 +189,38 @@ pub fn fetch_issues(limit: u32) -> Result<Vec<Issue>> {
     parse_issues(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse the JSON array produced by `gh pr list --json ...`.
+/// Fetch the most recently updated closed issues for the current repository,
+/// including their comments so the loop's per-run cost can be totalled per issue
+/// (#145).
+///
+/// Runs `gh issue list --state closed` requesting each issue's comments, then
+/// parses the JSON. Returns an error when `gh` is missing, not authenticated, or
+/// the command otherwise fails.
+pub fn fetch_closed_issues(limit: u32) -> Result<Vec<Issue>> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "list",
+            "--state",
+            "closed",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            GH_CLOSED_JSON_FIELDS,
+        ])
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue list` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
 pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
     serde_json::from_str(json).context("failed to parse `gh pr list` JSON output")
 }
@@ -467,5 +563,62 @@ mod tests {
         assert_eq!(issues[0].number, 96);
         assert_eq!(issues[0].author_login(), "AlienEngineer");
         assert_eq!(issues[0].label_names(), vec!["in-progress"]);
+    }
+
+    /// A realistic usage comment body as `copilot-loop.sh` posts it (#145).
+    fn usage_comment(credits: &str) -> String {
+        format!(
+            "**copilot-loop usage** (model: claude-opus-4.5)\n\n```\nAI Credits {credits} (9m 0s)\nTokens     ↑ 3.4m (3.2m cached) • ↓ 39.2k\n```\n\n<!-- copilot-loop:usage -->"
+        )
+    }
+
+    #[test]
+    fn parses_credits_from_a_usage_comment() {
+        assert_eq!(parse_comment_credits(&usage_comment("335")), Some(335.0));
+        assert_eq!(parse_comment_credits(&usage_comment("25.7")), Some(25.7));
+    }
+
+    #[test]
+    fn parses_the_legacy_premium_requests_label() {
+        let body = "```\nPremium requests 1.5 (8s)\n```\n<!-- copilot-loop:usage -->";
+        assert_eq!(parse_comment_credits(body), Some(1.5));
+    }
+
+    #[test]
+    fn credits_require_the_usage_marker() {
+        // Same credits line, but no marker — not a loop usage comment.
+        assert_eq!(parse_comment_credits("AI Credits 335 (9m 0s)"), None);
+    }
+
+    #[test]
+    fn credits_are_none_when_the_marker_has_no_credits_line() {
+        assert_eq!(
+            parse_comment_credits("a human note <!-- copilot-loop:usage -->"),
+            None
+        );
+    }
+
+    #[test]
+    fn totals_credits_across_all_usage_comments() {
+        let json = format!(
+            r#"[{{"number":1,"title":"t","comments":[
+                {{"body":{first}}},
+                {{"body":{second}}},
+                {{"body":"just a human comment"}}
+            ]}}]"#,
+            first = serde_json::to_string(&usage_comment("100")).unwrap(),
+            second = serde_json::to_string(&usage_comment("50.5")).unwrap(),
+        );
+        let issue = &parse_issues(&json).unwrap()[0];
+        assert_eq!(issue.credits_spent(), Some(150.5));
+    }
+
+    #[test]
+    fn credits_spent_is_none_without_usage_comments() {
+        let with_human = r#"[{"number":1,"title":"t","comments":[{"body":"hi"}]}]"#;
+        assert_eq!(parse_issues(with_human).unwrap()[0].credits_spent(), None);
+        // No comments field at all (the open-list shape).
+        let bare = r#"[{"number":1,"title":"t"}]"#;
+        assert_eq!(parse_issues(bare).unwrap()[0].credits_spent(), None);
     }
 }
