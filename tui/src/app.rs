@@ -91,6 +91,9 @@ pub struct App {
     show_output: bool,
     /// The number of the issue awaiting a close confirmation, if any (#118).
     close_confirm: Option<u64>,
+    /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
+    /// can announce when the loop *starts* a new issue (#119).
+    known_in_progress: Vec<u64>,
 }
 
 impl App {
@@ -119,6 +122,7 @@ impl App {
             repo_root: runner::repo_root(),
             show_output: false,
             close_confirm: None,
+            known_in_progress: Vec::new(),
         }
     }
 
@@ -157,16 +161,41 @@ impl App {
     }
 
     /// Silently re-fetch issues so the list (and its in-progress labels) tracks
-    /// the running loop without a manual refresh (#115).
+    /// the running loop without a manual refresh (#115), announcing when the
+    /// loop *starts* on a new issue so the user gets feedback (#119).
     ///
-    /// Unlike [`refresh`], this leaves the status line untouched on success and
-    /// swallows errors: it runs on a timer while the loop works, so a transient
-    /// `gh` hiccup must not clobber the current status or spam the footer — a
-    /// manual `r` still surfaces failures.
+    /// Unlike [`refresh`], this leaves the status line untouched on a plain
+    /// refresh and swallows errors: it runs on a timer while the loop works, so
+    /// a transient `gh` hiccup must not clobber the current status or spam the
+    /// footer — a manual `r` still surfaces failures. The one time it does set
+    /// the status is the discrete "loop started #N" event (#119).
     pub fn auto_refresh(&mut self) {
         if let Ok(issues) = github::fetch_issues(self.limit) {
             self.set_issues(issues);
+            if let Some(message) = self.take_started_feedback() {
+                self.status = Some(message);
+            }
         }
+    }
+
+    /// Which issues the loop has newly started (gained the in-progress label)
+    /// since the last check, as a feedback line, or `None` when nothing new.
+    ///
+    /// Updates the remembered in-progress set so each start is announced once
+    /// (#119). Reads only local state (`self.issues`), so it makes no `gh` call.
+    fn take_started_feedback(&mut self) -> Option<String> {
+        let current = self.in_progress_numbers();
+        let started = newly_started(&current, &self.known_in_progress);
+        self.known_in_progress = current;
+        started_message(&started, &self.issues)
+    }
+
+    /// Baseline the in-progress set to what is already labelled, so a later
+    /// [`auto_refresh`] only announces issues the loop *newly* starts. Called
+    /// when the loop starts so pre-existing in-progress labels are not
+    /// mistaken for fresh work (#119).
+    fn seed_in_progress_baseline(&mut self) {
+        self.known_in_progress = self.in_progress_numbers();
     }
 
     /// The currently selected issue, if any.
@@ -282,6 +311,9 @@ impl App {
         let model = self.selected_model().map(str::to_owned);
         match self.runner.start(&script, &repo, &log, model.as_deref()) {
             Ok(pid) => {
+                // Only announce issues the loop starts *after* this point; any
+                // already-labelled in-progress issue predates the loop (#119).
+                self.seed_in_progress_baseline();
                 self.status = Some(format!(
                     "Background loop started (pid {pid}, model {}). Log: {}",
                     self.current_model_label(),
@@ -522,6 +554,45 @@ impl App {
     }
 }
 
+/// Issue numbers present in `current` but not `known` — the ones the loop has
+/// newly started since the last check, in `current` order. Pure for testing.
+fn newly_started(current: &[u64], known: &[u64]) -> Vec<u64> {
+    current
+        .iter()
+        .copied()
+        .filter(|n| !known.contains(n))
+        .collect()
+}
+
+/// The title of the issue with `number`, if present. Pure for testing.
+fn issue_title(issues: &[Issue], number: u64) -> Option<&str> {
+    issues
+        .iter()
+        .find(|issue| issue.number == number)
+        .map(|issue| issue.title.as_str())
+}
+
+/// Build the "loop started" feedback line for the issues that just entered the
+/// in-progress state, or `None` when none did. A single issue shows its title
+/// for context; several are listed by number. Pure for testing (#119).
+fn started_message(started: &[u64], issues: &[Issue]) -> Option<String> {
+    match started {
+        [] => None,
+        [number] => Some(match issue_title(issues, *number) {
+            Some(title) => format!("Loop started working on #{number}: {title}"),
+            None => format!("Loop started working on #{number}."),
+        }),
+        many => {
+            let list = many
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("Loop started working on {list}."))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +683,63 @@ mod tests {
         ]"#;
         let app = App::new(parse_issues(json).unwrap());
         assert_eq!(app.in_progress_numbers(), vec![10, 12]);
+    }
+
+    #[test]
+    fn newly_started_returns_only_the_fresh_numbers() {
+        assert_eq!(newly_started(&[10, 12], &[]), vec![10, 12]);
+        assert_eq!(newly_started(&[10, 12], &[10]), vec![12]);
+        assert!(newly_started(&[10], &[10, 12]).is_empty());
+        assert!(newly_started(&[], &[10]).is_empty());
+    }
+
+    #[test]
+    fn started_message_wording_by_count() {
+        let json = r#"[{"number":10,"title":"fix the parser","labels":[]}]"#;
+        let issues = parse_issues(json).unwrap();
+
+        assert!(started_message(&[], &issues).is_none());
+        assert_eq!(
+            started_message(&[10], &issues).as_deref(),
+            Some("Loop started working on #10: fix the parser")
+        );
+        // A number with no matching issue falls back to just the number.
+        assert_eq!(
+            started_message(&[99], &issues).as_deref(),
+            Some("Loop started working on #99.")
+        );
+        assert_eq!(
+            started_message(&[10, 12], &issues).as_deref(),
+            Some("Loop started working on #10, #12.")
+        );
+    }
+
+    #[test]
+    fn take_started_feedback_announces_each_start_once() {
+        let json = r#"[
+            {"number":10,"title":"a","labels":[{"name":"in-progress"}]},
+            {"number":11,"title":"b","labels":[{"name":"ready"}]}
+        ]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+
+        // First check: #10 is a fresh start.
+        assert_eq!(
+            app.take_started_feedback().as_deref(),
+            Some("Loop started working on #10: a")
+        );
+        // Second check with no change: nothing new to announce.
+        assert!(app.take_started_feedback().is_none());
+    }
+
+    #[test]
+    fn take_started_feedback_skips_baselined_in_progress() {
+        // An issue already in-progress when the baseline is seeded (e.g. the
+        // moment the loop starts) is not mistaken for fresh work (#119).
+        let json = r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+
+        app.seed_in_progress_baseline();
+        assert!(app.take_started_feedback().is_none());
     }
 
     #[test]
