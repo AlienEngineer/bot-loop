@@ -54,6 +54,12 @@
 #      cheap model as trivial/normal/complex and the coding model is picked from
 #      TRIAGE_MAP, so cheap issues run on a cheap model; any failure falls back
 #      to the global COPILOT_MODEL.
+#   5b. Right after the run, post what that prompt cost (the "AI Credits" and
+#      "Tokens" summary Copilot prints at the end, taken from the run's log) as a
+#      comment on the issue/PR, tagged with the hidden "copilot-loop:usage"
+#      marker. This is best-effort: it is skipped when no stats were captured and
+#      never fails the run. The same happens after the conflict-resolution run in
+#      resolve_pr_conflicts, so every prompt's cost is tracked.
 #   6a. If Copilot needs more information it writes a question file; post the
 #       question as an issue comment, label the issue "needs-info", and wait for
 #       the user to reply (no PR opened, not counted as a failure).
@@ -227,6 +233,10 @@ QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
 # in the thread (mirrors QUESTION_MARKER).
 FAILURE_MARKER="<!-- copilot-loop:failed -->"
 
+# Hidden marker appended to every per-run cost/usage comment so they are easy to
+# recognise (and filter) in the thread (mirrors QUESTION_MARKER).
+USAGE_MARKER="<!-- copilot-loop:usage -->"
+
 # --- Helpers -----------------------------------------------------------------
 log() {
   printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -360,6 +370,57 @@ run_copilot() {
     copilot "$@" 2>&1 | tee -a "$log_file"
     COPILOT_RC="${PIPESTATUS[0]}"
   fi
+}
+
+# >>> usage helpers >>>
+# Extract the per-run cost/usage summary Copilot prints at the end of a run from
+# its captured output (read on stdin). Copilot ends a run with lines like:
+#     AI Credits 25.7 (8s)
+#     Tokens     ↑ 40.2k (40.2k written) • ↓ 221 (217 reasoning)
+# Echoes the LAST "AI Credits" (or legacy "Premium requests") line followed by
+# the LAST "Tokens" line, each with indentation and any trailing CR/space
+# stripped, as one multi-line summary. Taking the LAST occurrence ignores an
+# earlier triage run's stats captured in the same log. Echoes nothing when
+# neither line is present. Pure: reads only stdin, writes only stdout.
+parse_usage_stats() {
+  local input credits tokens
+  input="$(cat)"
+  credits="$(printf '%s\n' "$input" | sed 's/\r$//' \
+    | grep -E '^[[:space:]]*(AI Credits|Premium requests)[[:space:]]' \
+    | tail -n1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  tokens="$(printf '%s\n' "$input" | sed 's/\r$//' \
+    | grep -E '^[[:space:]]*Tokens[[:space:]]' \
+    | tail -n1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [ -n "$credits" ] && [ -n "$tokens" ]; then
+    printf '%s\n%s\n' "$credits" "$tokens"
+  elif [ -n "$credits" ]; then
+    printf '%s\n' "$credits"
+  elif [ -n "$tokens" ]; then
+    printf '%s\n' "$tokens"
+  fi
+}
+# <<< usage helpers <<<
+
+# Post the per-run cost/usage summary Copilot printed (parsed out of $log_file)
+# as a comment on the issue or PR, tagged with USAGE_MARKER so it is easy to spot
+# and filter in the thread. Skips silently when the log held no usage stats, and
+# never fails the loop (every failure is swallowed) so cost tracking can never
+# block or break a run.
+# Usage: _report_usage <issue|pr> <num> <log_file> <model>
+_report_usage() {
+  local kind="$1" num="$2" log_file="$3" model="${4:-}" summary header body
+  [ -f "$log_file" ] || return 0
+  summary="$(parse_usage_stats <"$log_file" 2>/dev/null)"
+  [ -n "$summary" ] || return 0
+  header="**copilot-loop usage**"
+  [ -n "$model" ] && header="$header (model: $model)"
+  # shellcheck disable=SC2016  # backticks/%s are literal printf format, not expansions
+  body="$(printf '%s\n\n```\n%s\n```\n\n%s' "$header" "$summary" "$USAGE_MARKER")"
+  case "$kind" in
+    pr) gh pr comment "$num" --body "$body" >/dev/null 2>&1 || true ;;
+    *)  gh issue comment "$num" --body "$body" >/dev/null 2>&1 || true ;;
+  esac
+  return 0
 }
 
 # Run a command with a wall-clock limit when a timeout utility is available so a
@@ -1169,6 +1230,10 @@ EOF
   cd "$REPO_DIR" 2>/dev/null || true
   log "issue #$num: copilot exited with code $copilot_rc"
 
+  # Track what this prompt cost on the issue (AI Credits + Tokens Copilot
+  # printed), before any early return, so every run is accounted for.
+  _report_usage issue "$num" "$log_file" "$coding_model"
+
   # Copilot asked for more information instead of coding: relay the question to
   # the user and wait for their reply (handled, so return success without a PR).
   if [ -s "$question_file" ]; then
@@ -1722,6 +1787,9 @@ EOF
     copilot_rc=$COPILOT_RC
     cd "$REPO_DIR" 2>/dev/null || true
     log "PR #$num: copilot exited with code $copilot_rc"
+
+    # Track what this conflict-resolution prompt cost on the PR.
+    _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
 
     # Bail out if Copilot left conflict markers behind in any conflicted file.
     local f unresolved=""

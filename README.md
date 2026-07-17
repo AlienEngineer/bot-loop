@@ -128,6 +128,24 @@ Each issue moves through these labels:
 | `copilot-done` | Resolved successfully and a PR was opened. |
 | `copilot-failed` | Failed; the loop does not retry automatically. A later human reply resumes it for another attempt. |
 
+## Cost tracking
+
+After every Copilot run the loop posts what that prompt cost as a comment on the
+issue (or PR, for conflict resolution). The comment carries the `AI Credits` and
+`Tokens` summary Copilot prints at the end of a run, taken from the run's log,
+and is tagged with a hidden `<!-- copilot-loop:usage -->` marker so the cost
+comments are easy to spot and filter in the thread:
+
+```
+**copilot-loop usage** (model: claude-opus-4.5)
+
+AI Credits 25.7 (8s)
+Tokens     ↑ 40.2k (40.2k written) • ↓ 221 (217 reasoning)
+```
+
+It is best-effort: when the log holds no usage stats nothing is posted, and it
+never fails or blocks a run.
+
 ## Troubleshooting
 
 **The loop starts but never picks up any issues (just keeps logging "no ready
