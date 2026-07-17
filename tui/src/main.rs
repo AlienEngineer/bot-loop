@@ -10,13 +10,18 @@ mod models;
 mod runner;
 mod ui;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use app::{App, DEFAULT_LIMIT};
+
+/// How often to silently re-fetch issues while the background loop runs, so the
+/// list's in-progress markers track what the loop is doing without a manual
+/// refresh (#115).
+const LOOP_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
     let mut app = App::new(Vec::new());
@@ -36,8 +41,11 @@ fn main() -> Result<()> {
     result
 }
 
-/// The main draw/input loop. Polls for key events and redraws each tick.
+/// The main draw/input loop. Polls for key events and redraws each tick, and
+/// silently refreshes the issue list on a timer while the loop runs so its
+/// progress (which issue is in-progress) stays visible (#115).
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut last_refresh = Instant::now();
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -46,6 +54,11 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             && key.kind == KeyEventKind::Press
         {
             handle_key(app, key);
+        }
+
+        if app.loop_running() && last_refresh.elapsed() >= LOOP_REFRESH_INTERVAL {
+            app.auto_refresh();
+            last_refresh = Instant::now();
         }
     }
     Ok(())

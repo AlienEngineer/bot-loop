@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     render_header(frame, header_area, app, loop_running);
-    render_body(frame, body_area, app);
+    render_body(frame, body_area, app, loop_running);
     render_footer(frame, footer_area, app, loop_running);
 
     // The model picker floats above everything else when open.
@@ -35,8 +35,51 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
-    let count = app.issues.len();
+/// Braille spinner frames used to signal the loop is alive (#115).
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The spinner frame for a given wall-clock instant (milliseconds), advancing
+/// every 100ms so it visibly turns across redraws. Pure for testing.
+fn spinner_frame_at(millis: u128) -> &'static str {
+    SPINNER_FRAMES[((millis / 100) % SPINNER_FRAMES.len() as u128) as usize]
+}
+
+/// The current spinner frame from the system clock.
+fn spinner_frame() -> &'static str {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    spinner_frame_at(millis)
+}
+
+/// A "working #96, #97" summary of the issues the loop is currently on, or
+/// `None` when it holds no issue. Pure for testing (#115).
+fn working_summary(working: &[u64]) -> Option<String> {
+    if working.is_empty() {
+        return None;
+    }
+    let list = working
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("working {list}"))
+}
+
+/// Build the header line spans: issue count, the viewed issue, the loop state,
+/// and the model. When the loop runs a turning spinner and the issue it is
+/// working (or "waiting for work") are shown so it is clear something is
+/// happening and which issue it is (#115). Pure so the running branch — which
+/// otherwise needs a live child process — is unit-testable.
+fn header_spans(
+    count: usize,
+    viewing: Option<u64>,
+    loop_running: bool,
+    working: &[u64],
+    model_label: &str,
+    spinner: &str,
+) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
             " GitHub Issues ",
@@ -50,40 +93,67 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
             Style::new().add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(issue) = app.selected() {
+    if let Some(number) = viewing {
         spans.push(Span::styled(
-            format!("  ·  viewing #{}", issue.number),
+            format!("  ·  viewing #{number}"),
             Style::new().fg(Color::DarkGray),
         ));
     }
-    let (loop_text, loop_color) = if loop_running {
-        ("  ·  loop: running", Color::Green)
+    if loop_running {
+        spans.push(Span::styled(
+            format!("  ·  {spinner} loop: running"),
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
+        match working_summary(working) {
+            Some(summary) => spans.push(Span::styled(
+                format!("  ·  {summary}"),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            None => spans.push(Span::styled(
+                "  ·  waiting for work",
+                Style::new().fg(Color::DarkGray),
+            )),
+        }
     } else {
-        ("  ·  loop: off", Color::DarkGray)
-    };
-    spans.push(Span::styled(loop_text, Style::new().fg(loop_color)));
+        spans.push(Span::styled(
+            "  ·  loop: off",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     spans.push(Span::styled(
-        format!("  ·  model: {}", app.current_model_label()),
+        format!("  ·  model: {model_label}"),
         Style::new().fg(Color::Magenta),
     ));
+    spans
+}
+
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
+    let spans = header_spans(
+        app.issues.len(),
+        app.selected().map(|issue| issue.number),
+        loop_running,
+        &app.in_progress_numbers(),
+        app.current_model_label(),
+        spinner_frame(),
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Draw the body: the issue list, plus the output side panel when it is open
 /// and an issue is selected (#107).
-fn render_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+fn render_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, loop_running: bool) {
     if app.output_visible() && app.selected().is_some() {
         let [list_area, panel_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(area);
-        render_list(frame, list_area, app);
+        render_list(frame, list_area, app, loop_running);
         render_output_panel(frame, panel_area, app);
     } else {
-        render_list(frame, area, app);
+        render_list(frame, area, app, loop_running);
     }
 }
 
-fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, loop_running: bool) {
     let block = Block::default().borders(Borders::ALL).title(" Issues ");
 
     if app.issues.is_empty() {
@@ -99,7 +169,12 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         return;
     }
 
-    let items: Vec<ListItem> = app.issues.iter().map(issue_item).collect();
+    let spinner = spinner_frame();
+    let items: Vec<ListItem> = app
+        .issues
+        .iter()
+        .map(|issue| issue_item(issue, loop_running, spinner))
+        .collect();
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -290,9 +365,28 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     .split(vertical[1])[1]
 }
 
-/// Format a single issue as a list row: number, title, and labels.
-fn issue_item(issue: &Issue) -> ListItem<'static> {
+/// The two-column gutter shown before an issue's number: a turning spinner
+/// while the loop actively works it, a static dot for an in-progress label
+/// with no running loop, or blanks so every row's number stays aligned (#115).
+fn progress_marker(in_progress: bool, loop_running: bool, spinner: &str) -> Span<'static> {
+    if !in_progress {
+        return Span::raw("  ");
+    }
+    if loop_running {
+        Span::styled(
+            format!("{spinner} "),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("● ", Style::new().fg(Color::DarkGray))
+    }
+}
+
+/// Format a single issue as a list row: an in-progress marker, number, title,
+/// and labels.
+fn issue_item(issue: &Issue, loop_running: bool, spinner: &str) -> ListItem<'static> {
     let mut spans = vec![
+        progress_marker(issue.is_in_progress(), loop_running, spinner),
         Span::styled(
             format!("#{:<5}", issue.number),
             Style::new().fg(Color::Yellow),
@@ -410,6 +504,72 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("o output"));
+    }
+
+    fn spans_text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn spinner_frame_advances_and_wraps_with_time() {
+        assert_eq!(spinner_frame_at(0), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame_at(100), SPINNER_FRAMES[1]);
+        assert_eq!(spinner_frame_at(1000), SPINNER_FRAMES[0]); // wraps after the last frame
+    }
+
+    #[test]
+    fn working_summary_lists_numbers_or_none() {
+        assert_eq!(working_summary(&[]), None);
+        assert_eq!(working_summary(&[96]).as_deref(), Some("working #96"));
+        assert_eq!(
+            working_summary(&[96, 97]).as_deref(),
+            Some("working #96, #97")
+        );
+    }
+
+    #[test]
+    fn header_shows_spinner_and_working_issue_when_loop_runs() {
+        let text = spans_text(&header_spans(3, Some(96), true, &[96], "auto", "⠋"));
+        assert!(text.contains("⠋ loop: running"));
+        assert!(text.contains("working #96"));
+        assert!(text.contains("model: auto"));
+    }
+
+    #[test]
+    fn header_says_waiting_when_loop_runs_without_an_issue() {
+        let text = spans_text(&header_spans(3, None, true, &[], "auto", "⠋"));
+        assert!(text.contains("loop: running"));
+        assert!(text.contains("waiting for work"));
+    }
+
+    #[test]
+    fn header_hides_loop_details_when_off() {
+        let text = spans_text(&header_spans(3, Some(96), false, &[96], "auto", "⠋"));
+        assert!(text.contains("loop: off"));
+        assert!(!text.contains("working"));
+        assert!(!text.contains("⠋"));
+    }
+
+    #[test]
+    fn progress_marker_reflects_state() {
+        assert_eq!(spans_text(&[progress_marker(false, true, "⠋")]), "  ");
+        assert_eq!(spans_text(&[progress_marker(true, true, "⠋")]), "⠋ ");
+        assert_eq!(spans_text(&[progress_marker(true, false, "⠋")]), "● ");
+    }
+
+    #[test]
+    fn renders_in_progress_marker_in_the_list() {
+        let issues = parse_issues(
+            r#"[{"number":96,"title":"t","labels":[{"name":"in-progress"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        // The loop is off, so an in-progress issue shows the static dot marker.
+        assert!(buffer_text(&terminal).contains("●"));
     }
 
     #[test]

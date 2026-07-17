@@ -79,6 +79,11 @@ right that tails the running loop's output for the selected issue (its
 `.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
 to close it.
 
+While the loop runs the header shows a turning spinner next to `loop: running`
+and the issue it is working (`working #96`, or `waiting for work` when idle), and
+the list refreshes on its own so `in-progress` issues — flagged with a spinner in
+their row — appear as the loop claims them, without a manual refresh (#115).
+
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
 `copilot-loop.sh` as `--model` the next time the loop starts; `auto` lets Copilot
