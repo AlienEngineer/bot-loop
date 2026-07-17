@@ -307,6 +307,39 @@ pub fn add_label(number: u64, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the `gh issue edit` arguments to remove a label. Pure for testing.
+fn remove_label_args(number: u64, label: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        number.to_string(),
+        "--remove-label".to_string(),
+        label.to_string(),
+    ]
+}
+
+/// Remove a label from an issue using the `gh` CLI.
+///
+/// Runs `gh issue edit <number> --remove-label <label>`. Unlike [`add_label`]
+/// there is no need to ensure the label exists first. Returns an error when
+/// `gh` is missing, not authenticated, or the edit fails.
+pub fn remove_label(number: u64, label: &str) -> Result<()> {
+    let output = Command::new("gh")
+        .args(remove_label_args(number, label))
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue edit` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    Ok(())
+}
+
 /// Build the `gh issue close` arguments. Pure for testing.
 fn close_issue_args(number: u64) -> Vec<String> {
     vec!["issue".to_string(), "close".to_string(), number.to_string()]
@@ -487,6 +520,14 @@ mod tests {
         assert_eq!(
             add_label_args(96, "ready"),
             vec!["issue", "edit", "96", "--add-label", "ready"]
+        );
+    }
+
+    #[test]
+    fn builds_remove_label_args() {
+        assert_eq!(
+            remove_label_args(96, "ready"),
+            vec!["issue", "edit", "96", "--remove-label", "ready"]
         );
     }
 

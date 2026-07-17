@@ -67,9 +67,10 @@ that spawns, monitors, and stops several loop instances ("bots") side by side.
 A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). The
 first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
-authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
-label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
-up. Press `c` to create a new issue: fill in a title and description, then
+authenticated for the target repo. Press `s` (or `Enter`) to toggle the trigger
+label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
+absent so the loop picks the issue up, or removed when present so a
+mistakenly-queued issue can be pulled back out (#146). Press `c` to create a new issue: fill in a title and description, then
 `Ctrl+S` to submit it (no label is added by default). Press `x` to close the
 selected issue: a confirmation popup names it, then `y` closes it on GitHub
 (`n`/`Esc` cancels). Press `l` to start (or
@@ -112,7 +113,7 @@ cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
+toggle the ready label (mark ready, or remove it if already ready), `x` close the selected issue (confirm with `y`), `l` start/stop
 the background loop, `m` pick the model, `o`
 show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
 issues and their cost, `r` refresh, `q` (or

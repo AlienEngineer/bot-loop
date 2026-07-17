@@ -123,7 +123,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('G') | KeyCode::End => app.last(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('c') => app.open_create(),
-        KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
+        KeyCode::Char('s') | KeyCode::Enter => app.toggle_ready(),
         KeyCode::Char('x') => app.request_close(),
         KeyCode::Char('l') => app.toggle_loop(),
         KeyCode::Char('m') => app.open_model_picker(),
