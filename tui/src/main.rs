@@ -43,9 +43,12 @@ fn main() -> Result<()> {
 
 /// The main draw/input loop. Polls for key events and redraws each tick, and
 /// silently refreshes the issue list on a timer while the loop runs so its
-/// progress (which issue is in-progress) stays visible (#115).
+/// progress (which issue is in-progress) stays visible (#115), then once more
+/// the tick the loop finishes so the final state (closed issues, dropped
+/// in-progress labels) shows without a manual refresh (#121).
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_refresh = Instant::now();
+    let mut loop_was_running = false;
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -56,12 +59,23 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             handle_key(app, key);
         }
 
-        if app.loop_running() && last_refresh.elapsed() >= LOOP_REFRESH_INTERVAL {
+        let loop_running = app.loop_running();
+        let interval_elapsed = last_refresh.elapsed() >= LOOP_REFRESH_INTERVAL;
+        if wants_loop_refresh(loop_was_running, loop_running, interval_elapsed) {
             app.auto_refresh();
             last_refresh = Instant::now();
         }
+        loop_was_running = loop_running;
     }
     Ok(())
+}
+
+/// Whether to silently re-fetch the issue list this tick: periodically while the
+/// loop runs so its in-progress markers track it (#115), and once the tick the
+/// loop finishes so the final state shows without a manual refresh (#121). The
+/// finishing refresh fires even before the interval elapses. Pure for testing.
+fn wants_loop_refresh(was_running: bool, running: bool, interval_elapsed: bool) -> bool {
+    (running && interval_elapsed) || (was_running && !running)
 }
 
 /// Map a key press to an action. Vim-style navigation per #51.
@@ -132,5 +146,38 @@ fn handle_create_key(app: &mut App, key: KeyEvent) {
             app.form_input(c)
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_loop_refresh;
+
+    #[test]
+    fn refreshes_periodically_while_running() {
+        assert!(wants_loop_refresh(true, true, true));
+    }
+
+    #[test]
+    fn waits_for_the_interval_while_running() {
+        assert!(!wants_loop_refresh(true, true, false));
+    }
+
+    #[test]
+    fn refreshes_the_tick_the_loop_finishes() {
+        // The finishing refresh fires even before the interval elapses (#121).
+        assert!(wants_loop_refresh(true, false, false));
+        assert!(wants_loop_refresh(true, false, true));
+    }
+
+    #[test]
+    fn does_not_refresh_again_after_the_loop_has_stopped() {
+        assert!(!wants_loop_refresh(false, false, false));
+        assert!(!wants_loop_refresh(false, false, true));
+    }
+
+    #[test]
+    fn refreshes_when_the_loop_just_started_and_the_interval_elapsed() {
+        assert!(wants_loop_refresh(false, true, true));
     }
 }
