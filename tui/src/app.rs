@@ -1,13 +1,19 @@
 //! Application state and list navigation for the issue TUI.
 
+use std::path::PathBuf;
+
 use ratatui::widgets::ListState;
 
 use crate::github::{self, Issue, Label};
+use crate::logs;
 use crate::models;
 use crate::runner::{self, LoopRunner};
 
 /// Default number of issues to request from `gh`.
 pub const DEFAULT_LIMIT: u32 = 200;
+
+/// How much of a loop log to read for the output panel (its tail).
+pub const OUTPUT_TAIL_BYTES: u64 = 64 * 1024;
 
 /// Which input surface currently has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -81,6 +87,8 @@ pub struct App {
     model_picker_open: bool,
     /// The chosen model, or `None` for `auto` (let Copilot pick).
     selected_model: Option<String>,
+    repo_root: PathBuf,
+    show_output: bool,
 }
 
 impl App {
@@ -106,6 +114,8 @@ impl App {
             model_state,
             model_picker_open: false,
             selected_model: None,
+            repo_root: runner::repo_root(),
+            show_output: false,
         }
     }
 
@@ -184,7 +194,7 @@ impl App {
             return;
         }
 
-        let repo = runner::repo_root();
+        let repo = self.repo_root.clone();
         let Some(script) = runner::resolve_loop_script(&repo) else {
             self.status = Some(format!(
                 "Cannot find {} — set {} to its path.",
@@ -298,6 +308,25 @@ impl App {
         });
     }
 
+    /// Whether the output side panel is open.
+    pub fn output_visible(&self) -> bool {
+        self.show_output
+    }
+
+    /// Open or close the output side panel (#107).
+    pub fn toggle_output(&mut self) {
+        self.show_output = !self.show_output;
+    }
+
+    /// The selected issue's latest loop log path and its sanitized tail, or
+    /// `None` when nothing is selected or the loop has produced no log yet.
+    pub fn selected_output(&self, max_bytes: u64) -> Option<(PathBuf, String)> {
+        let number = self.selected()?.number;
+        let path = logs::latest_issue_log(&logs::logs_dir(&self.repo_root), number)?;
+        let raw = logs::read_log_tail(&path, max_bytes).ok()?;
+        Some((path, logs::sanitize(&raw)))
+    }
+
     /// Whether the new-issue form is currently open.
     pub fn is_creating(&self) -> bool {
         self.mode == Mode::Create
@@ -400,6 +429,12 @@ impl App {
         if !self.issues.is_empty() {
             self.state.select(Some(self.issues.len() - 1));
         }
+    }
+
+    /// Point the app at a specific repository root (tests only).
+    #[cfg(test)]
+    pub fn set_repo_root(&mut self, repo_root: PathBuf) {
+        self.repo_root = repo_root;
     }
 }
 
@@ -576,6 +611,42 @@ mod tests {
         assert!(!app.model_picker_open());
         // Cancelled without confirming: still auto.
         assert_eq!(app.selected_model(), None);
+    }
+
+    #[test]
+    fn output_panel_is_hidden_by_default_and_toggles() {
+        let mut app = app_with(1);
+        assert!(!app.output_visible());
+        app.toggle_output();
+        assert!(app.output_visible());
+        app.toggle_output();
+        assert!(!app.output_visible());
+    }
+
+    #[test]
+    fn selected_output_reads_the_latest_log() {
+        let dir = std::env::temp_dir().join(format!("copilot-app-output-{}", std::process::id()));
+        let logs = dir.join(".copilot-loop").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("issue-1-20260101-000000.log"),
+            "\x1b[32mhello\x1b[0m from the loop\n",
+        )
+        .unwrap();
+
+        let mut app = app_with(2); // issues numbered 0 and 1
+        app.set_repo_root(dir.clone());
+        app.last(); // select issue #1
+
+        let (path, text) = app.selected_output(OUTPUT_TAIL_BYTES).expect("a log");
+        assert!(path.ends_with("issue-1-20260101-000000.log"));
+        assert_eq!(text, "hello from the loop\n");
+
+        // An issue with no log yields nothing.
+        app.first(); // issue #0
+        assert!(app.selected_output(OUTPUT_TAIL_BYTES).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

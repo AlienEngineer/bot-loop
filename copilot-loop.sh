@@ -1702,9 +1702,13 @@ claim_next_ready_issue() {
     gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
     break
+  # Emit one joined string, not a stream: gh/jq append a newline after every
+  # streamed result, and with NUL-delimited records that newline leaks into the
+  # front of the next number field ("\n12"), corrupting the branch name and
+  # failing every issue after the first. join("") keeps the stream NUL-only.
   done < <(gh issue list --state open --label "$TRIGGER_LABEL" --limit 1000 \
              --json number,body \
-             --jq 'sort_by(.number) | .[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000"' 2>/dev/null)
+             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000"] | join("")' 2>/dev/null)
 
   release_github_lock
   [ -n "$issue" ] && printf '%s\n' "$issue"
@@ -1879,6 +1883,7 @@ EOF
   return 0
 }
 
+# >>> conflict-pr helpers >>>
 # Echo the number of the lowest-numbered open PR targeting the default branch
 # whose merge is CONFLICTING, skipping any already marked unresolved or already
 # claimed (in-progress) by another instance. Returns 1 (no output) when no PR
@@ -1909,6 +1914,7 @@ claim_next_conflicted_pr() {
   [ -n "$pr" ] && printf '%s\n' "$pr"
   [ -n "$pr" ]
 }
+# <<< conflict-pr helpers <<<
 
 # --- Self-update: pull the loop code and restart when it changed --------------
 # Before tackling each iteration, refresh this script from the default branch so

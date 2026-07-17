@@ -74,7 +74,10 @@ up. Press `c` to create a new issue: fill in a title and description, then
 stop) a background `copilot-loop.sh` that works through the ready issues; it
 runs detached — output captured to `.copilot-loop/tui/loop.log` — and keeps
 going after you quit the TUI. The loop script is found at the repo root
-(override with `$COPILOT_LOOP_SCRIPT`).
+(override with `$COPILOT_LOOP_SCRIPT`). Press `o` to open a side panel on the
+right that tails the running loop's output for the selected issue (its
+`.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
+to close it.
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
@@ -88,9 +91,10 @@ cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-start (mark ready), `l` start/stop the background loop, `m` pick the model, `r`
-refresh, `q` (or `Esc`) quit. In the new-issue form: `Tab` switches fields, `Enter`
-adds a newline (or moves from title to description), `Ctrl+S` creates, `Esc` cancels.
+start (mark ready), `l` start/stop the background loop, `m` pick the model, `o`
+show/hide the output panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue
+form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
+description), `Ctrl+S` creates, `Esc` cancels.
 
 
 ### Branch and worktree cleanup
@@ -103,6 +107,20 @@ the merged remote branch too. It never touches the default branch or a branch
 that still has un-pushed work. Turn the sweep off with `--no-cleanup-merged`, and
 control remote-branch deletion with `--delete-remote-branch` /
 `--no-delete-remote-branch` (default: auto).
+
+### Keeping PRs mergeable
+
+Before starting any new task, each pass the loop checks every open PR targeting
+the default branch for merge conflicts. When one is found it merges the base
+branch into the PR's head branch and, if that conflicts, hands the conflicted
+files to Copilot to resolve, then pushes so the PR becomes mergeable again.
+
+Only one PR is worked at a time, and a PR is *claimed* by adding the
+`in-progress` label while the GitHub lock is held, so several instances running
+in parallel never grab the same PR to solve. The label is removed once the
+conflicts are resolved. If the loop cannot resolve a PR's conflicts it labels it
+`conflict-unresolved` and leaves it alone rather than retrying forever — remove
+that label by hand to let the loop try again.
 
 ## Flags and environment variables
 
