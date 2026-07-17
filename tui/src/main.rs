@@ -89,14 +89,13 @@ fn handle_create_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab | KeyCode::BackTab => app.form_toggle_field(),
         KeyCode::Backspace => app.form_backspace(),
         KeyCode::Enter => app.form_newline(),
-        KeyCode::Char(c) => {
-            // Ignore control/alt combos so shortcuts don't leak into the text.
+        // Ignore control/alt combos so shortcuts don't leak into the text.
+        KeyCode::Char(c)
             if !key
                 .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            {
-                app.form_input(c);
-            }
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.form_input(c)
         }
         _ => {}
     }
