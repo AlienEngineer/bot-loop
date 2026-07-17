@@ -657,7 +657,15 @@ mod tests {
 
     #[test]
     fn header_shows_the_worker_count_for_several_workers() {
-        let text = spans_text(&header_spans(5, Some(96), 3, &[96, 97, 98], &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(
+            5,
+            Some(96),
+            3,
+            &[96, 97, 98],
+            &[],
+            "auto",
+            "⠋",
+        ));
         assert!(text.contains("loop: running"));
         assert!(text.contains("3 workers"));
         assert!(text.contains("working #96, #97, #98"));
