@@ -2,7 +2,7 @@
 
 use ratatui::widgets::ListState;
 
-use crate::github::{self, Issue};
+use crate::github::{self, Issue, Label};
 
 /// Default number of issues to request from `gh`.
 pub const DEFAULT_LIMIT: u32 = 200;
@@ -62,6 +62,37 @@ impl App {
     /// The currently selected issue, if any.
     pub fn selected(&self) -> Option<&Issue> {
         self.state.selected().and_then(|i| self.issues.get(i))
+    }
+
+    /// Mark the selected issue ready so the loop can pick it up.
+    ///
+    /// Adds the trigger label via `gh`, reflects it locally so the row updates
+    /// without a refetch, and reports progress on the status line.
+    pub fn mark_ready(&mut self) {
+        let Some(index) = self.state.selected() else {
+            return;
+        };
+        let Some(issue) = self.issues.get(index) else {
+            return;
+        };
+
+        let number = issue.number;
+        let label = github::ready_label();
+
+        if issue.has_label(&label) {
+            self.status = Some(format!("#{number} already labelled '{label}'."));
+            return;
+        }
+
+        match github::add_label(number, &label) {
+            Ok(()) => {
+                self.issues[index].labels.push(Label {
+                    name: label.clone(),
+                });
+                self.status = Some(format!("#{number} marked '{label}'."));
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
     }
 
     /// Move the selection down by one, clamped to the last item.
@@ -163,5 +194,28 @@ mod tests {
         assert_eq!(app.state.selected(), Some(1)); // clamped from 4
         app.set_issues(Vec::new());
         assert_eq!(app.state.selected(), None);
+    }
+
+    #[test]
+    fn mark_ready_is_safe_when_nothing_selected() {
+        let mut app = app_with(0);
+        app.mark_ready();
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn mark_ready_short_circuits_when_already_labelled() {
+        let label = github::ready_label();
+        let json = format!(r#"[{{"number":7,"title":"t","labels":[{{"name":"{label}"}}]}}]"#);
+        let mut app = App::new(parse_issues(&json).unwrap());
+
+        app.mark_ready();
+
+        // No gh call happened: label count is unchanged and the status explains why.
+        assert_eq!(app.issues[0].labels.len(), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("#7 already labelled '{label}'.").as_str())
+        );
     }
 }

@@ -67,14 +67,17 @@ that spawns, monitors, and stops several loop instances ("bots") side by side.
 A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). The
 first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
-authenticated for the target repo.
+authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
+label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
+up.
 
 ```sh
 cd tui
 cargo run
 ```
 
-Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `r` refresh, `q` (or `Esc`) quit.
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `s`/`Enter` start (mark ready),
+`r` refresh, `q` (or `Esc`) quit.
 
 
 ### Branch and worktree cleanup
