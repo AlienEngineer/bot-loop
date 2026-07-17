@@ -42,6 +42,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.pr_output_open() {
         render_pr_output(frame, frame.area(), app);
     }
+    // The closed-issues (spend) popup floats on top when open (#145).
+    if app.closed_open() {
+        render_closed(frame, frame.area(), app);
+    }
 }
 
 /// Braille spinner frames used to signal the loop is alive (#115).
@@ -279,7 +283,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         spans.push(Span::raw("  "));
     }
     spans.push(Span::styled(
-        "j/k move · g/G top/bottom · c new · s ready · x close · l add-worker · L stop-all · m models · o output · p pr-output · r refresh · q quit",
+        "j/k move · g/G top/bottom · c new · s ready · x close · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit",
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -455,6 +459,91 @@ fn render_pr_output_log(
             );
         }
     }
+}
+
+/// Format an AI Credits total for display: whole numbers without a decimal
+/// point, otherwise one decimal place. Pure for testing (#145).
+fn format_credits(value: f64) -> String {
+    if value.fract().abs() < 0.05 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+/// Build a closed-issue row for the spend popup: the AI Credits spent (or a dash
+/// when none was recorded) leading the issue number, title, and labels. The cost
+/// leads and is coloured so "how much did this issue cost" is the first thing the
+/// eye lands on (#145).
+fn closed_issue_item(issue: &Issue) -> ListItem<'static> {
+    let cost = match issue.credits_spent() {
+        Some(credits) => Span::styled(
+            format!("{:>9} ", format!("{} cr", format_credits(credits))),
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(format!("{:>9} ", "—"), Style::new().fg(Color::DarkGray)),
+    };
+    let mut spans = vec![
+        cost,
+        Span::styled(
+            format!("#{:<5}", issue.number),
+            Style::new().fg(Color::Yellow),
+        ),
+        Span::raw(" "),
+        Span::raw(issue.title.clone()),
+    ];
+    let labels = issue.label_names();
+    if !labels.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{}]", labels.join(", ")),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// Draw the closed-issues (spend) popup: a centered, scrollable list of closed
+/// issues, each showing the AI Credits the loop spent on it, with the grand
+/// total in the border title so the overall cost is visible at a glance. A
+/// [`Clear`] underneath wipes the cells so the list behind it does not show
+/// through (#145).
+fn render_closed(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let total = match app.closed_total_credits() {
+        Some(credits) => format!("spent {} credits", format_credits(credits)),
+        None => "no recorded spend".to_string(),
+    };
+    let title = format!(
+        " Closed Issues · {} closed · {total} ",
+        app.closed_issues().len()
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k move · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    if app.closed_issues().is_empty() {
+        let body = Paragraph::new("No closed issues.")
+            .block(block)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(body, popup);
+        return;
+    }
+
+    let items: Vec<ListItem> = app.closed_issues().iter().map(closed_issue_item).collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, popup, &mut app.closed_state);
 }
 
 /// A rectangle of `width` columns and `height` rows centered within `area`,
@@ -973,5 +1062,60 @@ mod tests {
         assert!(text.contains("Description"));
         assert!(text.contains("Bug"));
         assert!(text.contains("Ctrl+S create"));
+    }
+
+    #[test]
+    fn format_credits_drops_trailing_zeros() {
+        assert_eq!(format_credits(335.0), "335");
+        assert_eq!(format_credits(25.7), "25.7");
+        assert_eq!(format_credits(150.5), "150.5");
+    }
+
+    #[test]
+    fn footer_advertises_the_closed_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(170, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("t closed"));
+    }
+
+    #[test]
+    fn renders_the_closed_popup_with_spend_per_issue_and_total() {
+        let json = format!(
+            "[{},{}]",
+            r#"{"number":143,"title":"resolve PR view","comments":[{"body":"```\nAI Credits 335 (9m)\n```\n<!-- copilot-loop:usage -->"}]}"#,
+            r#"{"number":128,"title":"animate the line","comments":[]}"#,
+        );
+        let mut app = App::new(Vec::new());
+        app.open_closed_with(parse_issues(&json).unwrap());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Closed Issues"));
+        // Both closed issues are listed.
+        assert!(text.contains("#143"));
+        assert!(text.contains("#128"));
+        // The spend leads each row: a figure where recorded, a dash where not.
+        assert!(text.contains("335 cr"));
+        assert!(text.contains("—"));
+        // The grand total is surfaced in the border title.
+        assert!(text.contains("spent 335 credits"));
+    }
+
+    #[test]
+    fn closed_popup_reports_when_there_are_no_closed_issues() {
+        let mut app = App::new(Vec::new());
+        app.open_closed_with(Vec::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("No closed issues."));
     }
 }
