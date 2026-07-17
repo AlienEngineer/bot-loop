@@ -98,6 +98,20 @@ that still has un-pushed work. Turn the sweep off with `--no-cleanup-merged`, an
 control remote-branch deletion with `--delete-remote-branch` /
 `--no-delete-remote-branch` (default: auto).
 
+### Keeping PRs mergeable
+
+Before starting any new task, each pass the loop checks every open PR targeting
+the default branch for merge conflicts. When one is found it merges the base
+branch into the PR's head branch and, if that conflicts, hands the conflicted
+files to Copilot to resolve, then pushes so the PR becomes mergeable again.
+
+Only one PR is worked at a time, and a PR is *claimed* by adding the
+`in-progress` label while the GitHub lock is held, so several instances running
+in parallel never grab the same PR to solve. The label is removed once the
+conflicts are resolved. If the loop cannot resolve a PR's conflicts it labels it
+`conflict-unresolved` and leaves it alone rather than retrying forever — remove
+that label by hand to let the loop try again.
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
