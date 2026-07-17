@@ -31,6 +31,12 @@
 #   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
 #      trigger label, or per a "Label:" directive in the file) so file-based
 #      tasks enter the queue below.
+#   0b. Sync the local default branch with origin/<default> so the loop's
+#      baseline matches the remote before any work. A clean update fast-forwards;
+#      when the local default branch has diverged and the merge conflicts, the
+#      conflicts are handed to Copilot to resolve so the loop can move forward
+#      (the resolved merge is kept local, never pushed). Set SYNC_REMOTE=0 to
+#      turn this off (see the "sync-default helpers").
 #   1. Before starting any new task, check open PRs targeting the default branch
 #      for merge conflicts. GitHub computes mergeability asynchronously, so the
 #      loop first waits (bounded) for any PR still reported UNKNOWN to be
@@ -143,6 +149,9 @@
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
+# Plus SYNC_REMOTE (env-only, no flag): set to 0 to stop the loop syncing the
+# local default branch with the remote before each pass; on by default (see the
+# flow's step 0b — a diverged merge conflict is handed to Copilot to resolve).
 # Plus MERGEABILITY_WAIT_ATTEMPTS / MERGEABILITY_WAIT_SECONDS (env-only): bound
 # the wait for GitHub to finish computing PR mergeability before the conflict
 # check, so a still-UNKNOWN (not yet evaluated) conflict is not skipped. Defaults
@@ -203,6 +212,10 @@ QUIET="${QUIET:-}"
 # script changes upstream. Left unset it is auto-enabled whenever the script is
 # a tracked file inside the repo it operates on.
 SELF_UPDATE="${SELF_UPDATE:-}"
+# Set SYNC_REMOTE=0 to stop the loop syncing the local default branch with the
+# remote before each pass. On by default; when the default branch has diverged
+# and the merge conflicts, Copilot is asked to resolve it so the loop can move on.
+SYNC_REMOTE="${SYNC_REMOTE:-}"
 # Whether each issue gets its own git worktree instead of switching branches in
 # the shared checkout. On by default so every task runs in a different folder;
 # set to 0 (or pass --no-worktrees) to work in place. 1/true/yes/on force it on.
@@ -851,6 +864,14 @@ if [ "$SELF_UPDATE" = 1 ]; then
   SCRIPT_REL="$(git -C "$REPO_DIR" ls-files --full-name -- "$SCRIPT_PATH" 2>/dev/null | head -1)"
   [ -n "$SCRIPT_REL" ] || SELF_UPDATE=0
 fi
+
+# Whether to sync the local default branch with origin/<default> before each pass
+# (see sync_default_branch, called at the top of the main loop). On unless an
+# explicit 0/false/no/off turns it off.
+case "$SYNC_REMOTE" in
+  0|false|no|off) SYNC_REMOTE=0 ;;
+  *)              SYNC_REMOTE=1 ;;
+esac
 
 # Decide whether to isolate each issue in its own git worktree. On by default so
 # every task works in a different folder and parallel instances never touch the
@@ -2223,11 +2244,176 @@ self_update() {
   exec "$SCRIPT_PATH" ${SELF_ARGS[@]+"${SELF_ARGS[@]}"}
 }
 
+# --- Sync: bring the local default branch up to date with the remote ---------
+# Before starting any new work, sync the local default branch with
+# origin/<default> so the loop's baseline matches the remote. A clean update is a
+# fast-forward; when the local default branch has diverged (it carries commits
+# that conflict with what landed on the remote) the merge is handed to Copilot to
+# resolve so the loop can move forward instead of stalling on a stale branch. The
+# resolved merge is kept local only — the loop never pushes the default branch
+# (pull requests do that). Best effort: any inability to sync is logged and the
+# loop carries on, and an identical divergence Copilot already failed to resolve
+# is skipped (marker) so it is not re-run every pass.
+#
+# classify_sync_state is pure and, with sync_default_branch, is covered by
+# tests/sync-default-branch.test.sh between the markers — keep them intact.
+# >>> sync-default helpers >>>
+# classify_sync_state <upstream_is_ancestor_of_local> <local_is_ancestor_of_upstream>
+# Classify how the local default branch relates to its upstream from the two
+# `git merge-base --is-ancestor` outcomes (each "yes" when the ancestor test
+# passed, anything else means no):
+#   insync   - upstream already contained locally (equal, or local ahead): nothing to pull
+#   ff       - local strictly behind upstream with no divergence: fast-forward
+#   diverged - each side has unique commits: a real merge that may conflict
+# Pure string logic so it can be unit tested without git.
+classify_sync_state() {
+  case "$1" in yes) printf 'insync'; return ;; esac
+  case "$2" in yes) printf 'ff';     return ;; esac
+  printf 'diverged'
+}
+
+sync_default_branch() {
+  [ "$SYNC_REMOTE" = 1 ] || return 0
+
+  git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || return 0
+  local upstream="origin/${DEFAULT_BRANCH}" local_ref="refs/heads/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$upstream"  >/dev/null 2>&1 || return 0
+  # Nothing to sync when there is no local default branch (e.g. a detached or
+  # bare-worktree layout) — new work still bases off the fresh origin/<default>.
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$local_ref" >/dev/null 2>&1 || return 0
+
+  local upstream_anc=no local_anc=no state
+  git -C "$REPO_DIR" merge-base --is-ancestor "$upstream" "$local_ref" >/dev/null 2>&1 && upstream_anc=yes
+  git -C "$REPO_DIR" merge-base --is-ancestor "$local_ref" "$upstream" >/dev/null 2>&1 && local_anc=yes
+  state="$(classify_sync_state "$upstream_anc" "$local_anc")"
+  [ "$state" = insync ] && return 0
+
+  local cur_branch
+  cur_branch="$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+
+  if [ "$state" = ff ]; then
+    # No divergence: fast-forward the checkout when the default branch is checked
+    # out here, otherwise just advance the local ref (safe, no working-tree move).
+    if [ "$cur_branch" = "$DEFAULT_BRANCH" ]; then
+      git -C "$REPO_DIR" merge --ff-only "$upstream" >/dev/null 2>&1 \
+        && log "synced $DEFAULT_BRANCH with origin (fast-forward)"
+    else
+      git -C "$REPO_DIR" branch -f "$DEFAULT_BRANCH" "$upstream" >/dev/null 2>&1 \
+        && log "synced $DEFAULT_BRANCH with origin (fast-forward)"
+    fi
+    return 0
+  fi
+
+  # Diverged. Resolving means merging in the default branch's working tree, so we
+  # only do it when the default branch is the checkout the loop owns (REPO_DIR);
+  # when it is checked out elsewhere we must not touch that tree.
+  if [ "$cur_branch" != "$DEFAULT_BRANCH" ]; then
+    log "$DEFAULT_BRANCH has diverged from origin but is not checked out here; skipping sync"
+    return 0
+  fi
+
+  # Skip a divergence we already handed to Copilot and could not resolve, until
+  # either side moves, so an unresolvable conflict is not re-run every pass.
+  local local_sha upstream_sha marker
+  local_sha="$(git -C "$REPO_DIR" rev-parse "$local_ref" 2>/dev/null)"
+  upstream_sha="$(git -C "$REPO_DIR" rev-parse "$upstream" 2>/dev/null)"
+  marker="$WORK_DIR/sync-unresolved"
+  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "${local_sha} ${upstream_sha}" ]; then
+    return 0
+  fi
+
+  log "$DEFAULT_BRANCH has diverged from origin; syncing"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  local log_file
+  log_file="$LOG_DIR/sync-$(date '+%Y%m%d-%H%M%S').log"
+
+  # A clean merge means there was nothing to resolve; a failed one leaves conflict
+  # markers for Copilot (or failed for another reason, handled below).
+  if git -C "$REPO_DIR" merge --no-edit "$upstream" >>"$log_file" 2>&1; then
+    rm -f "$marker"
+    log "synced $DEFAULT_BRANCH with origin (merged, no conflicts)"
+    return 0
+  fi
+
+  local conflicts
+  conflicts="$(git -C "$REPO_DIR" diff --name-only --diff-filter=U 2>/dev/null)"
+  if [ -z "$conflicts" ]; then
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    log "could not sync $DEFAULT_BRANCH with origin; leaving it unchanged"
+    return 0
+  fi
+  log "resolving $DEFAULT_BRANCH sync conflicts in: $(printf '%s' "$conflicts" | tr '\n' ' ')"
+
+  local prompt
+  prompt="$(cat <<EOF
+You are working in a git repository. Merging the remote branch
+"origin/${DEFAULT_BRANCH}" into the local "${DEFAULT_BRANCH}" branch produced
+conflicts that must be resolved before the automation can continue.
+
+These files contain git conflict markers (<<<<<<<, =======, >>>>>>>):
+${conflicts}
+
+Resolve every conflict so the result is correct and preserves the intent of both
+sides, then remove all conflict markers. Run any build or test commands needed to
+verify your work. Do NOT run git commit, git merge, git push, or create
+branches — those steps are handled automatically outside this session. Only edit
+files to resolve the conflicts and verify.
+EOF
+)"
+  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+
+  if ! cd "$REPO_DIR" 2>/dev/null; then
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    log "could not enter $REPO_DIR to resolve $DEFAULT_BRANCH sync conflicts; leaving it unchanged"
+    return 0
+  fi
+  log "running copilot to resolve $DEFAULT_BRANCH sync conflicts (log: $log_file)"
+  run_copilot "$log_file" "${copilot_args[@]}"
+  log "copilot exited with code $COPILOT_RC while resolving $DEFAULT_BRANCH sync"
+
+  # Bail if Copilot left conflict markers behind; record the divergence so we do
+  # not re-run it on the identical local/upstream pair next pass.
+  local f unresolved=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$REPO_DIR/$f" ] && grep -qE '^(<{7}|>{7})' "$REPO_DIR/$f" && unresolved="$unresolved $f"
+  done <<< "$conflicts"
+  if [ -n "$unresolved" ]; then
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    printf '%s %s\n' "$local_sha" "$upstream_sha" >"$marker" 2>/dev/null || true
+    log "could not resolve $DEFAULT_BRANCH sync conflicts (markers left in:$unresolved); leaving it unchanged"
+    return 0
+  fi
+
+  # Stage exactly the resolved conflict files (non-conflicted merge changes are
+  # already staged) so untracked files in the checkout are never swept into the
+  # merge commit, then complete the merge locally without pushing.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    git -C "$REPO_DIR" add -- "$f" >/dev/null 2>&1 || true
+  done <<< "$conflicts"
+  if git -C "$REPO_DIR" commit --no-edit >/dev/null 2>&1 \
+     || git -C "$REPO_DIR" commit -m "Merge origin/${DEFAULT_BRANCH} into ${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+    rm -f "$marker"
+    log "resolved $DEFAULT_BRANCH sync conflicts with origin (kept local, not pushed)"
+  else
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    log "failed to commit resolved $DEFAULT_BRANCH sync; leaving it unchanged"
+  fi
+  return 0
+}
+# <<< sync-default helpers <<<
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
   # Keep the loop current before starting any new work: pull the default branch
   # and re-exec if this script changed upstream.
   self_update
+
+  # Sync the local default branch with the remote so new work starts from the
+  # latest baseline; a diverged merge conflict is handed to Copilot to resolve.
+  sync_default_branch
 
   process_issue_files
 
