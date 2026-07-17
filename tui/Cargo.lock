@@ -156,6 +156,7 @@ name = "copilot-loop-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

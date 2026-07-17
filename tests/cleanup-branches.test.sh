@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317  # mock/stub helpers are invoked indirectly by the code under test
 #
 # Tests for the branch/worktree cleanup helpers in copilot-loop.sh. The functions
 # under test are extracted verbatim from the script (between the "cleanup helpers"

@@ -842,7 +842,7 @@ esac
 # tracked working tree.
 _common_dir="$(git -C "$REPO_DIR" rev-parse --git-common-dir 2>/dev/null || echo .)"
 case "$_common_dir" in /*) : ;; *) _common_dir="$REPO_DIR/$_common_dir" ;; esac
-_common_dir="$(cd "$_common_dir" 2>/dev/null && pwd || true)"
+_common_dir="$(cd "$_common_dir" 2>/dev/null && pwd)" || _common_dir=""
 if [ -n "$_common_dir" ] && [ "$(git --git-dir="$_common_dir" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
   WORKTREE_BASE="$_common_dir"
 else
@@ -1709,7 +1709,7 @@ claim_next_reply_issue() {
     { IFS= read -r -d '' last_author; IFS= read -r -d '' body; } < <(
       gh issue view "$n" --json comments,body \
         --jq '[(.comments[-1].author.login // ""), (.body // "")] | join("\u0000")' 2>/dev/null)
-    [ -n "$last_author" ] && [ "$last_author" != "$BOT_LOGIN" ] || continue
+    if [ -z "$last_author" ] || [ "$last_author" = "$BOT_LOGIN" ]; then continue; fi
     # Honour the same dependency gate as fresh issues: do not resume an issue
     # while an issue it declares it is waiting for is still open.
     blockers="$(issue_open_blockers "$n" "$body")"
