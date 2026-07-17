@@ -13,6 +13,7 @@ use crate::github::Issue;
 
 /// Draw the whole UI: header, issue list (or placeholder), and footer.
 pub fn render(frame: &mut Frame, app: &mut App) {
+    let loop_running = app.loop_running();
     let [header_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -20,12 +21,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, app);
+    render_header(frame, header_area, app, loop_running);
     render_body(frame, body_area, app);
-    render_footer(frame, footer_area, app);
+    render_footer(frame, footer_area, app, loop_running);
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
     let count = app.issues.len();
     let mut spans = vec![
         Span::styled(
@@ -46,6 +47,12 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Style::new().fg(Color::DarkGray),
         ));
     }
+    let (loop_text, loop_color) = if loop_running {
+        ("  ·  loop: running", Color::Green)
+    } else {
+        ("  ·  loop: off", Color::DarkGray)
+    };
+    spans.push(Span::styled(loop_text, Style::new().fg(loop_color)));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -73,7 +80,7 @@ fn render_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.state);
 }
 
-fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
     let mut spans = Vec::new();
     if let Some(status) = &app.status {
         spans.push(Span::styled(
@@ -82,8 +89,13 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ));
         spans.push(Span::raw("  "));
     }
+    let loop_key = if loop_running {
+        "l stop-loop"
+    } else {
+        "l start-loop"
+    };
     spans.push(Span::styled(
-        "j/k move · g/G top/bottom · s start · r refresh · q quit",
+        format!("j/k move · g/G top/bottom · s ready · {loop_key} · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -167,5 +179,20 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("No open issues found."));
+    }
+
+    #[test]
+    fn header_shows_loop_off_by_default() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
+                .unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("loop: off"));
+        assert!(text.contains("start-loop"));
     }
 }
