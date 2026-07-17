@@ -113,7 +113,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => app.open_create(),
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
         KeyCode::Char('x') => app.request_close(),
-        KeyCode::Char('l') => app.toggle_loop(),
+        KeyCode::Char('l') => app.start_worker(),
+        KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         _ => {}

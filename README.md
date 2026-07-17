@@ -72,23 +72,27 @@ label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
 up. Press `c` to create a new issue: fill in a title and description, then
 `Ctrl+S` to submit it (no label is added by default). Press `x` to close the
 selected issue: a confirmation popup names it, then `y` closes it on GitHub
-(`n`/`Esc` cancels). Press `l` to start (or
-stop) a background `copilot-loop.sh` that works through the ready issues; it
-runs detached — output captured to `.copilot-loop/tui/loop.log` — and keeps
-going after you quit the TUI. The loop script is found at the repo root
+(`n`/`Esc` cancels). Press `l` to start a background `copilot-loop.sh` worker
+that works through the ready issues; press `l` again to add more workers running
+in parallel. Each worker claims issues under a GitHub lock (and isolates each in
+its own git worktree), so multiple workers safely pick *different* issues (#134).
+Press `L` (Shift+L) to stop every worker. Workers run detached — each one's
+output captured to `.copilot-loop/tui/loop-<n>.log` — and keep going after you
+quit the TUI. The loop script is found at the repo root
 (override with `$COPILOT_LOOP_SCRIPT`). Press `o` to open a side panel on the
 right that tails the running loop's output for the selected issue (its
 `.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
 to close it.
 
-While the loop runs the header shows a turning spinner next to `loop: running`
-and the issue it is working (`working #96`, or `waiting for work` when idle), and
-the list refreshes on its own so `in-progress` issues — flagged with a spinner in
-their row — appear as the loop claims them, without a manual refresh (#115).
+While workers run the header shows a turning spinner next to `loop: running`,
+how many workers are running, and the issues they are working (`working #96, #97`,
+or `waiting for work` when idle), and the list refreshes on its own so
+`in-progress` issues — flagged with a spinner in their row — appear as the
+workers claim them, without a manual refresh (#115).
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
-`copilot-loop.sh` as `--model` the next time the loop starts; `auto` lets Copilot
+`copilot-loop.sh` as `--model` for workers started after that; `auto` lets Copilot
 pick. The picker's list defaults to a small built-in set — override it with
 `$COPILOT_MODELS` (a comma- or space-separated list).
 

@@ -94,6 +94,9 @@ pub struct App {
     /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
     /// can announce when the loop *starts* a new issue (#119).
     known_in_progress: Vec<u64>,
+    /// Monotonic id for the next worker, so each gets its own capture log
+    /// (`loop-<id>.log`) even as workers come and go (#134).
+    next_worker_id: usize,
 }
 
 impl App {
@@ -123,6 +126,7 @@ impl App {
             show_output: false,
             close_confirm: None,
             known_in_progress: Vec::new(),
+            next_worker_id: 1,
         }
     }
 
@@ -285,18 +289,13 @@ impl App {
         }
     }
 
-    /// Start or stop the background loop that works through ready issues.
+    /// Start another background worker that works through the ready issues.
     ///
-    /// When one is running it is stopped; otherwise a detached `copilot-loop.sh`
-    /// is launched against this repository (output captured to a log). The loop
-    /// keeps running after the TUI quits, matching the bash TUI's behaviour.
-    pub fn toggle_loop(&mut self) {
-        if self.runner.is_running() {
-            self.runner.stop();
-            self.status = Some("Background loop stopped.".to_string());
-            return;
-        }
-
+    /// Each call launches a new detached `copilot-loop.sh`. Because the loop
+    /// claims issues under a GitHub lock (and isolates each in its own git
+    /// worktree), several workers run safely on *different* issues (#134). A
+    /// worker keeps running after the TUI quits, matching the bash TUI.
+    pub fn start_worker(&mut self) {
         let repo = self.repo_root.clone();
         let Some(script) = runner::resolve_loop_script(&repo) else {
             self.status = Some(format!(
@@ -307,15 +306,20 @@ impl App {
             return;
         };
 
-        let log = runner::log_path(&repo);
+        // Baseline the in-progress set only when the first worker starts, so any
+        // already-labelled in-progress issue predates the workers (#119).
+        let was_idle = !self.runner.is_running();
+        let log = runner::log_path(&repo, self.next_worker_id);
         let model = self.selected_model().map(str::to_owned);
         match self.runner.start(&script, &repo, &log, model.as_deref()) {
             Ok(pid) => {
-                // Only announce issues the loop starts *after* this point; any
-                // already-labelled in-progress issue predates the loop (#119).
-                self.seed_in_progress_baseline();
+                self.next_worker_id += 1;
+                if was_idle {
+                    self.seed_in_progress_baseline();
+                }
+                let count = self.runner.running_count();
                 self.status = Some(format!(
-                    "Background loop started (pid {pid}, model {}). Log: {}",
+                    "Worker started (pid {pid}, model {}). {count} running. Log: {}",
                     self.current_model_label(),
                     log.display()
                 ));
@@ -324,7 +328,27 @@ impl App {
         }
     }
 
-    /// Whether the background loop is currently running.
+    /// Stop every running background worker (#134). Reports how many were stopped,
+    /// or that none were running.
+    pub fn stop_all_workers(&mut self) {
+        let count = self.runner.running_count();
+        if count == 0 {
+            self.status = Some("No workers running.".to_string());
+            return;
+        }
+        self.runner.stop_all();
+        self.status = Some(format!(
+            "Stopped {count} worker{}.",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// How many background workers are currently running (#134).
+    pub fn workers_running(&mut self) -> usize {
+        self.runner.running_count()
+    }
+
+    /// Whether any background worker is currently running.
     pub fn loop_running(&mut self) -> bool {
         self.runner.is_running()
     }
@@ -418,7 +442,7 @@ impl App {
 
         let label = self.current_model_label().to_string();
         self.status = Some(if self.runner.is_running() {
-            format!("Model set to {label} (applies when the loop restarts).")
+            format!("Model set to {label} (applies to workers started next).")
         } else {
             format!("Model set to {label}.")
         });
@@ -806,6 +830,15 @@ mod tests {
     fn loop_is_not_running_before_it_is_started() {
         let mut app = app_with(0);
         assert!(!app.loop_running());
+        assert_eq!(app.workers_running(), 0);
+    }
+
+    #[test]
+    fn stop_all_workers_is_a_no_op_when_none_run() {
+        let mut app = app_with(1);
+        app.stop_all_workers();
+        // No worker was running, so nothing is stopped and the status says so.
+        assert_eq!(app.status.as_deref(), Some("No workers running."));
     }
 
     #[test]
