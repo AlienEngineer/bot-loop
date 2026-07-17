@@ -89,6 +89,8 @@ pub struct App {
     selected_model: Option<String>,
     repo_root: PathBuf,
     show_output: bool,
+    /// The number of the issue awaiting a close confirmation, if any (#118).
+    close_confirm: Option<u64>,
     /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
     /// can announce when the loop *starts* a new issue (#119).
     known_in_progress: Vec<u64>,
@@ -119,6 +121,7 @@ impl App {
             selected_model: None,
             repo_root: runner::repo_root(),
             show_output: false,
+            close_confirm: None,
             known_in_progress: Vec::new(),
         }
     }
@@ -226,6 +229,57 @@ impl App {
                     name: label.clone(),
                 });
                 self.status = Some(format!("#{number} marked '{label}'."));
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// The number of the issue awaiting a close confirmation, if any (#118).
+    pub fn close_confirm(&self) -> Option<u64> {
+        self.close_confirm
+    }
+
+    /// Ask to close the selected issue: opens a confirmation prompt naming it.
+    ///
+    /// Closing is destructive, so nothing is sent to GitHub until the operator
+    /// confirms via [`confirm_close`].
+    pub fn request_close(&mut self) {
+        if let Some(issue) = self.selected() {
+            self.close_confirm = Some(issue.number);
+        }
+    }
+
+    /// Dismiss the close confirmation without closing anything.
+    pub fn cancel_close(&mut self) {
+        if let Some(number) = self.close_confirm.take() {
+            self.status = Some(format!("Close of #{number} cancelled."));
+        }
+    }
+
+    /// Close the issue awaiting confirmation via `gh`, then drop it from the
+    /// list.
+    ///
+    /// On success the now-closed issue is removed from the open list so it
+    /// disappears without a refetch, and the selection is kept in bounds. A
+    /// no-op when no confirmation is pending.
+    pub fn confirm_close(&mut self) {
+        let Some(number) = self.close_confirm.take() else {
+            return;
+        };
+
+        match github::close_issue(number) {
+            Ok(()) => {
+                if let Some(pos) = self.issues.iter().position(|i| i.number == number) {
+                    self.issues.remove(pos);
+                    if self.issues.is_empty() {
+                        self.state.select(None);
+                    } else {
+                        let max = self.issues.len() - 1;
+                        let selected = self.state.selected().unwrap_or(0).min(max);
+                        self.state.select(Some(selected));
+                    }
+                }
+                self.status = Some(format!("Closed issue #{number}."));
             }
             Err(err) => self.status = Some(format!("Error: {err}")),
         }
@@ -709,6 +763,43 @@ mod tests {
             app.status.as_deref(),
             Some(format!("#7 already labelled '{label}'.").as_str())
         );
+    }
+
+    #[test]
+    fn request_close_is_safe_when_nothing_selected() {
+        let mut app = app_with(0);
+        app.request_close();
+        assert_eq!(app.close_confirm(), None);
+    }
+
+    #[test]
+    fn request_close_opens_a_confirmation_for_the_selected_issue() {
+        let mut app = app_with(3); // numbers 0..=2
+        app.next(); // select #1
+        app.request_close();
+        assert_eq!(app.close_confirm(), Some(1));
+        // The list is untouched until the operator confirms.
+        assert_eq!(app.issues.len(), 3);
+    }
+
+    #[test]
+    fn cancel_close_clears_the_prompt_without_touching_the_list() {
+        let mut app = app_with(3);
+        app.request_close();
+        assert_eq!(app.close_confirm(), Some(0));
+        app.cancel_close();
+        assert_eq!(app.close_confirm(), None);
+        assert_eq!(app.issues.len(), 3);
+        assert_eq!(app.status.as_deref(), Some("Close of #0 cancelled."));
+    }
+
+    #[test]
+    fn confirm_close_without_a_pending_prompt_is_a_no_op() {
+        let mut app = app_with(2);
+        app.confirm_close();
+        // No gh call is made and the list is unchanged.
+        assert_eq!(app.issues.len(), 2);
+        assert!(app.status.is_none());
     }
 
     #[test]

@@ -33,6 +33,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.is_creating() {
         render_create_form(frame, app);
     }
+    // The close-issue confirmation floats on top of the list (#118).
+    if let Some(number) = app.close_confirm() {
+        render_close_confirm(frame, frame.area(), app, number);
+    }
 }
 
 /// Braille spinner frames used to signal the loop is alive (#115).
@@ -234,7 +238,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         "l start-loop"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · s ready · {loop_key} · m models · o output · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · s ready · x close · {loop_key} · m models · o output · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -270,6 +274,45 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &mut App) {
 
     frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, popup, &mut app.model_state);
+}
+
+/// Draw the close-issue confirmation popup: a centered prompt naming the issue
+/// to be closed, with a [`Clear`] underneath so the list does not show through
+/// (#118). The red border signals the action is destructive.
+fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
+    let title = app
+        .issues
+        .iter()
+        .find(|issue| issue.number == number)
+        .map(|issue| issue.title.clone())
+        .unwrap_or_default();
+
+    let popup = centered_popup(area, 50, 6);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Close issue #{number}? "))
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" y confirm · n/Esc cancel ").centered())
+        .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    let body = Paragraph::new(vec![
+        Line::from(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This closes the issue on GitHub.",
+            Style::new().fg(Color::DarkGray),
+        )),
+    ])
+    .block(block)
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(body, popup);
 }
 
 /// A rectangle of `width` columns and `height` rows centered within `area`,
@@ -504,6 +547,35 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("o output"));
+    }
+
+    #[test]
+    fn footer_advertises_the_close_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("x close"));
+    }
+
+    #[test]
+    fn renders_the_close_confirmation_popup_when_open() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
+                .unwrap();
+        let mut app = App::new(issues);
+        app.request_close();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Close issue #96?"));
+        assert!(text.contains("y confirm"));
+        assert!(text.contains("cancel"));
     }
 
     fn spans_text(spans: &[Span]) -> String {

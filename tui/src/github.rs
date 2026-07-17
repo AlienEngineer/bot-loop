@@ -162,6 +162,32 @@ pub fn add_label(number: u64, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the `gh issue close` arguments. Pure for testing.
+fn close_issue_args(number: u64) -> Vec<String> {
+    vec!["issue".to_string(), "close".to_string(), number.to_string()]
+}
+
+/// Close a GitHub issue by number using the `gh` CLI.
+///
+/// Runs `gh issue close <number>`. Returns an error when `gh` is missing, not
+/// authenticated, or the command otherwise fails.
+pub fn close_issue(number: u64) -> Result<()> {
+    let output = Command::new("gh")
+        .args(close_issue_args(number))
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue close` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    Ok(())
+}
+
 /// Build the `gh issue create` arguments for a new issue. Pure for testing.
 ///
 /// Only `--title` and `--body` are passed, so GitHub applies no labels by
@@ -305,6 +331,11 @@ mod tests {
                 "Ready for the copilot loop to pick up",
             ]
         );
+    }
+
+    #[test]
+    fn builds_close_issue_args() {
+        assert_eq!(close_issue_args(96), vec!["issue", "close", "96"]);
     }
 
     #[test]

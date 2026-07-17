@@ -92,6 +92,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The close-issue confirmation captures keys while it is open (#118).
+    if app.close_confirm().is_some() {
+        handle_close_confirm_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -106,6 +112,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('c') => app.open_create(),
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
+        KeyCode::Char('x') => app.request_close(),
         KeyCode::Char('l') => app.toggle_loop(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
@@ -120,6 +127,21 @@ fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('k') | KeyCode::Up => app.model_previous(),
         KeyCode::Enter => app.confirm_model(),
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => app.close_model_picker(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the close-issue confirmation is open (#118). Closing is
+/// destructive, so it defaults to safe: only `y` confirms; `n`, `Esc`, `q` and
+/// Enter cancel, and any other key is ignored so the prompt stays put.
+fn handle_close_confirm_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_close(),
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('q')
+        | KeyCode::Esc
+        | KeyCode::Enter => app.cancel_close(),
         _ => {}
     }
 }
