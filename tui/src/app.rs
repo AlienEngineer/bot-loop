@@ -14,12 +14,68 @@ pub const DEFAULT_LIMIT: u32 = 200;
 /// How much of a loop log to read for the output panel (its tail).
 pub const OUTPUT_TAIL_BYTES: u64 = 64 * 1024;
 
+/// Which input surface currently has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Browsing the issue list.
+    #[default]
+    List,
+    /// Filling in the new-issue form.
+    Create,
+}
+
+/// The field of the create form that currently receives typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreateField {
+    #[default]
+    Title,
+    Description,
+}
+
+/// State for the new-issue form: its two text fields and which one has focus.
+#[derive(Debug, Default, Clone)]
+pub struct CreateForm {
+    pub title: String,
+    pub description: String,
+    pub field: CreateField,
+}
+
+impl CreateForm {
+    /// The text of the currently focused field.
+    fn focused_mut(&mut self) -> &mut String {
+        match self.field {
+            CreateField::Title => &mut self.title,
+            CreateField::Description => &mut self.description,
+        }
+    }
+
+    /// Append a typed character to the focused field.
+    pub fn insert_char(&mut self, c: char) {
+        self.focused_mut().push(c);
+    }
+
+    /// Delete the last character of the focused field.
+    pub fn backspace(&mut self) {
+        self.focused_mut().pop();
+    }
+
+    /// Move focus to the other field.
+    pub fn toggle_field(&mut self) {
+        self.field = match self.field {
+            CreateField::Title => CreateField::Description,
+            CreateField::Description => CreateField::Title,
+        };
+    }
+}
+
 /// Holds the issues, the selection, and a transient status message.
 pub struct App {
     pub issues: Vec<Issue>,
     pub state: ListState,
     pub status: Option<String>,
     pub should_quit: bool,
+    pub mode: Mode,
+    pub form: CreateForm,
     limit: u32,
     runner: LoopRunner,
     repo_root: PathBuf,
@@ -38,6 +94,8 @@ impl App {
             state,
             status: None,
             should_quit: false,
+            mode: Mode::List,
+            form: CreateForm::default(),
             limit: DEFAULT_LIMIT,
             runner: LoopRunner::new(),
             repo_root: runner::repo_root(),
@@ -164,6 +222,77 @@ impl App {
         let path = logs::latest_issue_log(&logs::logs_dir(&self.repo_root), number)?;
         let raw = logs::read_log_tail(&path, max_bytes).ok()?;
         Some((path, logs::sanitize(&raw)))
+    }
+
+    /// Whether the new-issue form is currently open.
+    pub fn is_creating(&self) -> bool {
+        self.mode == Mode::Create
+    }
+
+    /// Open the new-issue form with empty fields, focused on the title.
+    pub fn open_create(&mut self) {
+        self.mode = Mode::Create;
+        self.form = CreateForm::default();
+        self.status = None;
+    }
+
+    /// Cancel issue creation and return to the list.
+    pub fn cancel_create(&mut self) {
+        self.mode = Mode::List;
+        self.form = CreateForm::default();
+        self.status = Some("Issue creation cancelled.".to_string());
+    }
+
+    /// Type a character into the focused form field.
+    pub fn form_input(&mut self, c: char) {
+        self.form.insert_char(c);
+    }
+
+    /// Delete the last character of the focused form field.
+    pub fn form_backspace(&mut self) {
+        self.form.backspace();
+    }
+
+    /// Move focus between the title and description fields.
+    pub fn form_toggle_field(&mut self) {
+        self.form.toggle_field();
+    }
+
+    /// Handle Enter in the form: from the title it advances to the description,
+    /// within the description it inserts a newline so bodies can span lines.
+    pub fn form_newline(&mut self) {
+        match self.form.field {
+            CreateField::Title => self.form.field = CreateField::Description,
+            CreateField::Description => self.form.insert_char('\n'),
+        }
+    }
+
+    /// Submit the new-issue form: create the issue via `gh`, then refresh.
+    ///
+    /// Requires a non-empty title. On success the list is refetched so the new
+    /// row appears and is selected, and the form closes; on failure the form
+    /// stays open with the error on the status line.
+    pub fn submit_create(&mut self) {
+        let title = self.form.title.trim().to_string();
+        if title.is_empty() {
+            self.form.field = CreateField::Title;
+            self.status = Some("Title is required to create an issue.".to_string());
+            return;
+        }
+        let body = self.form.description.clone();
+
+        match github::create_issue(&title, &body) {
+            Ok(number) => {
+                self.mode = Mode::List;
+                self.form = CreateForm::default();
+                self.refresh();
+                if let Some(pos) = self.issues.iter().position(|i| i.number == number) {
+                    self.state.select(Some(pos));
+                }
+                self.status = Some(format!("Created issue #{number}."));
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
     }
 
     /// Move the selection down by one, clamped to the last item.
@@ -336,5 +465,89 @@ mod tests {
         assert!(app.selected_output(OUTPUT_TAIL_BYTES).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_create_enters_form_mode_with_empty_fields() {
+        let mut app = app_with(3);
+        app.status = Some("stale".to_string());
+        app.open_create();
+        assert!(app.is_creating());
+        assert_eq!(app.form.field, CreateField::Title);
+        assert!(app.form.title.is_empty());
+        assert!(app.form.description.is_empty());
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn cancel_create_returns_to_the_list() {
+        let mut app = app_with(3);
+        app.open_create();
+        app.form_input('x');
+        app.cancel_create();
+        assert!(!app.is_creating());
+        assert!(app.form.title.is_empty());
+        assert_eq!(app.status.as_deref(), Some("Issue creation cancelled."));
+    }
+
+    #[test]
+    fn typing_goes_to_the_focused_field() {
+        let mut app = app_with(0);
+        app.open_create();
+        for c in "Hi".chars() {
+            app.form_input(c);
+        }
+        assert_eq!(app.form.title, "Hi");
+        assert!(app.form.description.is_empty());
+
+        app.form_toggle_field();
+        for c in "body".chars() {
+            app.form_input(c);
+        }
+        assert_eq!(app.form.description, "body");
+        assert_eq!(app.form.title, "Hi");
+    }
+
+    #[test]
+    fn backspace_deletes_from_the_focused_field() {
+        let mut app = app_with(0);
+        app.open_create();
+        app.form_input('a');
+        app.form_input('b');
+        app.form_backspace();
+        assert_eq!(app.form.title, "a");
+        app.form_backspace();
+        app.form_backspace(); // safe past empty
+        assert!(app.form.title.is_empty());
+    }
+
+    #[test]
+    fn enter_advances_from_title_then_inserts_newlines_in_body() {
+        let mut app = app_with(0);
+        app.open_create();
+        app.form_input('T');
+        app.form_newline(); // title -> description
+        assert_eq!(app.form.field, CreateField::Description);
+        app.form_input('a');
+        app.form_newline(); // newline within description
+        app.form_input('b');
+        assert_eq!(app.form.description, "a\nb");
+        assert_eq!(app.form.title, "T");
+    }
+
+    #[test]
+    fn submit_with_blank_title_keeps_form_open_and_warns() {
+        // Whitespace-only title: submit bails before any `gh` call.
+        let mut app = app_with(0);
+        app.open_create();
+        app.form_toggle_field();
+        app.form_input('b');
+        app.submit_create();
+        assert!(app.is_creating());
+        assert_eq!(app.form.field, CreateField::Title);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Title is required to create an issue.")
+        );
     }
 }

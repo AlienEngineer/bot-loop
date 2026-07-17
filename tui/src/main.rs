@@ -58,6 +58,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.is_creating() {
+        handle_create_key(app, key);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.next(),
@@ -65,9 +70,35 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') | KeyCode::Home => app.first(),
         KeyCode::Char('G') | KeyCode::End => app.last(),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('c') => app.open_create(),
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
         KeyCode::Char('l') => app.toggle_loop(),
         KeyCode::Char('o') => app.toggle_output(),
+        _ => {}
+    }
+}
+
+/// Handle a key while the new-issue form is open: type into the focused field,
+/// Tab to switch fields, Ctrl+S to create, Esc to cancel.
+fn handle_create_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        app.submit_create();
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => app.cancel_create(),
+        KeyCode::Tab | KeyCode::BackTab => app.form_toggle_field(),
+        KeyCode::Backspace => app.form_backspace(),
+        KeyCode::Enter => app.form_newline(),
+        // Ignore control/alt combos so shortcuts don't leak into the text.
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.form_input(c)
+        }
         _ => {}
     }
 }

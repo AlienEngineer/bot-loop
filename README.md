@@ -69,22 +69,26 @@ first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
 authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
 label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
-up. Press `l` to start (or stop) a background `copilot-loop.sh` that works
-through the ready issues; it runs detached — output captured to
-`.copilot-loop/tui/loop.log` — and keeps going after you quit the TUI. The loop
-script is found at the repo root (override with `$COPILOT_LOOP_SCRIPT`). Press
-`o` to open a side panel on the right that tails the running loop's output for
-the selected issue (its `.copilot-loop/logs/issue-<n>-…log`, following the PR
-run too); press `o` again to close it.
+up. Press `c` to create a new issue: fill in a title and description, then
+`Ctrl+S` to submit it (no label is added by default). Press `l` to start (or
+stop) a background `copilot-loop.sh` that works through the ready issues; it
+runs detached — output captured to `.copilot-loop/tui/loop.log` — and keeps
+going after you quit the TUI. The loop script is found at the repo root
+(override with `$COPILOT_LOOP_SCRIPT`). Press `o` to open a side panel on the
+right that tails the running loop's output for the selected issue (its
+`.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
+to close it.
 
 ```sh
 cd tui
 cargo run
 ```
 
-Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `s`/`Enter` start (mark ready),
-`l` start/stop the background loop, `o` show/hide the output panel, `r` refresh,
-`q` (or `Esc`) quit.
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
+start (mark ready), `l` start/stop the background loop, `o` show/hide the output
+panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue form: `Tab` switches
+fields, `Enter` adds a newline (or moves from title to description), `Ctrl+S`
+creates, `Esc` cancels.
 
 
 ### Branch and worktree cleanup
