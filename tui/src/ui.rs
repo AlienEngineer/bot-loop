@@ -282,8 +282,13 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ));
         spans.push(Span::raw("  "));
     }
+    let ready_key = if app.selected_is_ready() {
+        "s unready"
+    } else {
+        "s ready"
+    };
     spans.push(Span::styled(
-        "j/k move · g/G top/bottom · c new · s ready · x close · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit",
+        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -790,6 +795,29 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("x close"));
+    }
+
+    #[test]
+    fn footer_ready_key_flips_to_unready_when_selected_is_labelled() {
+        // An unlabelled selection offers to mark it ready…
+        let plain =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(plain);
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("s ready"));
+        assert!(!text.contains("s unready"));
+
+        // …while an already-ready selection offers to remove the label (#146).
+        let ready = parse_issues(
+            r#"[{"number":96,"title":"t","labels":[{"name":"ready"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(ready);
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("s unready"));
     }
 
     #[test]

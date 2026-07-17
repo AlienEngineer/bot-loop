@@ -67,9 +67,10 @@ that spawns, monitors, and stops several loop instances ("bots") side by side.
 A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). The
 first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
-authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
-label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
-up. Press `c` to create a new issue: fill in a title and description, then
+authenticated for the target repo. Press `s` (or `Enter`) to toggle the trigger
+label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
+absent so the loop picks the issue up, or removed when present so a
+mistakenly-queued issue can be pulled back out (#146). Press `c` to create a new issue: fill in a title and description, then
 `Ctrl+S` to submit it (no label is added by default). Press `x` to close the
 selected issue: a confirmation popup names it, then `y` closes it on GitHub
 (`n`/`Esc` cancels). Press `l` to start a background `copilot-loop.sh` worker
@@ -116,7 +117,7 @@ cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
+toggle the ready label (mark ready, or remove it if already ready), `x` close the selected issue (confirm with `y`), `l` start/stop
 the background loop, `m` pick the model, `o`
 show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
 issues and their cost, `r` refresh, `q` (or
@@ -166,6 +167,22 @@ loop never interrupts in-flight CI. A PR whose checks Copilot cannot fix (it mak
 no changes, or the push fails) is labelled `checks-unresolved` and left alone
 rather than retried forever — remove that label by hand to let the loop try again.
 
+### Syncing with the remote
+
+Before starting any new work each pass, the loop syncs the local default branch
+with the remote so new tasks branch from the latest baseline. A clean update is a
+fast-forward. If the local default branch has *diverged* from the remote (it
+carries local commits that conflict with what landed upstream), the loop merges
+the remote in and, when that conflicts, hands the conflicted files to Copilot to
+resolve so it can move forward instead of stalling on a stale branch. The
+resolved merge is kept **local only** — the loop never pushes the default branch
+(pull requests do that). A divergence Copilot cannot resolve is left untouched
+and not re-tried until either side moves, so it never loops forever. Turn the
+whole step off with `SYNC_REMOTE=0`.
+
+This runs for every loop instance, including the ones the TUI starts, since the
+TUI drives the same `copilot-loop.sh`.
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
@@ -189,7 +206,9 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | Delete a merged issue's remote branch (default: auto) |
 
 Env-only settings: `SELF_UPDATE` (set to `0` to stop the loop pulling and
-re-execing itself when the script changes upstream).
+re-execing itself when the script changes upstream) and `SYNC_REMOTE` (set to
+`0` to stop the loop syncing the local default branch with the remote before each
+pass).
 
 Run `./copilot-loop.sh --help`, or read the header of
 [`copilot-loop.sh`](./copilot-loop.sh), for the complete and authoritative list.

@@ -255,11 +255,13 @@ impl App {
         self.state.selected().and_then(|i| self.issues.get(i))
     }
 
-    /// Mark the selected issue ready so the loop can pick it up.
+    /// Toggle the trigger label on the selected issue.
     ///
-    /// Adds the trigger label via `gh`, reflects it locally so the row updates
-    /// without a refetch, and reports progress on the status line.
-    pub fn mark_ready(&mut self) {
+    /// Adds the label via `gh` when the issue lacks it so the loop picks it up,
+    /// or removes it when present so a mistakenly-queued issue can be pulled
+    /// back out (#146). Either way the change is reflected locally so the row
+    /// updates without a refetch, and progress is reported on the status line.
+    pub fn toggle_ready(&mut self) {
         let Some(index) = self.state.selected() else {
             return;
         };
@@ -271,19 +273,31 @@ impl App {
         let label = github::ready_label();
 
         if issue.has_label(&label) {
-            self.status = Some(format!("#{number} already labelled '{label}'."));
-            return;
-        }
-
-        match github::add_label(number, &label) {
-            Ok(()) => {
-                self.issues[index].labels.push(Label {
-                    name: label.clone(),
-                });
-                self.status = Some(format!("#{number} marked '{label}'."));
+            match github::remove_label(number, &label) {
+                Ok(()) => {
+                    self.issues[index].labels.retain(|l| l.name != label);
+                    self.status = Some(format!("#{number} unmarked '{label}'."));
+                }
+                Err(err) => self.status = Some(format!("Error: {err}")),
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+        } else {
+            match github::add_label(number, &label) {
+                Ok(()) => {
+                    self.issues[index].labels.push(Label {
+                        name: label.clone(),
+                    });
+                    self.status = Some(format!("#{number} marked '{label}'."));
+                }
+                Err(err) => self.status = Some(format!("Error: {err}")),
+            }
         }
+    }
+
+    /// Whether the selected issue already carries the trigger label, so the
+    /// footer can offer `s unready` instead of `s ready` (#146).
+    pub fn selected_is_ready(&self) -> bool {
+        let label = github::ready_label();
+        self.selected().is_some_and(|issue| issue.has_label(&label))
     }
 
     /// The number of the issue awaiting a close confirmation, if any (#118).
@@ -1133,26 +1147,27 @@ mod tests {
     }
 
     #[test]
-    fn mark_ready_is_safe_when_nothing_selected() {
+    fn toggle_ready_is_safe_when_nothing_selected() {
         let mut app = app_with(0);
-        app.mark_ready();
+        app.toggle_ready();
         assert!(app.status.is_none());
     }
 
     #[test]
-    fn mark_ready_short_circuits_when_already_labelled() {
+    fn selected_is_ready_reflects_the_trigger_label() {
         let label = github::ready_label();
+
+        // Nothing selected: not ready.
+        assert!(!app_with(0).selected_is_ready());
+
+        // An unlabelled issue: not ready.
+        assert!(!app_with(1).selected_is_ready());
+
+        // An issue already carrying the trigger label: ready, so the footer
+        // offers `s unready` and `toggle_ready` would remove it (#146).
         let json = format!(r#"[{{"number":7,"title":"t","labels":[{{"name":"{label}"}}]}}]"#);
-        let mut app = App::new(parse_issues(&json).unwrap());
-
-        app.mark_ready();
-
-        // No gh call happened: label count is unchanged and the status explains why.
-        assert_eq!(app.issues[0].labels.len(), 1);
-        assert_eq!(
-            app.status.as_deref(),
-            Some(format!("#7 already labelled '{label}'.").as_str())
-        );
+        let app = App::new(parse_issues(&json).unwrap());
+        assert!(app.selected_is_ready());
     }
 
     #[test]
