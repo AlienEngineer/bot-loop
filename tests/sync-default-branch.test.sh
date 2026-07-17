@@ -96,7 +96,10 @@ setup_repo() {
   git -C "$clone" branch -M main
   git -C "$clone" push -q -u origin main
 
-  git clone -q "$origin" "$other" 2>/dev/null
+  # Clone main explicitly: origin's HEAD may point at another default branch
+  # (e.g. CI defaulting to master), which would otherwise leave this clone with
+  # no local main.
+  git clone -q -b main "$origin" "$other" 2>/dev/null
   git -C "$other" config user.email t@e.com
   git -C "$other" config user.name  t
   git -C "$other" config commit.gpgsign false
