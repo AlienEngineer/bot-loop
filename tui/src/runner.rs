@@ -319,6 +319,52 @@ mod tests {
         assert_eq!(runner.running_count(), 0);
     }
 
+    /// Whether `err`'s chain carries an `ETXTBSY` ("Text file busy", `os error
+    /// 26`) failure.
+    #[cfg(unix)]
+    fn is_text_file_busy(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(26)
+        })
+    }
+
+    /// Start a worker, retrying briefly while exec fails with `ETXTBSY`. Writing
+    /// an executable and then exec'ing it inside a multithreaded process is
+    /// inherently racy: a *concurrent* test's fork can momentarily inherit our
+    /// still-open write handle to the freshly written script, so the kernel
+    /// refuses to exec it until that child execs and the handle closes. A short
+    /// retry makes the test deterministic without weakening what it checks.
+    #[cfg(unix)]
+    fn start_worker(runner: &mut LoopRunner, script: &Path, dir: &Path, log: &Path) -> u32 {
+        for attempt in 1..=50 {
+            match runner.start(script, dir, log, None) {
+                Ok(pid) => return pid,
+                Err(err) if attempt < 50 && is_text_file_busy(&err) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("start worker: {err:#}"),
+            }
+        }
+        unreachable!("the loop returns or panics before exhausting its attempts")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_text_file_busy_in_an_error_chain() {
+        let busy = Err::<(), _>(std::io::Error::from_raw_os_error(26))
+            .context("failed to start /tmp/fake.sh")
+            .unwrap_err();
+        assert!(is_text_file_busy(&busy));
+
+        let missing = Err::<(), _>(std::io::Error::from_raw_os_error(2))
+            .context("failed to start /tmp/fake.sh")
+            .unwrap_err();
+        assert!(!is_text_file_busy(&missing));
+    }
+
     #[cfg(unix)]
     #[test]
     fn start_tracks_multiple_workers_and_stop_all_ends_them() {
@@ -336,8 +382,8 @@ mod tests {
         let log2 = dir.join(format!("copilot-loop-w2-{}.log", std::process::id()));
 
         let mut runner = LoopRunner::new();
-        runner.start(&script, &dir, &log1, None).expect("start w1");
-        runner.start(&script, &dir, &log2, None).expect("start w2");
+        start_worker(&mut runner, &script, &dir, &log1);
+        start_worker(&mut runner, &script, &dir, &log2);
         assert_eq!(runner.running_count(), 2);
         assert!(runner.is_running());
 
