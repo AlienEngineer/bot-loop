@@ -47,9 +47,9 @@ cd ../instance-2
 ./copilot-loop.sh
 ```
 
-When the repo is used with worktrees, each issue automatically runs in its own
-worktree so the shared checkout is never touched. Force this on or off with
-`--worktrees` / `--no-worktrees`.
+By default each issue runs in its own worktree (a different folder) so the
+shared checkout is never touched and parallel instances never conflict. Turn
+this off with `--no-worktrees` to work in the current checkout instead.
 
 There is also an optional terminal UI, [`copilot-loop-tui.sh`](./copilot-loop-tui.sh),
 that spawns, monitors, and stops several loop instances ("bots") side by side.
@@ -81,7 +81,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--triage-map <map>` | `TRIAGE_MAP` | `class=model` pairs mapping difficulty to model |
 | `--issues-dir <dir>` | `ISSUES_DIR` | Folder scanned for issue markdown files |
 | `--quiet` | `QUIET` | Log only to files, do not stream to stdout |
-| `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Force per-issue worktrees on/off |
+| `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Per-issue worktrees (default: on) |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | Merge each PR automatically |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge`, `squash`, or `rebase` |
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | Sweep merged branches/worktrees each pass (default: on) |

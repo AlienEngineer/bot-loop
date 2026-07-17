@@ -45,9 +45,9 @@
 #   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
 #      (done atomically by the claiming functions to prevent race conditions).
 #   4. Create a fresh branch for the issue, based on the latest default branch.
-#      The default branch (main/master) is never checked out for the work; when
-#      the repo is used with git worktrees each issue runs in its own worktree so
-#      the shared checkout is left untouched.
+#      The default branch (main/master) is never checked out for the work; by
+#      default each issue also runs in its own git worktree (a different folder)
+#      so the shared checkout is left untouched (disable with --no-worktrees).
 #   5. Run `copilot -p` (all tools, file access restricted to this repo),
 #      passing the issue's comment thread so any prior Q&A is available. When
 #      triage is enabled (TRIAGE_MODEL) the issue is first classified by that
@@ -112,8 +112,9 @@
 #                            behaviour). By default the loop streams Copilot's
 #                            output live to stdout as well as the log files.
 #   --worktrees / --no-worktrees
-#                            Force per-issue git worktrees on/off (default: auto,
-#                            on when the repo is used with git worktrees).
+#                            Give each issue its own git worktree, or work in the
+#                            current checkout (default: on — every task uses a new
+#                            worktree so parallel runs never conflict).
 #   --auto-merge / --no-auto-merge
 #                            Merge each PR automatically instead of leaving it for
 #                            review (default: off).
@@ -191,7 +192,8 @@ QUIET="${QUIET:-}"
 # a tracked file inside the repo it operates on.
 SELF_UPDATE="${SELF_UPDATE:-}"
 # Whether each issue gets its own git worktree instead of switching branches in
-# the shared checkout. Empty means auto-detect (see below); 1/0 force it on/off.
+# the shared checkout. On by default so every task runs in a different folder;
+# set to 0 (or pass --no-worktrees) to work in place. 1/true/yes/on force it on.
 # The default branch (main/master) is never checked out for work in either mode.
 USE_WORKTREES="${USE_WORKTREES:-}"
 # Merge each PR automatically instead of leaving it open for review. Off by
@@ -330,8 +332,8 @@ work:
                            behaviour). By default the loop streams Copilot's
                            output live to stdout as well as the log files.
   --worktrees              Give every issue its own git worktree (never touch
-                           the shared checkout). Default: auto (on when the repo
-                           is used with git worktrees).
+                           the shared checkout). This is the default, so each
+                           task always works in a different folder.
   --no-worktrees           Work in the current checkout instead of per-issue
                            worktrees. The default branch is still never checked
                            out for work; the issue branch is created directly.
@@ -818,23 +820,18 @@ if [ "$SELF_UPDATE" = 1 ]; then
   [ -n "$SCRIPT_REL" ] || SELF_UPDATE=0
 fi
 
-# Decide whether to isolate each issue in its own git worktree. Auto-detect when
-# not forced: use worktrees if we are running inside a linked worktree, or if the
-# repository already has more than one worktree. This keeps the shared checkout
-# untouched and guarantees the default branch is never used for the work. Each
-# issue still gets its own branch in either mode.
+# Decide whether to isolate each issue in its own git worktree. On by default so
+# every task works in a different folder and parallel instances never touch the
+# same checkout; pass --no-worktrees (or USE_WORKTREES=0) to work in place
+# instead. This keeps the shared checkout untouched and guarantees the default
+# branch is never used for the work. Each issue still gets its own branch in
+# either mode.
+# >>> worktree-default helpers >>>
 case "$USE_WORKTREES" in
-  1|true|yes|on)  USE_WORKTREES=1 ;;
   0|false|no|off) USE_WORKTREES=0 ;;
-  *)
-    USE_WORKTREES=0
-    if [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
-      USE_WORKTREES=1
-    elif [ "$(git worktree list --porcelain 2>/dev/null | grep -c '^worktree ')" -gt 1 ]; then
-      USE_WORKTREES=1
-    fi
-    ;;
+  *)              USE_WORKTREES=1 ;;
 esac
+# <<< worktree-default helpers <<<
 # Where per-issue worktrees are created (only used when USE_WORKTREES=1). A
 # sibling of REPO_DIR so it never lands inside the tracked working tree.
 WORKTREE_BASE="$(dirname "$REPO_DIR")/copilot-loop-worktrees"
@@ -899,13 +896,15 @@ ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The copilot loop could not r
 #
 # Two modes, selected by USE_WORKTREES:
 #   1 -> a dedicated git worktree per branch, so the shared checkout is untouched
-#        (required when the repo is used with git worktrees, where the default
-#        branch may already be checked out elsewhere and cannot be switched to).
-#   0 -> the branch is checked out in REPO_DIR itself.
+#        (the default: every task works in a different folder, and it is required
+#        when the repo is used with git worktrees, where the default branch may
+#        already be checked out elsewhere and cannot be switched to).
+#   0 -> the branch is checked out in REPO_DIR itself (opt in with --no-worktrees).
 # Both set WORKSPACE_DIR to the directory Copilot and git should operate in.
 WORKSPACE_DIR=""
 
 # Map a branch name to its worktree directory (slashes flattened to dashes).
+# >>> workspace helpers >>>
 _worktree_path() {
   printf '%s/%s' "$WORKTREE_BASE" "$(printf '%s' "$1" | tr '/' '-')"
 }
@@ -951,6 +950,7 @@ cleanup_workspace() {
   git branch -D "$branch" >/dev/null 2>&1 || true
   WORKSPACE_DIR=""
 }
+# <<< workspace helpers <<<
 
 # --- Core: enable auto-merge on a freshly opened PR --------------------------
 # When AUTO_MERGE is on, ask GitHub to merge the PR without manual review.
