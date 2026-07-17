@@ -3,6 +3,7 @@
 use ratatui::widgets::ListState;
 
 use crate::github::{self, Issue, Label};
+use crate::runner::{self, LoopRunner};
 
 /// Default number of issues to request from `gh`.
 pub const DEFAULT_LIMIT: u32 = 200;
@@ -14,6 +15,7 @@ pub struct App {
     pub status: Option<String>,
     pub should_quit: bool,
     limit: u32,
+    runner: LoopRunner,
 }
 
 impl App {
@@ -29,6 +31,7 @@ impl App {
             status: None,
             should_quit: false,
             limit: DEFAULT_LIMIT,
+            runner: LoopRunner::new(),
         }
     }
 
@@ -93,6 +96,45 @@ impl App {
             }
             Err(err) => self.status = Some(format!("Error: {err}")),
         }
+    }
+
+    /// Start or stop the background loop that works through ready issues.
+    ///
+    /// When one is running it is stopped; otherwise a detached `copilot-loop.sh`
+    /// is launched against this repository (output captured to a log). The loop
+    /// keeps running after the TUI quits, matching the bash TUI's behaviour.
+    pub fn toggle_loop(&mut self) {
+        if self.runner.is_running() {
+            self.runner.stop();
+            self.status = Some("Background loop stopped.".to_string());
+            return;
+        }
+
+        let repo = runner::repo_root();
+        let Some(script) = runner::resolve_loop_script(&repo) else {
+            self.status = Some(format!(
+                "Cannot find {} — set {} to its path.",
+                runner::LOOP_SCRIPT_NAME,
+                runner::LOOP_SCRIPT_ENV
+            ));
+            return;
+        };
+
+        let log = runner::log_path(&repo);
+        match self.runner.start(&script, &repo, &log) {
+            Ok(pid) => {
+                self.status = Some(format!(
+                    "Background loop started (pid {pid}). Log: {}",
+                    log.display()
+                ));
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// Whether the background loop is currently running.
+    pub fn loop_running(&mut self) -> bool {
+        self.runner.is_running()
     }
 
     /// Move the selection down by one, clamped to the last item.
@@ -217,5 +259,11 @@ mod tests {
             app.status.as_deref(),
             Some(format!("#7 already labelled '{label}'.").as_str())
         );
+    }
+
+    #[test]
+    fn loop_is_not_running_before_it_is_started() {
+        let mut app = app_with(0);
+        assert!(!app.loop_running());
     }
 }

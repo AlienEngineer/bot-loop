@@ -5,6 +5,7 @@
 
 mod app;
 mod github;
+mod runner;
 mod ui;
 
 use std::time::Duration;
@@ -64,6 +65,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('G') | KeyCode::End => app.last(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
+        KeyCode::Char('l') => app.toggle_loop(),
         _ => {}
     }
 }
