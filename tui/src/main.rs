@@ -97,19 +97,61 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    handle_list_key(app, key);
+}
+
+/// Handle a key while browsing the issue list. Vim motions (#51): counts like
+/// `5j`, `gg`/`G` for top/bottom (or go-to-line N with a count), and
+/// Ctrl-d/u/f/b plus PageUp/PageDown for half- and full-page scrolling. Any
+/// other action clears a half-typed count/`g` prefix so it can't leak on.
+fn handle_list_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.next(),
-        KeyCode::Char('k') | KeyCode::Up => app.previous(),
-        KeyCode::Char('g') | KeyCode::Home => app.first(),
-        KeyCode::Char('G') | KeyCode::End => app.last(),
-        KeyCode::Char('r') => app.refresh(),
-        KeyCode::Char('c') => app.open_create(),
-        KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
-        KeyCode::Char('l') => app.toggle_loop(),
-        KeyCode::Char('m') => app.open_model_picker(),
-        KeyCode::Char('o') => app.toggle_output(),
-        _ => {}
+        KeyCode::Char('d') if ctrl => app.half_page_down(),
+        KeyCode::Char('u') if ctrl => app.half_page_up(),
+        KeyCode::Char('f') if ctrl => app.page_down(),
+        KeyCode::Char('b') if ctrl => app.page_up(),
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::PageUp => app.page_up(),
+        // Digits build a count; a leading `0` is unbound (matches vim), but a
+        // `0` after other digits (e.g. `10`) is a trailing digit.
+        KeyCode::Char(d @ '0'..='9') if !ctrl && (d != '0' || app.has_pending_count()) => {
+            app.push_count_digit((d as u8 - b'0') as usize);
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.motion_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.motion_up(),
+        KeyCode::Char('g') => app.press_g(),
+        KeyCode::Home => app.motion_top(),
+        KeyCode::Char('G') | KeyCode::End => app.motion_bottom(),
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.reset_pending();
+            app.should_quit = true;
+        }
+        KeyCode::Char('r') => {
+            app.reset_pending();
+            app.refresh();
+        }
+        KeyCode::Char('c') => {
+            app.reset_pending();
+            app.open_create();
+        }
+        KeyCode::Char('s') | KeyCode::Enter => {
+            app.reset_pending();
+            app.mark_ready();
+        }
+        KeyCode::Char('l') => {
+            app.reset_pending();
+            app.toggle_loop();
+        }
+        KeyCode::Char('m') => {
+            app.reset_pending();
+            app.open_model_picker();
+        }
+        KeyCode::Char('o') => {
+            app.reset_pending();
+            app.toggle_output();
+        }
+        _ => app.reset_pending(),
     }
 }
 
@@ -151,7 +193,10 @@ fn handle_create_key(app: &mut App, key: KeyEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::wants_loop_refresh;
+    use super::{handle_key, wants_loop_refresh};
+    use crate::app::App;
+    use crate::github::parse_issues;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn refreshes_periodically_while_running() {
@@ -179,5 +224,64 @@ mod tests {
     #[test]
     fn refreshes_when_the_loop_just_started_and_the_interval_elapsed() {
         assert!(wants_loop_refresh(false, true, true));
+    }
+
+    fn app_with(count: usize) -> App {
+        let items: Vec<String> = (0..count)
+            .map(|i| format!(r#"{{"number": {i}, "title": "t{i}"}}"#))
+            .collect();
+        let json = format!("[{}]", items.join(","));
+        App::new(parse_issues(&json).unwrap())
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn ctrl(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn gg_binding_jumps_to_the_top() {
+        let mut app = app_with(10);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.state.selected(), Some(9));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn count_prefix_binding_moves_by_n() {
+        let mut app = app_with(20);
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.state.selected(), Some(5));
+    }
+
+    #[test]
+    fn count_capital_g_binding_goes_to_line() {
+        let mut app = app_with(10);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn ctrl_d_binding_moves_half_a_page() {
+        let mut app = app_with(100);
+        app.set_viewport_height(10);
+        ctrl(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.state.selected(), Some(5));
+    }
+
+    #[test]
+    fn a_non_motion_key_clears_a_half_typed_count() {
+        let mut app = app_with(20);
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Char('o')); // toggles output, must drop the count
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.state.selected(), Some(1));
     }
 }

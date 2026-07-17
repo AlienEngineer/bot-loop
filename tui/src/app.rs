@@ -92,6 +92,13 @@ pub struct App {
     /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
     /// can announce when the loop *starts* a new issue (#119).
     known_in_progress: Vec<u64>,
+    /// Rows visible in the issue list, captured at render, so page and
+    /// half-page motions (Ctrl-f/Ctrl-b, Ctrl-d/Ctrl-u) know how far to jump.
+    viewport_height: usize,
+    /// A vim numeric count typed before a motion (the `5` in `5j`), or `None`.
+    pending_count: Option<usize>,
+    /// Whether a lone `g` was pressed and we await the second `g` of `gg`.
+    pending_g: bool,
 }
 
 impl App {
@@ -120,6 +127,9 @@ impl App {
             repo_root: runner::repo_root(),
             show_output: false,
             known_in_progress: Vec::new(),
+            viewport_height: 0,
+            pending_count: None,
+            pending_g: false,
         }
     }
 
@@ -460,23 +470,23 @@ impl App {
         }
     }
 
-    /// Move the selection down by one, clamped to the last item.
-    pub fn next(&mut self) {
+    /// Move the selection down by `n`, clamped to the last item.
+    pub fn next_by(&mut self, n: usize) {
         if self.issues.is_empty() {
             return;
         }
         let last = self.issues.len() - 1;
-        let next = self.state.selected().map_or(0, |i| (i + 1).min(last));
-        self.state.select(Some(next));
+        let current = self.state.selected().unwrap_or(0);
+        self.state.select(Some(current.saturating_add(n).min(last)));
     }
 
-    /// Move the selection up by one, clamped to the first item.
-    pub fn previous(&mut self) {
+    /// Move the selection up by `n`, clamped to the first item.
+    pub fn previous_by(&mut self, n: usize) {
         if self.issues.is_empty() {
             return;
         }
-        let prev = self.state.selected().map_or(0, |i| i.saturating_sub(1));
-        self.state.select(Some(prev));
+        let current = self.state.selected().unwrap_or(0);
+        self.state.select(Some(current.saturating_sub(n)));
     }
 
     /// Jump to the first issue.
@@ -490,6 +500,134 @@ impl App {
     pub fn last(&mut self) {
         if !self.issues.is_empty() {
             self.state.select(Some(self.issues.len() - 1));
+        }
+    }
+
+    /// Select the 1-based line `one_based`, clamped into range. Backs the vim
+    /// `NG` / `Ngg` "go to line N" motions.
+    pub fn go_to_line(&mut self, one_based: usize) {
+        if self.issues.is_empty() {
+            return;
+        }
+        let last = self.issues.len() - 1;
+        self.state
+            .select(Some(one_based.saturating_sub(1).min(last)));
+    }
+
+    /// Record the list's visible row count (captured at render) so page and
+    /// half-page motions know how far to move.
+    pub fn set_viewport_height(&mut self, rows: usize) {
+        self.viewport_height = rows;
+    }
+
+    /// Rows a full page moves: the viewport height, at least one so it advances.
+    fn page_step(&self) -> usize {
+        self.viewport_height.max(1)
+    }
+
+    /// Rows half a page moves: half the viewport, at least one so it advances.
+    fn half_page_step(&self) -> usize {
+        (self.viewport_height / 2).max(1)
+    }
+
+    /// Move a full page down (vim Ctrl-f / PageDown).
+    pub fn page_down(&mut self) {
+        let step = self.page_step();
+        self.reset_pending();
+        self.next_by(step);
+    }
+
+    /// Move a full page up (vim Ctrl-b / PageUp).
+    pub fn page_up(&mut self) {
+        let step = self.page_step();
+        self.reset_pending();
+        self.previous_by(step);
+    }
+
+    /// Move half a page down (vim Ctrl-d).
+    pub fn half_page_down(&mut self) {
+        let step = self.half_page_step();
+        self.reset_pending();
+        self.next_by(step);
+    }
+
+    /// Move half a page up (vim Ctrl-u).
+    pub fn half_page_up(&mut self) {
+        let step = self.half_page_step();
+        self.reset_pending();
+        self.previous_by(step);
+    }
+
+    /// Whether a numeric count is being typed, so a `0` key can be a trailing
+    /// digit rather than an unbound key.
+    pub fn has_pending_count(&self) -> bool {
+        self.pending_count.is_some()
+    }
+
+    /// Append a digit to the pending vim count (the `5` of `5j`). Cancels any
+    /// half-typed `gg`. Saturates so a long run of digits cannot overflow.
+    pub fn push_count_digit(&mut self, digit: usize) {
+        self.pending_g = false;
+        self.pending_count = Some(
+            self.pending_count
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(digit),
+        );
+    }
+
+    /// Take the pending count, defaulting to 1 and clearing it.
+    fn take_count(&mut self) -> usize {
+        self.pending_count.take().unwrap_or(1)
+    }
+
+    /// Clear any pending count and half-typed `gg`, so a stale prefix does not
+    /// leak into the next motion.
+    pub fn reset_pending(&mut self) {
+        self.pending_count = None;
+        self.pending_g = false;
+    }
+
+    /// Move down by the pending count (vim `j` / `Nj`).
+    pub fn motion_down(&mut self) {
+        let n = self.take_count();
+        self.pending_g = false;
+        self.next_by(n);
+    }
+
+    /// Move up by the pending count (vim `k` / `Nk`).
+    pub fn motion_up(&mut self) {
+        let n = self.take_count();
+        self.pending_g = false;
+        self.previous_by(n);
+    }
+
+    /// Jump to the top, or to line N when a count is pending (vim `gg`/`Ngg`).
+    pub fn motion_top(&mut self) {
+        match self.pending_count.take() {
+            Some(n) => self.go_to_line(n),
+            None => self.first(),
+        }
+        self.pending_g = false;
+    }
+
+    /// Jump to the bottom, or to line N when a count is pending (vim `G`/`NG`).
+    pub fn motion_bottom(&mut self) {
+        match self.pending_count.take() {
+            Some(n) => self.go_to_line(n),
+            None => self.last(),
+        }
+        self.pending_g = false;
+    }
+
+    /// Handle a `g` press: complete a `gg` jump-to-top when one is pending,
+    /// otherwise arm the pending `g` and wait for the second (count preserved
+    /// so `5gg` still goes to line 5).
+    pub fn press_g(&mut self) {
+        if self.pending_g {
+            self.motion_top();
+        } else {
+            self.pending_g = true;
         }
     }
 
@@ -567,12 +705,12 @@ mod tests {
     #[test]
     fn next_and_previous_clamp() {
         let mut app = app_with(3);
-        app.previous();
+        app.previous_by(1);
         assert_eq!(app.state.selected(), Some(0)); // clamps at top
-        app.next();
+        app.next_by(1);
         assert_eq!(app.state.selected(), Some(1));
-        app.next();
-        app.next();
+        app.next_by(1);
+        app.next_by(1);
         assert_eq!(app.state.selected(), Some(2)); // clamps at bottom
     }
 
@@ -588,8 +726,8 @@ mod tests {
     #[test]
     fn navigation_is_safe_on_empty() {
         let mut app = app_with(0);
-        app.next();
-        app.previous();
+        app.next_by(1);
+        app.previous_by(1);
         app.first();
         app.last();
         assert_eq!(app.state.selected(), None);
@@ -609,7 +747,7 @@ mod tests {
     #[test]
     fn set_issues_keeps_selection_on_the_same_issue() {
         let mut app = app_with(5); // numbers 0..=4
-        app.next(); // highlight number 1
+        app.next_by(1); // highlight number 1
         assert_eq!(app.selected().map(|i| i.number), Some(1));
 
         // A refresh that drops number 0 shifts indices but must keep #1 selected.
@@ -914,5 +1052,128 @@ mod tests {
             app.status.as_deref(),
             Some("Title is required to create an issue.")
         );
+    }
+
+    #[test]
+    fn next_by_and_previous_by_clamp() {
+        let mut app = app_with(5);
+        app.next_by(3);
+        assert_eq!(app.state.selected(), Some(3));
+        app.next_by(10);
+        assert_eq!(app.state.selected(), Some(4)); // clamps at bottom
+        app.previous_by(2);
+        assert_eq!(app.state.selected(), Some(2));
+        app.previous_by(10);
+        assert_eq!(app.state.selected(), Some(0)); // clamps at top
+    }
+
+    #[test]
+    fn go_to_line_is_one_based_and_clamps() {
+        let mut app = app_with(5);
+        app.go_to_line(3);
+        assert_eq!(app.state.selected(), Some(2));
+        app.go_to_line(1);
+        assert_eq!(app.state.selected(), Some(0));
+        app.go_to_line(99);
+        assert_eq!(app.state.selected(), Some(4)); // clamps to last
+        app.go_to_line(0);
+        assert_eq!(app.state.selected(), Some(0)); // 0 clamps to first
+    }
+
+    #[test]
+    fn count_prefix_drives_motions() {
+        let mut app = app_with(20);
+        // 5j
+        app.push_count_digit(5);
+        app.motion_down();
+        assert_eq!(app.state.selected(), Some(5));
+        // count is consumed: a bare j moves one
+        app.motion_down();
+        assert_eq!(app.state.selected(), Some(6));
+        // 3k
+        app.push_count_digit(3);
+        app.motion_up();
+        assert_eq!(app.state.selected(), Some(3));
+        // multi-digit: 1 then 0 -> 10
+        app.push_count_digit(1);
+        app.push_count_digit(0);
+        app.motion_down();
+        assert_eq!(app.state.selected(), Some(13));
+    }
+
+    #[test]
+    fn gg_jumps_to_top_and_ngg_goes_to_line() {
+        let mut app = app_with(10);
+        app.last();
+        assert_eq!(app.state.selected(), Some(9));
+        // gg: first g arms, second jumps to top.
+        app.press_g();
+        assert_eq!(app.state.selected(), Some(9)); // nothing yet
+        app.press_g();
+        assert_eq!(app.state.selected(), Some(0));
+        // 4gg -> line 4 (index 3)
+        app.push_count_digit(4);
+        app.press_g();
+        app.press_g();
+        assert_eq!(app.state.selected(), Some(3));
+    }
+
+    #[test]
+    fn capital_g_goes_to_bottom_or_line_n() {
+        let mut app = app_with(10);
+        app.motion_bottom();
+        assert_eq!(app.state.selected(), Some(9));
+        app.push_count_digit(2);
+        app.motion_bottom();
+        assert_eq!(app.state.selected(), Some(1)); // 2G -> line 2
+    }
+
+    #[test]
+    fn page_and_half_page_use_the_viewport_height() {
+        let mut app = app_with(100);
+        app.set_viewport_height(10);
+        app.page_down();
+        assert_eq!(app.state.selected(), Some(10));
+        app.half_page_down();
+        assert_eq!(app.state.selected(), Some(15));
+        app.half_page_up();
+        assert_eq!(app.state.selected(), Some(10));
+        app.page_up();
+        assert_eq!(app.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn page_motions_advance_even_without_a_rendered_viewport() {
+        let mut app = app_with(5);
+        // viewport_height defaults to 0; page steps stay at least 1.
+        app.page_down();
+        assert_eq!(app.state.selected(), Some(1));
+        app.half_page_down();
+        assert_eq!(app.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn reset_pending_discards_a_half_typed_prefix() {
+        let mut app = app_with(10);
+        app.push_count_digit(5);
+        app.press_g(); // count still pending, g half-typed
+        app.reset_pending();
+        // A following j moves one, not five, and g must re-arm from scratch.
+        app.motion_down();
+        assert_eq!(app.state.selected(), Some(1));
+        app.press_g();
+        app.press_g();
+        assert_eq!(app.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn a_zero_digit_only_counts_after_another_digit() {
+        let mut app = app_with(10);
+        assert!(!app.has_pending_count());
+        app.push_count_digit(2);
+        assert!(app.has_pending_count());
+        app.push_count_digit(0); // -> 20
+        app.motion_down();
+        assert_eq!(app.state.selected(), Some(9)); // clamped from 20
     }
 }

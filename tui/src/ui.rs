@@ -154,6 +154,10 @@ fn render_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, lo
 }
 
 fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, loop_running: bool) {
+    // Remember how many rows the list can show so page/half-page motions
+    // (Ctrl-f/Ctrl-b, Ctrl-d/Ctrl-u) know how far to jump; borders take 2 rows.
+    app.set_viewport_height(area.height.saturating_sub(2) as usize);
+
     let block = Block::default().borders(Borders::ALL).title(" Issues ");
 
     if app.issues.is_empty() {
@@ -234,7 +238,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         "l start-loop"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · s ready · {loop_key} · m models · o output · r refresh · q quit"),
+        format!("j/k move · gg/G top/bottom · ^u/^d/^b/^f scroll · c new · s ready · {loop_key} · m models · o output · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
