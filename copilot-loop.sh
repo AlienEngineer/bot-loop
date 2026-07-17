@@ -199,6 +199,12 @@ ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
 QUIET="${QUIET:-}"
+# When non-empty, log() also appends its line to this per-run log file, so the
+# loop's own narration (branch creation, "running copilot", PR push, ...) lands
+# in the same issue-<n>/pr-<n> log as Copilot's transcript. The TUI's per-issue
+# output panel reads that file, so it then shows the full run — matching what the
+# bash loop prints to the terminal instead of "just the copilot output" (#126).
+CURRENT_RUN_LOG=""
 # Set SELF_UPDATE=0 to stop the loop pulling and restarting itself when this
 # script changes upstream. Left unset it is auto-enabled whenever the script is
 # a tracked file inside the repo it operates on.
@@ -263,8 +269,18 @@ FAILURE_MARKER="<!-- copilot-loop:failed -->"
 USAGE_MARKER="<!-- copilot-loop:usage -->"
 
 # --- Helpers -----------------------------------------------------------------
+# Emit a timestamped status line to stdout. When CURRENT_RUN_LOG is set (during a
+# per-issue or per-PR run) the same line is also appended to that run's log file,
+# so the loop's narration is interleaved with Copilot's transcript there and the
+# TUI's output panel shows the full run, not just Copilot's output (#126). The
+# mirror is best-effort: a write failure never breaks the loop.
 log() {
-  printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+  local line
+  line="$(printf '%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")"
+  printf '%s\n' "$line"
+  if [ -n "${CURRENT_RUN_LOG:-}" ]; then
+    printf '%s\n' "$line" >>"$CURRENT_RUN_LOG" 2>/dev/null || true
+  fi
 }
 
 die() {
@@ -1224,6 +1240,10 @@ process_issue() {
   commit_msg="Resolve #${num}: ${title}"
   pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
+  # Mirror this run's status lines into the per-issue log so the TUI's output
+  # panel shows the branch creation and the rest of the loop's narration, not
+  # just Copilot's transcript (#126). Cleared at the top of the main loop.
+  CURRENT_RUN_LOG="$log_file"
   # Copilot writes here when it needs to ask the user something. Lives in the
   # gitignored work dir so it is never committed; clear any stale copy.
   question_file="$WORK_DIR/issue-${num}.question"
@@ -1839,6 +1859,10 @@ resolve_pr_conflicts() {
       --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
   [ -n "$base" ] || base="$DEFAULT_BRANCH"
   log_file="$LOG_DIR/pr-${num}-$(date '+%Y%m%d-%H%M%S').log"
+  # Mirror this run's status lines into the per-PR log so the TUI's output panel
+  # shows the loop's narration alongside Copilot's transcript (#126). Cleared at
+  # the top of the main loop.
+  CURRENT_RUN_LOG="$log_file"
 
   if [ -z "$head" ]; then
     log "PR #$num: could not determine head branch, skipping"
@@ -1963,6 +1987,10 @@ resolve_pr_check_failures() {
       --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
   [ -n "$base" ] || base="$DEFAULT_BRANCH"
   log_file="$LOG_DIR/pr-${num}-checks-$(date '+%Y%m%d-%H%M%S').log"
+  # Mirror this run's status lines into the per-PR log so the TUI's output panel
+  # shows the loop's narration alongside Copilot's transcript (#126). Cleared at
+  # the top of the main loop.
+  CURRENT_RUN_LOG="$log_file"
 
   if [ -z "$head" ]; then
     log "PR #$num: could not determine head branch, skipping"
@@ -2225,6 +2253,11 @@ self_update() {
 
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  # Each iteration's setup and queue-scanning logs belong to the loop itself, not
+  # to any one run, so drop the per-run mirror before the next run claims it
+  # (#126). process_issue / resolve_pr_* re-arm it once they know their log file.
+  CURRENT_RUN_LOG=""
+
   # Keep the loop current before starting any new work: pull the default branch
   # and re-exec if this script changed upstream.
   self_update
