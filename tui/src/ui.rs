@@ -298,7 +298,10 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
         .style(Style::new().bg(Color::Black));
 
     let body = Paragraph::new(vec![
-        Line::from(Span::styled(title, Style::new().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "This closes the issue on GitHub.",
@@ -560,10 +563,9 @@ mod tests {
 
     #[test]
     fn renders_the_close_confirmation_popup_when_open() {
-        let issues = parse_issues(
-            r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#,
-        )
-        .unwrap();
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
+                .unwrap();
         let mut app = App::new(issues);
         app.request_close();
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
