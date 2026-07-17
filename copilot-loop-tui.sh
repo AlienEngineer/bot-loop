@@ -376,13 +376,13 @@ tui_init() {
     tput smcup 2>/dev/null || true   # alternate screen buffer
     tput civis 2>/dev/null || true   # hide cursor
   fi
-  [ -t 0 ] && stty -echo 2>/dev/null || true
+  if [ -t 0 ]; then stty -echo 2>/dev/null || true; fi
   TUI_ACTIVE=1
 }
 
 tui_restore() {
   [ "$TUI_ACTIVE" = 0 ] && return 0
-  [ -t 0 ] && stty echo 2>/dev/null || true
+  if [ -t 0 ]; then stty echo 2>/dev/null || true; fi
   if [ -t 1 ]; then
     tput cnorm 2>/dev/null || true   # show cursor
     tput rmcup 2>/dev/null || true   # leave alternate screen

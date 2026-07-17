@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317  # mock/stub helpers are invoked indirectly by the code under test
 #
 # Unit tests for the "pending" label helpers in copilot-loop.sh. An issue held
 # back by an open dependency ("Wait for: #N") is labelled "pending"; the label

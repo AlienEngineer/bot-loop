@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317  # mock/stub helpers are invoked indirectly by the code under test
 #
 # Unit tests for the "Wait for: #N" issue-dependency helpers in copilot-loop.sh.
 # The functions under test are extracted verbatim from the script (between the

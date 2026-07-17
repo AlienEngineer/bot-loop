@@ -170,14 +170,14 @@ fn terminate(child: &mut Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
-        signal_group(pid, "TERM");
+        signal_group(pid, libc::SIGTERM);
         for _ in 0..5 {
             if let Ok(Some(_)) = child.try_wait() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        signal_group(pid, "KILL");
+        signal_group(pid, libc::SIGKILL);
     }
     #[cfg(not(unix))]
     {
@@ -185,14 +185,21 @@ fn terminate(child: &mut Child) {
     }
 }
 
-/// Send `sig` to the whole process group led by `pid` (best effort). The
-/// negative pid targets the group, matching the bash TUI's `stop_bot`.
+/// Send `sig` to the whole process group led by `pid`, falling back to the lone
+/// process when it is not a group leader (best effort). The negative pid targets
+/// the group, matching the bash TUI's `stop_bot`. Uses `kill(2)` directly rather
+/// than shelling out to `kill`, whose negative-pid parsing differs between the
+/// BSD and util-linux implementations and left the group unsignalled on Linux.
 #[cfg(unix)]
-fn signal_group(pid: u32, sig: &str) {
-    let _ = Command::new("kill")
-        .arg(format!("-{sig}"))
-        .arg(format!("-{pid}"))
-        .status();
+fn signal_group(pid: u32, sig: i32) {
+    let pid = pid as libc::pid_t;
+    // SAFETY: `kill(2)` only delivers `sig` to the target process/group; it never
+    // touches this process's memory and reports a missing target via its result.
+    unsafe {
+        if libc::kill(-pid, sig) == -1 {
+            libc::kill(pid, sig);
+        }
+    }
 }
 
 #[cfg(test)]

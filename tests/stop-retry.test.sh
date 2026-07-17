@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317  # mock/stub helpers are invoked indirectly by the code under test
 #
 # Regression test for issue #90 "stop retry": a failed issue must be marked
 # "copilot-failed" and never re-queued for an automatic retry. _fail_issue is
