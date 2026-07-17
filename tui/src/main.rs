@@ -5,6 +5,7 @@
 
 mod app;
 mod github;
+mod logs;
 mod runner;
 mod ui;
 
@@ -66,6 +67,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
         KeyCode::Char('l') => app.toggle_loop(),
+        KeyCode::Char('o') => app.toggle_output(),
         _ => {}
     }
 }
