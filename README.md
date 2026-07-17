@@ -54,6 +54,21 @@ this off with `--no-worktrees` to work in the current checkout instead.
 There is also an optional terminal UI, [`copilot-loop-tui.sh`](./copilot-loop-tui.sh),
 that spawns, monitors, and stops several loop instances ("bots") side by side.
 
+### Rust TUI (experimental)
+
+A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). The
+first slice lists the repository's open GitHub issues in a scrollable,
+vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
+authenticated for the target repo.
+
+```sh
+cd tui
+cargo run
+```
+
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `r` refresh, `q` (or `Esc`) quit.
+
+
 ### Branch and worktree cleanup
 
 Every issue runs on its own branch (`copilot/<n>-<slug>`) and, in worktree mode,
