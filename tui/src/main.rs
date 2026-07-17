@@ -98,6 +98,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The PR-output popup captures keys while it is open (#143).
+    if app.pr_output_open() {
+        handle_pr_output_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -117,6 +123,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
+        KeyCode::Char('p') => app.open_pr_output(),
         _ => {}
     }
 }
@@ -143,6 +150,17 @@ fn handle_close_confirm_key(app: &mut App, key: KeyEvent) {
         | KeyCode::Char('q')
         | KeyCode::Esc
         | KeyCode::Enter => app.cancel_close(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the PR-output popup is open: navigate the resolving PRs,
+/// and close on `q`, `Esc`, or `p` (#143).
+fn handle_pr_output_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.pr_output_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.pr_output_previous(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('p') => app.close_pr_output(),
         _ => {}
     }
 }

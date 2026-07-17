@@ -104,6 +104,10 @@ pub struct App {
     /// In-progress PR numbers seen at the last refresh, mirroring
     /// `known_in_progress` so a newly started PR is announced once (#133).
     known_in_progress_prs: Vec<u64>,
+    /// Whether the PR-output popup is open (#143).
+    pr_output_open: bool,
+    /// Selection within the PR-output popup's PR list (#143).
+    pub pr_output_state: ListState,
 }
 
 impl App {
@@ -136,6 +140,8 @@ impl App {
             next_worker_id: 1,
             in_progress_prs: Vec::new(),
             known_in_progress_prs: Vec::new(),
+            pr_output_open: false,
+            pr_output_state: ListState::default(),
         }
     }
 
@@ -181,7 +187,9 @@ impl App {
     /// next tick. Leaves the list unchanged on failure rather than blanking it.
     fn refresh_in_progress_prs(&mut self) {
         if let Ok(prs) = github::fetch_in_progress_prs() {
+            let previous = self.selected_pr_number();
             self.in_progress_prs = prs;
+            self.reselect_pr_output(previous);
         }
     }
 
@@ -503,6 +511,89 @@ impl App {
         Some((path, logs::sanitize(&raw)))
     }
 
+    /// The pull requests the loop is currently resolving, in list order (#143).
+    pub fn in_progress_prs(&self) -> &[PullRequest] {
+        &self.in_progress_prs
+    }
+
+    /// Whether the PR-output popup is open (#143).
+    pub fn pr_output_open(&self) -> bool {
+        self.pr_output_open
+    }
+
+    /// Open the PR-output popup, keeping a valid selection when PRs exist (#143).
+    ///
+    /// The popup shows the transcript of whatever PR the loop is resolving; the
+    /// in-progress PR list is kept current by the periodic refresh (and `r`), so
+    /// opening the popup just surfaces it rather than making its own `gh` call.
+    pub fn open_pr_output(&mut self) {
+        let previous = self.selected_pr_number();
+        self.reselect_pr_output(previous);
+        self.pr_output_open = true;
+    }
+
+    /// Close the PR-output popup.
+    pub fn close_pr_output(&mut self) {
+        self.pr_output_open = false;
+    }
+
+    /// Move the PR-output highlight down by one, clamped to the last PR (#143).
+    pub fn pr_output_next(&mut self) {
+        if self.in_progress_prs.is_empty() {
+            return;
+        }
+        let last = self.in_progress_prs.len() - 1;
+        let next = self
+            .pr_output_state
+            .selected()
+            .map_or(0, |i| (i + 1).min(last));
+        self.pr_output_state.select(Some(next));
+    }
+
+    /// Move the PR-output highlight up by one, clamped to the first PR (#143).
+    pub fn pr_output_previous(&mut self) {
+        if self.in_progress_prs.is_empty() {
+            return;
+        }
+        let prev = self
+            .pr_output_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.pr_output_state.select(Some(prev));
+    }
+
+    /// The number of the PR selected in the PR-output popup, if any (#143).
+    fn selected_pr_number(&self) -> Option<u64> {
+        self.pr_output_state
+            .selected()
+            .and_then(|i| self.in_progress_prs.get(i))
+            .map(|pr| pr.number)
+    }
+
+    /// Point the PR-output selection at `previous` again after the list changed,
+    /// falling back to the clamped prior index, or clearing it when no PR is left
+    /// (#143). Keeps the highlight on the same PR as the list refreshes.
+    fn reselect_pr_output(&mut self, previous: Option<u64>) {
+        if self.in_progress_prs.is_empty() {
+            self.pr_output_state.select(None);
+            return;
+        }
+        let max = self.in_progress_prs.len() - 1;
+        let index = previous
+            .and_then(|n| self.in_progress_prs.iter().position(|pr| pr.number == n))
+            .unwrap_or_else(|| self.pr_output_state.selected().unwrap_or(0).min(max));
+        self.pr_output_state.select(Some(index));
+    }
+
+    /// The selected in-progress PR's number and its sanitized log tail, or `None`
+    /// when no PR is selected or the loop has produced no log for it yet (#143).
+    pub fn selected_pr_output(&self, max_bytes: u64) -> Option<(u64, String)> {
+        let number = self.selected_pr_number()?;
+        let path = logs::latest_issue_log(&logs::logs_dir(&self.repo_root), number)?;
+        let raw = logs::read_log_tail(&path, max_bytes).ok()?;
+        Some((number, logs::sanitize(&raw)))
+    }
+
     /// Whether the new-issue form is currently open.
     pub fn is_creating(&self) -> bool {
         self.mode == Mode::Create
@@ -614,10 +705,12 @@ impl App {
     }
 
     /// Seed the in-progress PR list directly (tests only), standing in for a
-    /// `gh pr list` fetch.
+    /// `gh pr list` fetch. Reselects the PR-output highlight like a real refresh.
     #[cfg(test)]
     pub fn set_in_progress_prs(&mut self, prs: Vec<PullRequest>) {
+        let previous = self.selected_pr_number();
         self.in_progress_prs = prs;
+        self.reselect_pr_output(previous);
     }
 }
 
@@ -1117,6 +1210,111 @@ mod tests {
         // An issue with no log yields nothing.
         app.first(); // issue #0
         assert!(app.selected_output(OUTPUT_TAIL_BYTES).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pr_output_popup_is_hidden_by_default_and_toggles() {
+        let mut app = App::new(Vec::new());
+        assert!(!app.pr_output_open());
+        app.open_pr_output();
+        assert!(app.pr_output_open());
+        app.close_pr_output();
+        assert!(!app.pr_output_open());
+    }
+
+    #[test]
+    fn open_pr_output_selects_the_first_pr() {
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn pr_output_navigation_clamps_at_both_ends() {
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+
+        app.pr_output_previous(); // already at the top
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+        app.pr_output_next();
+        assert_eq!(app.pr_output_state.selected(), Some(1));
+        app.pr_output_next(); // clamp at the last PR
+        assert_eq!(app.pr_output_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn pr_output_navigation_is_safe_without_prs() {
+        let mut app = App::new(Vec::new());
+        app.open_pr_output();
+        app.pr_output_next();
+        app.pr_output_previous();
+        assert_eq!(app.pr_output_state.selected(), None);
+    }
+
+    #[test]
+    fn pr_output_selection_follows_the_pr_across_a_refresh() {
+        // The highlight tracks the same PR by number even when the list reorders
+        // or shrinks under it, so a background refresh never jumps it (#143).
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+        app.pr_output_next(); // select #15 (index 1)
+
+        // Reordered so #15 is now first: the selection follows it.
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":15,"title":"b"},{"number":12,"title":"a"}]"#)
+                .unwrap(),
+        );
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+
+        // The selected PR finishing clears the highlight rather than dangling.
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"}]"#).unwrap(),
+        );
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+        app.set_in_progress_prs(github::parse_pull_requests(r#"[]"#).unwrap());
+        assert_eq!(app.pr_output_state.selected(), None);
+    }
+
+    #[test]
+    fn selected_pr_output_reads_the_pr_log() {
+        let dir = std::env::temp_dir().join(format!("copilot-app-proutput-{}", std::process::id()));
+        let logs = dir.join(".copilot-loop").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("pr-12-20260101-000000.log"),
+            "\x1b[32mresolving\x1b[0m the conflict\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+
+        let (number, text) = app.selected_pr_output(OUTPUT_TAIL_BYTES).expect("a PR log");
+        assert_eq!(number, 12);
+        assert_eq!(text, "resolving the conflict\n");
+
+        // The other PR has no log yet, so nothing is returned for it.
+        app.pr_output_next();
+        assert!(app.selected_pr_output(OUTPUT_TAIL_BYTES).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
