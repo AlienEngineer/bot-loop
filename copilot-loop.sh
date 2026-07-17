@@ -972,6 +972,36 @@ _worktree_path() {
   printf '%s/%s' "$WORKTREE_BASE" "$(printf '%s' "$1" | tr '/' '-')"
 }
 
+# _worktree_lock_state <branch>
+# Classify the lock on the worktree that has <branch> checked out, so cleanup
+# can tell its own (reclaimable) worktree from one a *different* live run still
+# owns (#106):
+#   unlocked  -> not locked
+#   pid:<N>   -> locked by a copilot-loop run whose pid is <N> (see the reason
+#                prepare_workspace writes)
+#   locked    -> locked without our pid marker (e.g. a manual `git worktree lock`)
+# Matches on the branch ref rather than the path so it stays correct when git
+# reports a resolved path (e.g. macOS /var -> /private/var); the lock reason is
+# emitted on the `locked` line, unquoted for our plain reason.
+_worktree_lock_state() {
+  local branch="$1" line target=0 pid
+  [ -n "$branch" ] || { printf 'unlocked'; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) target=0 ;;
+      "branch refs/heads/$branch") target=1 ;;
+      locked|"locked "*)
+        if [ "$target" = 1 ]; then
+          pid="$(printf '%s\n' "$line" | sed -n 's/.*pid \([0-9][0-9]*\).*/\1/p')"
+          if [ -n "$pid" ]; then printf 'pid:%s' "$pid"; else printf 'locked'; fi
+          return 0
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  printf 'unlocked'
+}
+
 # prepare_workspace <branch> <start-ref>
 # Create (or reset) <branch> at <start-ref> and set WORKSPACE_DIR. Returns 1 if
 # the branch/worktree could not be created.
@@ -1008,6 +1038,25 @@ cleanup_workspace() {
   local branch="$1"
   if [ "$USE_WORKTREES" = 1 ]; then
     local wt; wt="$(_worktree_path "$branch")"
+    # Never tear down a worktree a *different* live run still owns: removing it
+    # would delete an active Copilot session's working directory — the #106
+    # race. Our own lock (pid $$) and a crashed run's stale lock (a pid no
+    # longer alive) are safe to reclaim; a foreign live lock, or one placed by
+    # hand (no pid marker), is left strictly alone so the session survives.
+    local lock_state; lock_state="$(_worktree_lock_state "$branch")"
+    case "$lock_state" in
+      "pid:$$") : ;;                                   # our own lock -> reclaim
+      pid:*)
+        if kill -0 "${lock_state#pid:}" 2>/dev/null; then
+          WORKSPACE_DIR=""
+          return 0                                     # another live run owns it
+        fi
+        ;;                                             # dead pid -> reclaim
+      locked)
+        WORKSPACE_DIR=""
+        return 0                                       # locked by hand -> leave it
+        ;;
+    esac
     # Unlock first: prepare_workspace locked it while the run was live, and a
     # locked worktree cannot be removed with a single --force.
     git worktree unlock "$wt" >/dev/null 2>&1 || true
@@ -1119,6 +1168,13 @@ remove_local_branch() {
   local branch="$1" wt
   branch_is_ours "$branch" || return 0
   wt="$(_worktree_dir_for_branch "$branch")"
+  if [ -n "$wt" ] && _worktree_is_locked "$wt"; then
+    # Defence-in-depth (#106): a locked worktree belongs to a live Copilot
+    # session. Never remove it — nor delete its branch — even when this is
+    # reached directly or the lock was taken after the sweep's own guard ran.
+    log "cleanup: keeping $branch (worktree in use)"
+    return 0
+  fi
   if [ -n "$wt" ]; then
     git worktree remove --force "$wt" >/dev/null 2>&1 || true
   fi

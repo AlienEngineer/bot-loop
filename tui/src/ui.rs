@@ -71,16 +71,37 @@ fn working_summary(working: &[u64]) -> Option<String> {
     Some(format!("working {list}"))
 }
 
+/// A "resolving PR #12" / "resolving PRs #12, #13" summary of the pull requests
+/// the loop is currently working, or `None` when it holds none. PRs are absent
+/// from the issue list, so this is the surface that tells the user the loop is
+/// busy on a PR. Pure for testing (#133).
+fn pr_summary(prs: &[u64]) -> Option<String> {
+    match prs {
+        [] => None,
+        [one] => Some(format!("resolving PR #{one}")),
+        many => {
+            let list = many
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("resolving PRs {list}"))
+        }
+    }
+}
+
 /// Build the header line spans: issue count, the viewed issue, the loop state,
-/// and the model. When the loop runs a turning spinner and the issue it is
-/// working (or "waiting for work") are shown so it is clear something is
-/// happening and which issue it is (#115). Pure so the running branch — which
-/// otherwise needs a live child process — is unit-testable.
+/// and the model. When the loop runs a turning spinner and the work it is doing
+/// — the issues *and* any PRs it is resolving, or "waiting for work" when idle —
+/// are shown so it is clear something is happening and on what (#115, #133).
+/// Pure so the running branch — which otherwise needs a live child process — is
+/// unit-testable.
 fn header_spans(
     count: usize,
     viewing: Option<u64>,
     loop_running: bool,
     working: &[u64],
+    working_prs: &[u64],
     model_label: &str,
     spinner: &str,
 ) -> Vec<Span<'static>> {
@@ -108,15 +129,26 @@ fn header_spans(
             format!("  ·  {spinner} loop: running"),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
-        match working_summary(working) {
-            Some(summary) => spans.push(Span::styled(
+        let mut idle = true;
+        if let Some(summary) = working_summary(working) {
+            spans.push(Span::styled(
                 format!("  ·  {summary}"),
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            None => spans.push(Span::styled(
+            ));
+            idle = false;
+        }
+        if let Some(summary) = pr_summary(working_prs) {
+            spans.push(Span::styled(
+                format!("  ·  {spinner} {summary}"),
+                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            ));
+            idle = false;
+        }
+        if idle {
+            spans.push(Span::styled(
                 "  ·  waiting for work",
                 Style::new().fg(Color::DarkGray),
-            )),
+            ));
         }
     } else {
         spans.push(Span::styled(
@@ -137,6 +169,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         app.selected().map(|issue| issue.number),
         loop_running,
         &app.in_progress_numbers(),
+        &app.in_progress_pr_numbers(),
         app.current_model_label(),
         spinner_frame(),
     );
@@ -600,25 +633,54 @@ mod tests {
     }
 
     #[test]
+    fn pr_summary_lists_numbers_or_none() {
+        assert_eq!(pr_summary(&[]), None);
+        assert_eq!(pr_summary(&[12]).as_deref(), Some("resolving PR #12"));
+        assert_eq!(
+            pr_summary(&[12, 13]).as_deref(),
+            Some("resolving PRs #12, #13")
+        );
+    }
+
+    #[test]
     fn header_shows_spinner_and_working_issue_when_loop_runs() {
-        let text = spans_text(&header_spans(3, Some(96), true, &[96], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, Some(96), true, &[96], &[], "auto", "⠋"));
         assert!(text.contains("⠋ loop: running"));
         assert!(text.contains("working #96"));
         assert!(text.contains("model: auto"));
     }
 
     #[test]
+    fn header_shows_pr_work_when_the_loop_resolves_a_pr() {
+        // A PR being resolved is not in the issue list, so the header is the
+        // only place the user learns the loop is busy (#133).
+        let text = spans_text(&header_spans(3, None, true, &[], &[12], "auto", "⠋"));
+        assert!(text.contains("loop: running"));
+        assert!(text.contains("resolving PR #12"));
+        // With PR work in flight the loop is not idle.
+        assert!(!text.contains("waiting for work"));
+    }
+
+    #[test]
+    fn header_shows_both_issue_and_pr_work() {
+        let text = spans_text(&header_spans(3, None, true, &[96], &[12], "auto", "⠋"));
+        assert!(text.contains("working #96"));
+        assert!(text.contains("resolving PR #12"));
+    }
+
+    #[test]
     fn header_says_waiting_when_loop_runs_without_an_issue() {
-        let text = spans_text(&header_spans(3, None, true, &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, true, &[], &[], "auto", "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("waiting for work"));
     }
 
     #[test]
     fn header_hides_loop_details_when_off() {
-        let text = spans_text(&header_spans(3, Some(96), false, &[96], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, Some(96), false, &[96], &[12], "auto", "⠋"));
         assert!(text.contains("loop: off"));
         assert!(!text.contains("working"));
+        assert!(!text.contains("resolving PR"));
         assert!(!text.contains("⠋"));
     }
 
