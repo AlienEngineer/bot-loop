@@ -111,6 +111,30 @@ assert_eq    "worktree: folder removed on cleanup" "$([ -d "$WORKTREE_BASE/copil
 assert_false "worktree: branch removed on cleanup" git -C "$clone" show-ref --verify --quiet "refs/heads/copilot/1-alpha"
 cleanup_workspace "copilot/2-beta"
 
+# --- #106: cleanup_workspace must not delete a worktree another live run owns -
+# prepare_workspace locks each worktree with the owning run's pid. Rewrite the
+# lock so it looks held by a *different* copilot-loop process that is still
+# alive, then prove cleanup_workspace leaves that worktree (and branch) intact
+# instead of pulling it out from under the other session.
+WORKSPACE_DIR=""
+assert_true "shared: prepared" prepare_workspace "copilot/4-shared" "origin/main"
+wt_shared="$WORKTREE_BASE/copilot-4-shared"
+sleep 300 & other_pid=$!
+git -C "$clone" worktree unlock "$wt_shared" >/dev/null 2>&1 || true
+git -C "$clone" worktree lock \
+  --reason "copilot-loop: copilot/4-shared in progress (pid $other_pid)" "$wt_shared" >/dev/null 2>&1 || true
+cleanup_workspace "copilot/4-shared"
+assert_eq   "shared: foreign live-locked worktree survives cleanup" "$([ -d "$wt_shared" ] && echo yes || echo no)" "yes"
+assert_true "shared: foreign live-locked branch survives cleanup"   git -C "$clone" show-ref --verify --quiet "refs/heads/copilot/4-shared"
+
+# The other run now "finishes": its process exits, leaving a stale lock whose
+# pid is dead. cleanup_workspace reclaims the worktree and branch normally.
+kill "$other_pid" 2>/dev/null || true
+wait "$other_pid" 2>/dev/null || true
+cleanup_workspace "copilot/4-shared"
+assert_eq    "shared: stale (dead-pid) worktree reclaimed" "$([ -d "$wt_shared" ] && echo yes || echo no)" "no"
+assert_false "shared: stale (dead-pid) branch removed"     git -C "$clone" show-ref --verify --quiet "refs/heads/copilot/4-shared"
+
 # (opt-out) in-place mode: the branch is checked out in REPO_DIR, no worktree.
 USE_WORKTREES=0
 WORKSPACE_DIR=""
