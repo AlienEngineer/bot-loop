@@ -51,6 +51,14 @@ By default each issue runs in its own worktree (a different folder) so the
 shared checkout is never touched and parallel instances never conflict. Turn
 this off with `--no-worktrees` to work in the current checkout instead.
 
+When the loop runs inside a bare-repository worktree setup (a `git clone --bare`
+whose branches are all checked out as linked worktrees), each issue's worktree
+is created directly under the bare root and named after its branch (slashes
+flattened to dashes) — the same folder a manual `git worktree add` would use — so
+the loop's worktrees and any you manage by hand share one namespace and never
+collide. In an ordinary checkout they are grouped in a `copilot-loop-worktrees`
+folder beside the repository instead.
+
 There is also an optional terminal UI, [`copilot-loop-tui.sh`](./copilot-loop-tui.sh),
 that spawns, monitors, and stops several loop instances ("bots") side by side.
 

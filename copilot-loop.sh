@@ -832,9 +832,23 @@ case "$USE_WORKTREES" in
   *)              USE_WORKTREES=1 ;;
 esac
 # <<< worktree-default helpers <<<
-# Where per-issue worktrees are created (only used when USE_WORKTREES=1). A
-# sibling of REPO_DIR so it never lands inside the tracked working tree.
-WORKTREE_BASE="$(dirname "$REPO_DIR")/copilot-loop-worktrees"
+# Where per-issue worktrees are created (only used when USE_WORKTREES=1). In a
+# bare-repo worktree workflow (git clone --bare + linked worktrees, e.g. the
+# cw/aw/sw shell helpers) they live directly under the bare root, named after the
+# branch with slashes flattened to dashes — exactly what `sw <branch>` creates —
+# so the loop shares one worktree namespace with any created by hand and the two
+# never collide. In an ordinary (non-bare) checkout they are grouped in a
+# copilot-loop-worktrees sibling of REPO_DIR so they never land inside the
+# tracked working tree.
+_common_dir="$(git -C "$REPO_DIR" rev-parse --git-common-dir 2>/dev/null || echo .)"
+case "$_common_dir" in /*) : ;; *) _common_dir="$REPO_DIR/$_common_dir" ;; esac
+_common_dir="$(cd "$_common_dir" 2>/dev/null && pwd || true)"
+if [ -n "$_common_dir" ] && [ "$(git --git-dir="$_common_dir" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+  WORKTREE_BASE="$_common_dir"
+else
+  WORKTREE_BASE="$(dirname "$REPO_DIR")/copilot-loop-worktrees"
+fi
+unset _common_dir
 
 # Our own login, used to tell the user's replies apart from the loop's own
 # comments when deciding whether a "needs-info" issue is ready to resume. Pin the
