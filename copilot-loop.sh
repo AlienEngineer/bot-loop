@@ -596,9 +596,14 @@ ${capped}
 EOF
 )"
 
-  # Cheapest model, no color/logs; time-boxed. Append provider noise to the log
-  # for debugging but keep stdout to just the class. Fall back on any failure.
+  # Cheapest model, no color/logs; time-boxed. Pin to the issue workspace (when
+  # one exists) so triage never runs against the shared checkout. Append provider
+  # noise to the log for debugging but keep stdout to just the class. Fall back
+  # on any failure.
+  local -a _ws_args=()
+  [ -n "${WORKSPACE_DIR:-}" ] && _ws_args=(-C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR")
   raw="$(_run_with_timeout 60 copilot -p "$prompt" \
+           ${_ws_args[@]+"${_ws_args[@]}"} \
            --model "$TRIAGE_MODEL" --allow-all-tools --no-color --log-level none 2>>"$log_file")"
   class="$(normalize_triage_class "$raw")"
   [ -n "$class" ] && printf '%s' "$class"
@@ -1300,10 +1305,6 @@ process_issue() {
   # panel shows the branch creation and the rest of the loop's narration, not
   # just Copilot's transcript (#126). Cleared at the top of the main loop.
   CURRENT_RUN_LOG="$log_file"
-  # Copilot writes here when it needs to ask the user something. Lives in the
-  # gitignored work dir so it is never committed; clear any stale copy.
-  question_file="$WORK_DIR/issue-${num}.question"
-  rm -f "$question_file"
 
   log "issue #$num on $REPO_SLUG: $title"
 
@@ -1323,6 +1324,15 @@ process_issue() {
     _fail_issue "$num" "$log_file" "could not create work branch $branch"
     return 1
   fi
+
+  # Copilot writes here when it needs to ask the user something instead of
+  # coding. Kept inside the per-issue workspace (never the shared checkout) under
+  # its gitignored control dir; the ask-path returns before any commit, so it is
+  # never included in a PR. A fresh worktree carries no stale copy, but clear it
+  # defensively.
+  question_file="$WORKSPACE_DIR/.copilot-loop/issue-${num}.question"
+  mkdir -p "$(dirname "$question_file")" 2>/dev/null || true
+  rm -f "$question_file"
 
   # Surface the freshly created branch before Copilot starts: log it and set the
   # terminal tab/window title (and tmux window name) to the branch name.
@@ -1357,10 +1367,11 @@ when you genuinely cannot proceed without their input.
 EOF
 )"
 
-  # Run Copilot non-interactively from the issue's workspace. All tools allowed
-  # and file access stays restricted to that checkout (we deliberately do not
-  # pass --allow-all-paths); WORK_DIR is additionally allowed so Copilot can
-  # write the question file there when its workspace is a separate worktree.
+  # Run Copilot non-interactively, pinned to the issue's workspace: -C makes that
+  # worktree Copilot's working directory and --add-dir keeps file access
+  # restricted to it (we deliberately do not pass --allow-all-paths), so Copilot
+  # only ever edits the created folder and never the shared checkout. The
+  # question file lives inside that workspace, so no other directory is granted.
   # Choose the coding model. When triage is enabled, classify the issue with the
   # cheap TRIAGE_MODEL and map the class to a coding model via TRIAGE_MAP; on any
   # failure, or a class with no mapping, fall back to the global COPILOT_MODEL so
@@ -1382,7 +1393,7 @@ EOF
     fi
   fi
 
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --add-dir "$WORK_DIR" --no-color --log-level none)
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
 
   log "issue #$num: running copilot (log: $log_file)"
@@ -1965,7 +1976,7 @@ branches — those steps are handled automatically outside this session. Only ed
 files to resolve the conflicts and verify.
 EOF
 )"
-    local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+    local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
@@ -2081,7 +2092,7 @@ fix. Do NOT run git commit, git push, or create branches — those steps are han
 automatically outside this session. Only edit files and verify.
 EOF
 )"
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
   log "PR #$num: running copilot to fix failing checks (log: $log_file)"
