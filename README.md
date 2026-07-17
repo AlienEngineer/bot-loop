@@ -84,7 +84,11 @@ to close it.
 While the loop runs the header shows a turning spinner next to `loop: running`
 and the issue it is working (`working #96`, or `waiting for work` when idle), and
 the list refreshes on its own so `in-progress` issues — flagged with a spinner in
-their row — appear as the loop claims them, without a manual refresh (#115).
+their row — appear as the loop claims them, without a manual refresh (#115). The
+loop also works pull requests (resolving merge conflicts and fixing failing
+checks); since PRs are not in the issue list, the header calls that out with its
+own spinner and a `resolving PR #12` note, and the status line announces each PR
+the loop starts, so it is always clear the loop is busy on a PR (#133).
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
