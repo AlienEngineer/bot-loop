@@ -935,6 +935,11 @@ prepare_workspace() {
     if ! git worktree add --force -B "$branch" "$wt" "$start" >/dev/null 2>&1; then
       return 1
     fi
+    # Lock the worktree for as long as this run owns it so a concurrent cleanup
+    # pass in another bot (sweep_merged_branches / git worktree prune) can never
+    # remove the folder out from under a live Copilot session — the race that
+    # left sessions with a dead working directory. cleanup_workspace unlocks it.
+    git worktree lock --reason "copilot-loop: $branch in progress (pid $$)" "$wt" >/dev/null 2>&1 || true
     WORKSPACE_DIR="$wt"
   else
     git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
@@ -954,6 +959,9 @@ cleanup_workspace() {
   local branch="$1"
   if [ "$USE_WORKTREES" = 1 ]; then
     local wt; wt="$(_worktree_path "$branch")"
+    # Unlock first: prepare_workspace locked it while the run was live, and a
+    # locked worktree cannot be removed with a single --force.
+    git worktree unlock "$wt" >/dev/null 2>&1 || true
     git worktree remove --force "$wt" >/dev/null 2>&1 || true
     git worktree prune >/dev/null 2>&1 || true
   else
@@ -1021,6 +1029,22 @@ _worktree_dir_for_branch() {
   git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$branch" '
     /^worktree /  { wt = substr($0, 10) }
     /^branch /    { if (substr($0, 8) == b) { print wt; exit } }'
+}
+
+# _worktree_is_locked <path>
+# True (0) when the worktree at <path> is currently locked, i.e. a live
+# copilot-loop run owns it (see prepare_workspace). The sweep uses this to never
+# remove or delete a worktree/branch that a running Copilot session still needs.
+_worktree_is_locked() {
+  local target="$1" line wt=""
+  [ -n "$target" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }" ;;
+      locked|"locked "*) [ "$wt" = "$target" ] && return 0 ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  return 1
 }
 
 # branch_has_unpushed_work <branch> <base-ref>
@@ -1098,7 +1122,7 @@ sweep_merged_branches() {
   merged_prs="$(gh pr list --state merged --base "$DEFAULT_BRANCH" --limit 200 \
                   --json headRefName --jq '.[].headRefName' 2>/dev/null)"
 
-  local removed=0 b
+  local removed=0 b wt
   # Local branches: remove merged ones together with their worktree.
   while IFS= read -r b; do
     [ -n "$b" ] || continue
@@ -1106,6 +1130,14 @@ sweep_merged_branches() {
     _branch_is_merged "$b" "$base" "$merged_prs" || continue
     if branch_has_unpushed_work "$b" "$base"; then
       log "cleanup: keeping $b (has un-pushed work)"
+      continue
+    fi
+    # Never pull a worktree out from under a live run: a locked worktree means a
+    # Copilot session still owns it. Leave it — a later pass sweeps it once the
+    # run finishes and cleanup_workspace unlocks it.
+    wt="$(_worktree_dir_for_branch "$b")"
+    if [ -n "$wt" ] && _worktree_is_locked "$wt"; then
+      log "cleanup: keeping $b (worktree in use)"
       continue
     fi
     remove_local_branch "$b"
@@ -1121,6 +1153,13 @@ sweep_merged_branches() {
       [ -n "$b" ] || continue
       branch_is_ours "$b" || continue
       _branch_is_merged "origin/$b" "$base" "$merged_prs" "$b" || continue
+      # A live run may still push to this remote branch; if its local worktree is
+      # locked (in use), leave the remote alone until the run finishes.
+      wt="$(_worktree_dir_for_branch "$b")"
+      if [ -n "$wt" ] && _worktree_is_locked "$wt"; then
+        log "cleanup: keeping remote $b (worktree in use)"
+        continue
+      fi
       delete_remote_branch "$b"
       log "cleanup: deleted merged remote branch $b"
       removed=$(( removed + 1 ))
@@ -1238,7 +1277,10 @@ EOF
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
 
   log "issue #$num: running copilot (log: $log_file)"
-  cd "$WORKSPACE_DIR" 2>/dev/null || true
+  if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+    _fail_issue "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run (refusing to edit $REPO_DIR)"
+    return 1
+  fi
   run_copilot "$log_file" "${copilot_args[@]}"
   local copilot_rc=$COPILOT_RC
   cd "$REPO_DIR" 2>/dev/null || true
@@ -1796,7 +1838,10 @@ EOF
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
-    cd "$WORKSPACE_DIR" 2>/dev/null || true
+    if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+      _fail_pr "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run (refusing to edit $REPO_DIR)"
+      return 1
+    fi
     run_copilot "$log_file" "${copilot_args[@]}"
     copilot_rc=$COPILOT_RC
     cd "$REPO_DIR" 2>/dev/null || true

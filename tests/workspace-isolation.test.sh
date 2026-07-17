@@ -89,6 +89,16 @@ assert_eq    "worktree: workspace differs from shared checkout" "$([ "$WORKSPACE
 assert_eq    "worktree: folder exists on disk" "$([ -d "$WORKSPACE_DIR" ] && echo yes || echo no)" "yes"
 assert_true  "worktree: branch created" git -C "$clone" show-ref --verify --quiet "refs/heads/copilot/1-alpha"
 assert_eq    "worktree: branch checked out in that folder" "$(git -C "$WORKSPACE_DIR" rev-parse --abbrev-ref HEAD)" "copilot/1-alpha"
+# The worktree is locked while the run owns it, so a concurrent cleanup sweep in
+# another bot cannot remove it out from under a live session. Match by branch to
+# stay robust against symlinked temp paths (macOS /var -> /private/var).
+locked_state() {
+  git -C "$clone" worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$1" '
+    /^worktree /{ target=0 }
+    $1=="branch" && $2==b { target=1 }
+    /^locked/{ if (target) { print "yes"; exit } }'
+}
+assert_eq    "worktree: locked while in use" "$(locked_state "copilot/1-alpha")" "yes"
 
 # A second issue gets a second, distinct folder — parallel tasks never collide.
 WORKSPACE_DIR=""

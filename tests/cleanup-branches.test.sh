@@ -72,7 +72,7 @@ DELETE_REMOTE_BRANCH=1
 gh() {
   case "$*" in
     *"pr list"*"--state merged"*)
-      printf '%s\n' "copilot/1-merged" "copilot/3-squash" "copilot/5-wt" "copilot/6-remote"
+      printf '%s\n' "copilot/1-merged" "copilot/3-squash" "copilot/5-wt" "copilot/6-remote" "copilot/9-locked"
       ;;
     *) : ;;
   esac
@@ -82,6 +82,7 @@ root="$(mktemp -d)"
 origin="$root/origin.git"
 clone="$root/clone"
 wt5="$root/wt-5"
+wt9="$root/wt-9"
 
 git init --bare -q "$origin"
 git clone -q "$origin" "$clone" 2>/dev/null
@@ -124,11 +125,18 @@ mk_branch "copilot/5-wt"; merge_into_main "copilot/5-wt"
 # (6) merged, pushed, local branch already gone -> delete lingering remote only
 mk_branch "copilot/6-remote"; merge_into_main "copilot/6-remote"
 git branch -qD "copilot/6-remote"
+# (9) merged, pushed, checked out in a LOCKED worktree (a live run owns it)
+#     -> KEEP local + worktree + remote until the run finishes and unlocks it
+mk_branch "copilot/9-locked"; merge_into_main "copilot/9-locked"
 
 # Park the checkout on a detached HEAD so no branch is "current" (mirrors the
 # loop between iterations) and add the worktree for branch 5.
 git switch -q --detach main
 git worktree add -q "$wt5" "copilot/5-wt"
+# Branch 9's worktree stands in for an in-progress run: locked so the sweep must
+# leave it (and its branch/remote) alone.
+git worktree add -q "$wt9" "copilot/9-locked"
+git worktree lock "$wt9" >/dev/null 2>&1 || true
 
 REPO_DIR="$clone"
 sweep_merged_branches
@@ -155,6 +163,10 @@ assert_eq    "5: worktree directory removed"      "$([ -d "$wt5" ] && echo yes |
 
 assert_false "6: lingering merged remote deleted" rem "copilot/6-remote"
 
+assert_true  "9: in-use (locked) worktree branch kept"  loc "copilot/9-locked"
+assert_true  "9: in-use (locked) worktree remote kept"  rem "copilot/9-locked"
+assert_eq    "9: in-use worktree directory kept"        "$([ -d "$wt9" ] && echo yes || echo no)" "yes"
+
 # --- Integration: cleanup disabled is a no-op --------------------------------
 mk_branch "copilot/7-merged"; merge_into_main "copilot/7-merged"
 git switch -q --detach main
@@ -176,6 +188,7 @@ DELETE_REMOTE_BRANCH=1
 
 # --- cleanup -----------------------------------------------------------------
 cd "$here" || exit 1
+git -C "$clone" worktree unlock "$wt9" >/dev/null 2>&1 || true
 git -C "$clone" worktree prune >/dev/null 2>&1 || true
 rm -rf "$root"
 
