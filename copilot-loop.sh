@@ -36,6 +36,12 @@
 #      loop first waits (bounded) for any PR still reported UNKNOWN to be
 #      evaluated, then — if a PR is conflicting — merges the base branch into it
 #      and lets Copilot resolve the conflicts, then pushes, so PRs stay mergeable.
+#   1b. Still before starting new work, check those open PRs for failing CI checks
+#      and, when one is found, hand its failing checks to Copilot to fix on the PR
+#      branch, commit and push so CI re-runs. Only one PR is fixed per pass; a PR
+#      Copilot cannot fix is labelled "checks-unresolved" so it is not retried
+#      forever. Conflicts are handled first, so a conflicting PR is never grabbed
+#      here (see the "failing-checks-pr helpers").
 #   2. Pick the next issue to work on (protected by GitHub lock):
 #        a. an issue awaiting a reply ("needs-info") or a failed issue
 #           ("copilot-failed") whose latest comment came from a human (the user
@@ -235,6 +241,9 @@ PENDING_LABEL="pending"
 # Marks a PR whose conflicts the loop tried and failed to resolve, so it is not
 # retried forever. Remove it by hand to let the loop try again.
 CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
+# Marks a PR whose failing CI checks the loop tried and failed to fix, so it is
+# not retried forever. Remove it by hand to let the loop try again.
+CHECKS_UNRESOLVED_LABEL="checks-unresolved"
 
 # Prefix of every work branch the loop creates ("copilot/<num>-<slug>"). Used to
 # recognise the loop's own branches when cleaning up so a sweep never touches the
@@ -925,6 +934,7 @@ ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce ch
 ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
 ensure_label "$PENDING_LABEL"    "d4c5f9" "Waiting for another issue to be resolved before it can start"
 ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The copilot loop could not resolve this PR's merge conflicts"
+ensure_label "$CHECKS_UNRESOLVED_LABEL" "b60205" "The copilot loop could not fix this PR's failing checks"
 
 # --- Workspace isolation -----------------------------------------------------
 # Every issue (and every PR conflict fix) runs in its own branch, prepared here.
@@ -1582,6 +1592,20 @@ _fail_pr() {
   cleanup_workspace "$head"
 }
 
+# Mark a PR failing-checks fix attempt failed: comment a log tail, label the PR
+# so it is not retried forever, and tear down the workspace. Mirrors _fail_pr.
+_fail_pr_checks() {
+  local num="$1" log_file="$2" reason="$3" tail_out
+  log "PR #$num: FAILED to fix failing checks - $reason"
+  tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
+  # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
+  gh pr comment "$num" --body "$(printf 'copilot-loop could not fix the failing checks: %s\n\n```\n%s\n```' \
+    "$reason" "$tail_out")" >/dev/null 2>&1 || true
+  gh pr edit "$num" --add-label "$CHECKS_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
+  gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  cleanup_workspace "$head"
+}
+
 # Copilot needs more information: post its question to the issue, mark it
 # "needs-info", and leave it for the user to answer. Discards any work in
 # progress so the branch is clean for the eventual resume.
@@ -1906,6 +1930,115 @@ EOF
   return 0
 }
 
+# Echo, comma-joined, the names of a PR's failing CI checks (an empty string when
+# none). A check is failing when it is a completed CheckRun with a failing
+# conclusion or a StatusContext in a failing state — the same predicate
+# next_failing_checks_pr selects on.
+pr_failing_check_names() {
+  local num="$1"
+  # shellcheck disable=SC2016  # $c is a jq variable, not a shell expansion — keep single quotes
+  gh pr view "$num" --json statusCheckRollup --jq '
+    [ .statusCheckRollup[]? as $c
+      | select(
+          ($c.__typename == "CheckRun" and (["FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE"] | index($c.conclusion)))
+          or ($c.__typename == "StatusContext" and (["FAILURE","ERROR"] | index($c.state)))
+        )
+      | ($c.name // $c.context // "check")
+    ] | unique | join(", ")' 2>/dev/null
+}
+
+# --- Core: fix a single PR's failing CI checks ------------------------------
+# Checks out the PR head branch and hands Copilot the list of failing checks to
+# investigate and fix (verifying locally), then commits and pushes so CI re-runs.
+# If Copilot makes no changes it cannot fix them, so the PR is labelled
+# "checks-unresolved" rather than pushed empty and re-grabbed forever. Returns 0
+# on success, 1 on failure.
+resolve_pr_check_failures() {
+  local num="$1"
+  local head base title log_file failing copilot_rc
+
+  # One API round-trip for the PR's head branch, base branch and title.
+  { IFS= read -r -d '' head; IFS= read -r -d '' base; IFS= read -r -d '' title; } < <(
+    gh pr view "$num" --json headRefName,baseRefName,title \
+      --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
+  [ -n "$base" ] || base="$DEFAULT_BRANCH"
+  log_file="$LOG_DIR/pr-${num}-checks-$(date '+%Y%m%d-%H%M%S').log"
+
+  if [ -z "$head" ]; then
+    log "PR #$num: could not determine head branch, skipping"
+    gh pr edit "$num" --add-label "$CHECKS_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  failing="$(pr_failing_check_names "$num")"
+  log "PR #$num has failing checks (${failing:-unknown}): $title"
+
+  # Base a fresh workspace on the PR head branch, without ever checking out the
+  # default branch, so Copilot fixes the failures on the PR's own branch.
+  git -C "$REPO_DIR" fetch origin >>"$log_file" 2>&1 || true
+  if ! prepare_workspace "$head" "origin/$head"; then
+    _fail_pr_checks "$num" "$log_file" "could not check out PR head branch '$head'"
+    return 1
+  fi
+
+  # Surface the PR branch on the terminal tab/window title before Copilot starts.
+  log "PR #$num: working on branch $head"
+  set_terminal_title "$head"
+
+  local prompt
+  prompt="$(cat <<EOF
+You are working in a git repository on branch "${head}" (pull request #${num}).
+Its continuous-integration checks are failing: ${failing:-unknown}.
+
+Investigate why these checks fail and fix the code so they pass. Run the relevant
+build, test, or lint commands locally to reproduce each failure and confirm your
+fix. Do NOT run git commit, git push, or create branches — those steps are handled
+automatically outside this session. Only edit files and verify.
+EOF
+)"
+  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+
+  log "PR #$num: running copilot to fix failing checks (log: $log_file)"
+  if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+    _fail_pr_checks "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run (refusing to edit $REPO_DIR)"
+    return 1
+  fi
+  run_copilot "$log_file" "${copilot_args[@]}"
+  copilot_rc=$COPILOT_RC
+  cd "$REPO_DIR" 2>/dev/null || true
+  log "PR #$num: copilot exited with code $copilot_rc"
+
+  # Track what this fix prompt cost on the PR.
+  _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
+
+  # No changes means Copilot could not fix the checks. Give up (label so it is not
+  # retried forever) instead of pushing an empty commit and re-grabbing next pass.
+  if [ -z "$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null)" ]; then
+    _fail_pr_checks "$num" "$log_file" "copilot made no changes to fix the failing checks"
+    return 1
+  fi
+
+  git -C "$WORKSPACE_DIR" add -A
+  if ! git -C "$WORKSPACE_DIR" commit -m "Fix failing checks on $head (#$num)" >/dev/null 2>&1; then
+    _fail_pr_checks "$num" "$log_file" "git commit failed"
+    return 1
+  fi
+
+  if ! git -C "$WORKSPACE_DIR" push origin "HEAD:$head" >>"$log_file" 2>&1; then
+    _fail_pr_checks "$num" "$log_file" "git push failed"
+    return 1
+  fi
+
+  gh pr comment "$num" \
+    --body "copilot-loop pushed a fix for the failing checks (${failing:-unknown})." >/dev/null 2>&1 || true
+  gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  log "PR #$num: pushed a fix for failing checks"
+  cleanup_workspace "$head"
+  return 0
+}
+
 # >>> mergeability helpers >>>
 # GitHub computes a PR's mergeable state asynchronously: right after a PR is
 # opened, pushed to, or its base branch moves, `mergeable` is reported as UNKNOWN
@@ -1980,6 +2113,45 @@ claim_next_conflicted_pr() {
   [ -n "$pr" ]
 }
 # <<< conflict-pr helpers <<<
+
+# >>> failing-checks-pr helpers >>>
+# Echo the number of the lowest-numbered open PR targeting the default branch
+# whose CI checks are failing, skipping any that is conflicting (handled by the
+# conflict path first), already marked unresolved (conflict or checks), or already
+# claimed (in-progress) by another instance. A check is failing when it is a
+# completed CheckRun with a failing conclusion or a StatusContext in a failing
+# state — pending/successful/skipped checks are ignored so a PR whose CI is still
+# running is left alone. Returns 1 (no output) when no PR needs a check fix.
+next_failing_checks_pr() {
+  local jq_filter
+  jq_filter='[.[] | select(.mergeable != "CONFLICTING")'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$CHECKS_UNRESOLVED_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$CONFLICT_UNRESOLVED_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$INPROGRESS_LABEL"'")) | not)'
+  # shellcheck disable=SC2016  # $c is a jq variable, not a shell expansion — keep single quotes
+  jq_filter="$jq_filter"' | select([.statusCheckRollup[]? as $c | select(($c.__typename == "CheckRun" and (["FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE"] | index($c.conclusion))) or ($c.__typename == "StatusContext" and (["FAILURE","ERROR"] | index($c.state))))] | length > 0)'
+  jq_filter="$jq_filter"' | .number] | sort | .[0] // empty'
+  gh pr list --state open --base "$DEFAULT_BRANCH" \
+    --json number,mergeable,labels,statusCheckRollup --jq "$jq_filter" 2>/dev/null
+}
+
+# Atomically select and claim the next PR with failing checks, protected by the
+# GitHub lock, so two instances never fix the same PR (which would collide on the
+# shared worktree path and race each other's pushes). Marks the PR in-progress
+# while holding the lock; the resolve/fail paths clear that label. Echoes the PR
+# number on success, nothing when there is no PR to work.
+claim_next_failing_pr() {
+  local pr=""
+  acquire_github_lock || return 1
+  pr="$(next_failing_checks_pr)"
+  if [ -n "$pr" ]; then
+    gh pr edit "$pr" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  fi
+  release_github_lock
+  [ -n "$pr" ] && printf '%s\n' "$pr"
+  [ -n "$pr" ]
+}
+# <<< failing-checks-pr helpers <<<
 
 # --- Self-update: pull the loop code and restart when it changed --------------
 # Before tackling each iteration, refresh this script from the default branch so
@@ -2075,6 +2247,17 @@ while true; do
   if [ -n "$conflicted_pr" ]; then
     log "PR #$conflicted_pr has conflicts, resolving before starting new tasks"
     resolve_pr_conflicts "$conflicted_pr" || true
+    continue
+  fi
+
+  # Still before starting new work: fix any open PR whose CI checks are failing.
+  # Claim one atomically (under the lock, so instances never fix the same PR) and
+  # hand its failing checks to Copilot, then re-check on the next pass. Conflicts
+  # are handled first above, so a conflicting PR is never grabbed here.
+  failing_pr="$(claim_next_failing_pr || true)"
+  if [ -n "$failing_pr" ]; then
+    log "PR #$failing_pr has failing checks, fixing before starting new tasks"
+    resolve_pr_check_failures "$failing_pr" || true
     continue
   fi
 

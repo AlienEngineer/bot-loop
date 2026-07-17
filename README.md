@@ -127,6 +127,22 @@ conflicts are resolved. If the loop cannot resolve a PR's conflicts it labels it
 `conflict-unresolved` and leaves it alone rather than retrying forever — remove
 that label by hand to let the loop try again.
 
+### Fixing failing checks
+
+Still before starting new work, each pass the loop also checks those open PRs for
+failing CI checks. When it finds one it checks out the PR's branch and hands the
+failing checks to Copilot to investigate and fix — running the build, test, or
+lint commands to reproduce and verify — then commits and pushes so CI re-runs and
+the PR can go green.
+
+As with conflict resolution only one PR is fixed per pass, claimed with the
+`in-progress` label under the GitHub lock so parallel instances never grab the
+same PR. Conflicts are handled first, so a conflicting PR is never picked up for a
+check fix. Checks that are still running or already passing are ignored, so the
+loop never interrupts in-flight CI. A PR whose checks Copilot cannot fix (it makes
+no changes, or the push fails) is labelled `checks-unresolved` and left alone
+rather than retried forever — remove that label by hand to let the loop try again.
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
