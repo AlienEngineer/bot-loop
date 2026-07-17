@@ -70,7 +70,9 @@ vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
 authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
 label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
 up. Press `c` to create a new issue: fill in a title and description, then
-`Ctrl+S` to submit it (no label is added by default). Press `l` to start (or
+`Ctrl+S` to submit it (no label is added by default). Press `x` to close the
+selected issue: a confirmation popup names it, then `y` closes it on GitHub
+(`n`/`Esc` cancels). Press `l` to start (or
 stop) a background `copilot-loop.sh` that works through the ready issues; it
 runs detached — output captured to `.copilot-loop/tui/loop.log` — and keeps
 going after you quit the TUI. The loop script is found at the repo root
@@ -96,7 +98,8 @@ cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-start (mark ready), `l` start/stop the background loop, `m` pick the model, `o`
+start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
+the background loop, `m` pick the model, `o`
 show/hide the output panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
