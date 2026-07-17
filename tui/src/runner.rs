@@ -138,7 +138,8 @@ impl LoopRunner {
     }
 
     /// Stop the running loop (TERM its process group, escalating to KILL after a
-    /// short grace period). A no-op when nothing is running.
+    /// grace period that matches the bash TUI's `stop_bot`). A no-op when nothing
+    /// is running.
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             terminate(&mut child);
@@ -178,17 +179,28 @@ fn spawn_detached(program: &Path, args: &[String], log: &Path) -> Result<Child> 
         .with_context(|| format!("failed to start {}", program.display()))
 }
 
-/// Terminate a spawned child: TERM its process group, wait briefly, then KILL.
+/// How long to wait for a TERMed loop to exit before escalating to KILL. Matches
+/// the bash TUI's `stop_bot`, which polls for up to 3s (15 × 0.2s) so
+/// `copilot-loop.sh` has time to run its cleanup trap — releasing the GitHub lock
+/// so the next run is not blocked — before being force-killed. A shorter window
+/// risks KILLing the loop mid-cleanup and leaking the lock file.
+#[cfg(unix)]
+const TERM_GRACE_POLLS: u32 = 30;
+#[cfg(unix)]
+const TERM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Terminate a spawned child: TERM its process group, wait up to the grace period
+/// (matching the bash TUI's `stop_bot`), then KILL.
 fn terminate(child: &mut Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
         signal_group(pid, libc::SIGTERM);
-        for _ in 0..5 {
+        for _ in 0..TERM_GRACE_POLLS {
             if let Ok(Some(_)) = child.try_wait() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(TERM_POLL_INTERVAL);
         }
         signal_group(pid, libc::SIGKILL);
     }
