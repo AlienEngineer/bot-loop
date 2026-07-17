@@ -104,6 +104,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The closed-issues (spend) popup captures keys while it is open (#145).
+    if app.closed_open() {
+        handle_closed_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -123,6 +129,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),
+        KeyCode::Char('t') => app.open_closed(),
         _ => {}
     }
 }
@@ -160,6 +167,17 @@ fn handle_pr_output_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down => app.pr_output_next(),
         KeyCode::Char('k') | KeyCode::Up => app.pr_output_previous(),
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('p') => app.close_pr_output(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the closed-issues (spend) popup is open: navigate the
+/// closed issues, and close on `q`, `Esc`, or `t` (#145).
+fn handle_closed_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.closed_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.closed_previous(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('t') => app.close_closed(),
         _ => {}
     }
 }

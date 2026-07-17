@@ -105,6 +105,13 @@ pub struct App {
     pr_output_open: bool,
     /// Selection within the PR-output popup's PR list (#143).
     pub pr_output_state: ListState,
+    /// Whether the closed-issues (spend) popup is open (#145).
+    closed_open: bool,
+    /// The closed issues shown in that popup, fetched with their comments so
+    /// each row's AI Credits spend can be totalled (#145).
+    closed_issues: Vec<Issue>,
+    /// Selection within the closed-issues popup (#145).
+    pub closed_state: ListState,
 }
 
 impl App {
@@ -138,6 +145,9 @@ impl App {
             known_in_progress_prs: Vec::new(),
             pr_output_open: false,
             pr_output_state: ListState::default(),
+            closed_open: false,
+            closed_issues: Vec::new(),
+            closed_state: ListState::default(),
         }
     }
 
@@ -584,6 +594,96 @@ impl App {
         Some((number, logs::sanitize(&raw)))
     }
 
+    /// Whether the closed-issues (spend) popup is open (#145).
+    pub fn closed_open(&self) -> bool {
+        self.closed_open
+    }
+
+    /// The closed issues shown in the popup, in list order (#145).
+    pub fn closed_issues(&self) -> &[Issue] {
+        &self.closed_issues
+    }
+
+    /// Total AI Credits spent across every closed issue currently shown, or
+    /// `None` when none of them carries a usage comment to total (#145).
+    pub fn closed_total_credits(&self) -> Option<f64> {
+        let mut total = 0.0;
+        let mut found = false;
+        for issue in &self.closed_issues {
+            if let Some(credits) = issue.credits_spent() {
+                total += credits;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+
+    /// Point the popup at the first closed issue (or nothing when empty) and mark
+    /// it open. Shared by [`open_closed`] and the test seam so both present the
+    /// list the same way (#145).
+    fn present_closed(&mut self) {
+        self.closed_state.select(if self.closed_issues.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        self.closed_open = true;
+    }
+
+    /// Open the closed-issues popup, fetching the closed issues (with their
+    /// comments) so each row's spend can be totalled (#145).
+    ///
+    /// The fetch is synchronous, matching the other `gh`-backed actions. On
+    /// failure the popup still opens with an empty list and the error on the
+    /// status line, rather than leaving the key feeling dead.
+    pub fn open_closed(&mut self) {
+        match github::fetch_closed_issues(self.limit) {
+            Ok(issues) => {
+                self.closed_issues = issues;
+                self.status = if self.closed_issues.is_empty() {
+                    Some("No closed issues found.".to_string())
+                } else {
+                    None
+                };
+            }
+            Err(err) => {
+                self.closed_issues = Vec::new();
+                self.status = Some(format!("Error: {err}"));
+            }
+        }
+        self.present_closed();
+    }
+
+    /// Close the closed-issues popup.
+    pub fn close_closed(&mut self) {
+        self.closed_open = false;
+    }
+
+    /// Move the closed-issues highlight down by one, clamped to the last (#145).
+    pub fn closed_next(&mut self) {
+        if self.closed_issues.is_empty() {
+            return;
+        }
+        let last = self.closed_issues.len() - 1;
+        let next = self
+            .closed_state
+            .selected()
+            .map_or(0, |i| (i + 1).min(last));
+        self.closed_state.select(Some(next));
+    }
+
+    /// Move the closed-issues highlight up by one, clamped to the first (#145).
+    pub fn closed_previous(&mut self) {
+        if self.closed_issues.is_empty() {
+            return;
+        }
+        let prev = self
+            .closed_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.closed_state.select(Some(prev));
+    }
+
     /// Whether the new-issue form is currently open.
     pub fn is_creating(&self) -> bool {
         self.mode == Mode::Create
@@ -701,6 +801,14 @@ impl App {
         let previous = self.selected_pr_number();
         self.in_progress_prs = prs;
         self.reselect_pr_output(previous);
+    }
+
+    /// Seed the closed-issues popup and open it (tests only), standing in for the
+    /// `gh issue list --state closed` fetch in [`open_closed`] (#145).
+    #[cfg(test)]
+    pub fn open_closed_with(&mut self, issues: Vec<Issue>) {
+        self.closed_issues = issues;
+        self.present_closed();
     }
 }
 
@@ -1383,5 +1491,77 @@ mod tests {
             app.status.as_deref(),
             Some("Title is required to create an issue.")
         );
+    }
+
+    /// A closed issue JSON with one usage comment worth `credits` AI Credits.
+    fn closed_issue_json(number: u64, credits: &str) -> String {
+        let body = format!("```\\nAI Credits {credits} (1s)\\n```\\n<!-- copilot-loop:usage -->");
+        format!(r#"{{"number":{number},"title":"t{number}","comments":[{{"body":"{body}"}}]}}"#)
+    }
+
+    #[test]
+    fn open_closed_with_selects_the_first_issue() {
+        let mut app = app_with(0);
+        let json = format!("[{}]", closed_issue_json(10, "100"));
+        app.open_closed_with(parse_issues(&json).unwrap());
+        assert!(app.closed_open());
+        assert_eq!(app.closed_state.selected(), Some(0));
+        assert_eq!(app.closed_issues().len(), 1);
+    }
+
+    #[test]
+    fn close_closed_hides_the_popup() {
+        let mut app = app_with(0);
+        app.open_closed_with(parse_issues(&format!("[{}]", closed_issue_json(10, "100"))).unwrap());
+        app.close_closed();
+        assert!(!app.closed_open());
+    }
+
+    #[test]
+    fn closed_navigation_clamps_at_both_ends() {
+        let mut app = app_with(0);
+        let json = format!(
+            "[{},{}]",
+            closed_issue_json(10, "100"),
+            closed_issue_json(11, "50")
+        );
+        app.open_closed_with(parse_issues(&json).unwrap());
+
+        app.closed_previous(); // already at the top
+        assert_eq!(app.closed_state.selected(), Some(0));
+        app.closed_next();
+        assert_eq!(app.closed_state.selected(), Some(1));
+        app.closed_next(); // clamp at the last issue
+        assert_eq!(app.closed_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn closed_navigation_is_safe_when_empty() {
+        let mut app = app_with(0);
+        app.open_closed_with(Vec::new());
+        assert_eq!(app.closed_state.selected(), None);
+        app.closed_next();
+        app.closed_previous();
+        assert_eq!(app.closed_state.selected(), None);
+    }
+
+    #[test]
+    fn closed_total_credits_sums_across_issues() {
+        let mut app = app_with(0);
+        let json = format!(
+            "[{},{}]",
+            closed_issue_json(10, "100"),
+            closed_issue_json(11, "50.5")
+        );
+        app.open_closed_with(parse_issues(&json).unwrap());
+        assert_eq!(app.closed_total_credits(), Some(150.5));
+    }
+
+    #[test]
+    fn closed_total_credits_is_none_without_any_spend() {
+        let mut app = app_with(0);
+        let json = r#"[{"number":10,"title":"t","comments":[{"body":"just a human comment"}]}]"#;
+        app.open_closed_with(parse_issues(json).unwrap());
+        assert_eq!(app.closed_total_credits(), None);
     }
 }
