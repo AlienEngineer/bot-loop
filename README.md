@@ -69,10 +69,12 @@ first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
 authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
 label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
-up. Press `l` to start (or stop) a background `copilot-loop.sh` that works
-through the ready issues; it runs detached — output captured to
-`.copilot-loop/tui/loop.log` — and keeps going after you quit the TUI. The loop
-script is found at the repo root (override with `$COPILOT_LOOP_SCRIPT`).
+up. Press `c` to create a new issue: fill in a title and description, then
+`Ctrl+S` to submit it (no label is added by default). Press `l` to start (or
+stop) a background `copilot-loop.sh` that works through the ready issues; it
+runs detached — output captured to `.copilot-loop/tui/loop.log` — and keeps
+going after you quit the TUI. The loop script is found at the repo root
+(override with `$COPILOT_LOOP_SCRIPT`).
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
@@ -85,9 +87,10 @@ cd tui
 cargo run
 ```
 
-Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `s`/`Enter` start (mark ready),
-`l` start/stop the background loop, `m` pick the model, `r` refresh, `q` (or
-`Esc`) quit.
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
+start (mark ready), `l` start/stop the background loop, `m` pick the model, `r`
+refresh, `q` (or `Esc`) quit. In the new-issue form: `Tab` switches fields, `Enter`
+adds a newline (or moves from title to description), `Ctrl+S` creates, `Esc` cancels.
 
 
 ### Branch and worktree cleanup

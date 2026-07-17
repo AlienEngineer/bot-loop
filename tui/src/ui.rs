@@ -5,10 +5,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::App;
+use crate::app::{App, CreateField};
 use crate::github::Issue;
 
 /// Draw the whole UI: header, issue list (or placeholder), and footer.
@@ -28,6 +28,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // The model picker floats above everything else when open.
     if app.model_picker_open() {
         render_model_picker(frame, frame.area(), app);
+    }
+    if app.is_creating() {
+        render_create_form(frame, app);
     }
 }
 
@@ -104,7 +107,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         "l start-loop"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · s ready · {loop_key} · m models · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · s ready · {loop_key} · m models · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -115,7 +118,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
 /// behind it does not show through.
 fn render_model_picker(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = (app.models.len() as u16 + 2).min(area.height.max(3));
-    let popup = centered_rect(area, 40, height);
+    let popup = centered_popup(area, 40, height);
 
     let items: Vec<ListItem> = app
         .models
@@ -144,7 +147,7 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// A rectangle of `width` columns and `height` rows centered within `area`,
 /// clamped to fit. `width` is a percentage of `area`'s width.
-fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
+fn centered_popup(area: Rect, width_pct: u16, height: u16) -> Rect {
     let [row] = Layout::vertical([Constraint::Length(height.min(area.height))])
         .flex(Flex::Center)
         .areas(area);
@@ -152,6 +155,87 @@ fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     col
+}
+
+/// Draw the modal new-issue form centered over the list.
+fn render_create_form(frame: &mut Frame, app: &App) {
+    let area = centered_rect(70, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" New Issue ")
+        .title_alignment(Alignment::Center)
+        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let [title_area, desc_area, help_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let field = app.form.field;
+    frame.render_widget(
+        field_widget("Title", &app.form.title, field == CreateField::Title),
+        title_area,
+    );
+    frame.render_widget(
+        field_widget(
+            "Description",
+            &app.form.description,
+            field == CreateField::Description,
+        ),
+        desc_area,
+    );
+
+    let help = Paragraph::new(Line::from(Span::styled(
+        "Tab switch · Enter newline/next · Ctrl+S create · Esc cancel",
+        Style::new().fg(Color::DarkGray),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(help, help_area);
+}
+
+/// A bordered text field for the create form; the focused one is highlighted
+/// and shows a trailing cursor.
+fn field_widget(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
+    let border_style = if focused {
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
+    let text = if focused {
+        format!("{value}▏")
+    } else {
+        value.to_string()
+    };
+    Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {label} "))
+                .border_style(border_style),
+        )
+        .wrap(Wrap { trim: false })
+}
+
+/// A rectangle centered within `area`, sized to the given width/height percent.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(vertical[1])[1]
 }
 
 /// Format a single issue as a list row: number, title, and labels.
@@ -280,5 +364,24 @@ mod tests {
         assert!(text.contains("Select model"));
         assert!(text.contains(first_model.as_str()));
         assert!(text.contains("Enter select"));
+    }
+
+    #[test]
+    fn renders_the_create_form_overlay() {
+        let mut app = App::new(Vec::new());
+        app.open_create();
+        for c in "Bug".chars() {
+            app.form_input(c);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("New Issue"));
+        assert!(text.contains("Title"));
+        assert!(text.contains("Description"));
+        assert!(text.contains("Bug"));
+        assert!(text.contains("Ctrl+S create"));
     }
 }
