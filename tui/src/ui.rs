@@ -37,6 +37,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(number) = app.close_confirm() {
         render_close_confirm(frame, frame.area(), app, number);
     }
+    // The PR-output popup floats on top of everything else when open (#143).
+    if app.pr_output_open() {
+        render_pr_output(frame, frame.area(), app);
+    }
 }
 
 /// Braille spinner frames used to signal the loop is alive (#115).
@@ -271,7 +275,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         "l start-loop"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · s ready · x close · {loop_key} · m models · o output · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · s ready · x close · {loop_key} · m models · o output · p pr-output · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -346,6 +350,107 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(body, popup);
+}
+
+/// Draw the PR-output popup: a centered modal listing the pull requests the loop
+/// is resolving, with the selected PR's live transcript beside it, so the user
+/// can watch a PR being worked even though PRs are absent from the issue list.
+/// Handles several PRs at once via the navigable list (#143). A [`Clear`]
+/// underneath wipes the cells so the list behind it does not show through.
+fn render_pr_output(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" Resolving PRs ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k move · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    // With no PR in flight there is nothing to show, so say so plainly.
+    if app.in_progress_prs().is_empty() {
+        let body = Paragraph::new("No PRs are being resolved.")
+            .block(outer)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(body, popup);
+        return;
+    }
+
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let [list_area, log_area] =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(inner);
+
+    // Collect owned data first so the immutable borrows of `app` end before the
+    // list needs a mutable borrow of its selection state.
+    let items: Vec<ListItem> = app
+        .in_progress_prs()
+        .iter()
+        .map(|pr| ListItem::new(Line::from(format!("#{} {}", pr.number, pr.title))))
+        .collect();
+    let selected_number = app
+        .pr_output_state
+        .selected()
+        .and_then(|i| app.in_progress_prs().get(i))
+        .map(|pr| pr.number);
+    let selected_output = app.selected_pr_output(OUTPUT_TAIL_BYTES);
+
+    render_pr_output_log(frame, log_area, selected_number, selected_output);
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" PRs "))
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, list_area, &mut app.pr_output_state);
+}
+
+/// Draw the transcript pane of the PR-output popup, following the bottom like
+/// `tail -f` so the newest output stays on screen, or a placeholder when the
+/// selected PR has produced no log yet (#143).
+fn render_pr_output_log(
+    frame: &mut Frame,
+    area: Rect,
+    number: Option<u64>,
+    output: Option<(u64, String)>,
+) {
+    let title = match number {
+        Some(n) => format!(" Output · PR #{n} "),
+        None => " Output ".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    match output {
+        Some((_number, text)) => {
+            let inner_height = area.height.saturating_sub(2) as usize;
+            let body: Vec<Line> = logs::last_lines(&text, inner_height)
+                .into_iter()
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            frame.render_widget(Paragraph::new(body).block(block), area);
+        }
+        None => {
+            let msg = match number {
+                Some(n) => format!("No output yet for PR #{n}."),
+                None => "No PR selected.".to_string(),
+            };
+            frame.render_widget(
+                Paragraph::new(msg)
+                    .block(block)
+                    .alignment(Alignment::Center)
+                    .style(Style::new().fg(Color::DarkGray)),
+                area,
+            );
+        }
+    }
 }
 
 /// A rectangle of `width` columns and `height` rows centered within `area`,
@@ -768,6 +873,65 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("No loop output yet for #42."));
+    }
+
+    #[test]
+    fn footer_advertises_the_pr_output_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("p pr-output"));
+    }
+
+    #[test]
+    fn renders_the_pr_output_popup_with_the_selected_log() {
+        let dir = std::env::temp_dir().join(format!("copilot-ui-proutput-{}", std::process::id()));
+        let logs = dir.join(".copilot-loop").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("pr-12-20260101-000000.log"),
+            "\x1b[32mresolving the conflict\x1b[0m\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+        app.set_in_progress_prs(
+            crate::github::parse_pull_requests(
+                r#"[{"number":12,"title":"resolve conflicts"},{"number":15,"title":"fix checks"}]"#,
+            )
+            .unwrap(),
+        );
+        app.open_pr_output();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Resolving PRs"));
+        // Both in-flight PRs are listed so multiple resolutions are visible.
+        assert!(text.contains("#12"));
+        assert!(text.contains("#15"));
+        // The selected PR's transcript shows, with ANSI colour codes stripped.
+        assert!(text.contains("resolving the conflict"));
+        assert!(!text.contains("[32m"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pr_output_popup_reports_when_no_prs_are_resolving() {
+        let mut app = App::new(Vec::new());
+        app.open_pr_output();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("No PRs are being resolved."));
     }
 
     #[test]

@@ -88,7 +88,10 @@ their row — appear as the loop claims them, without a manual refresh (#115). T
 loop also works pull requests (resolving merge conflicts and fixing failing
 checks); since PRs are not in the issue list, the header calls that out with its
 own spinner and a `resolving PR #12` note, and the status line announces each PR
-the loop starts, so it is always clear the loop is busy on a PR (#133).
+the loop starts, so it is always clear the loop is busy on a PR (#133). Press `p`
+to open a popup that lists the PRs being resolved and tails the selected one's
+transcript (its `.copilot-loop/logs/pr-<n>-…log`); when several resolve at once,
+`j`/`k` switch between them, and `Esc` (or `p`/`q`) closes it (#143).
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
@@ -104,7 +107,8 @@ cargo run
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
 start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
 the background loop, `m` pick the model, `o`
-show/hide the output panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue
+show/hide the output panel, `p` show the resolving-PRs popup, `r` refresh, `q` (or
+`Esc`) quit. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
 
