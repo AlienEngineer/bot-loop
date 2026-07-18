@@ -83,7 +83,10 @@ quit the TUI. The loop script is found at the repo root
 (override with `$COPILOT_LOOP_SCRIPT`). Press `o` to open a side panel on the
 right that tails the running loop's output for the selected issue (its
 `.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
-to close it.
+to close it. That log holds the loop's own narration — branch creation, "running
+copilot", the PR push — interleaved with Copilot's transcript, so the panel shows
+the whole run just as the bash loop prints it to the terminal, not only Copilot's
+output (#126).
 
 While workers run the header shows a turning spinner next to `loop: running`,
 how many workers are running, and the issues they are working (`working #96, #97`,
