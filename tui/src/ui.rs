@@ -46,6 +46,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.closed_open() {
         render_closed(frame, frame.area(), app);
     }
+    // The issue-details popup floats on top of everything else when open (#152).
+    if app.details_open() {
+        render_details(frame, frame.area(), app);
+    }
 }
 
 /// Braille spinner frames used to signal the loop is alive (#115).
@@ -288,7 +292,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         "s ready"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · d details · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -549,6 +553,180 @@ fn render_closed(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, popup, &mut app.closed_state);
+}
+
+/// Build the details popup's content as logical (pre-wrap) lines, each paired
+/// with the style it renders in: the issue title, a meta line (number, author,
+/// labels), the body, then the comment thread. Pure so the content is
+/// unit-testable without a terminal (#152).
+fn detail_content(issue: &Issue) -> Vec<(String, Style)> {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines: Vec<(String, Style)> = Vec::new();
+
+    lines.push((issue.title.clone(), bold.fg(Color::White)));
+
+    let mut meta = format!("#{}", issue.number);
+    let author = issue.author_login();
+    if !author.is_empty() {
+        meta.push_str(&format!(" · @{author}"));
+    }
+    let labels = issue.label_names();
+    if !labels.is_empty() {
+        meta.push_str(&format!(" · [{}]", labels.join(", ")));
+    }
+    lines.push((meta, dim));
+    lines.push((String::new(), dim));
+
+    if issue.body.trim().is_empty() {
+        lines.push(("(no description)".to_string(), dim));
+    } else {
+        for line in issue.body.lines() {
+            lines.push((line.to_string(), Style::new()));
+        }
+    }
+
+    lines.push((String::new(), dim));
+    lines.push((
+        format!("Comments ({})", issue.comments.len()),
+        bold.fg(Color::Cyan),
+    ));
+
+    if issue.comments.is_empty() {
+        lines.push(("(no comments)".to_string(), dim));
+    } else {
+        for comment in &issue.comments {
+            lines.push((String::new(), dim));
+            lines.push((comment_heading(comment), bold.fg(Color::Green)));
+            for line in comment.body.lines() {
+                lines.push((line.to_string(), Style::new()));
+            }
+        }
+    }
+
+    lines
+}
+
+/// A comment's heading line for the details popup: `@author` plus the date it
+/// was posted when known. Falls back to `unknown` when no author is recorded and
+/// omits the date when `gh` did not return one. Pure for testing (#152).
+fn comment_heading(comment: &crate::github::Comment) -> String {
+    let who = match comment.author_login() {
+        "" => "unknown",
+        login => login,
+    };
+    match comment_date(&comment.created_at) {
+        Some(date) => format!("@{who} · {date}"),
+        None => format!("@{who}"),
+    }
+}
+
+/// The calendar-day portion (`YYYY-MM-DD`) of a comment's ISO-8601 `createdAt`
+/// timestamp, or `None` when it is empty or not a `YYYY-MM-DD`-shaped date. Pure
+/// for testing.
+fn comment_date(created_at: &str) -> Option<String> {
+    let day = created_at.split('T').next().unwrap_or("");
+    let is_iso_day = day.len() == 10
+        && day.chars().enumerate().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            _ => c.is_ascii_digit(),
+        });
+    is_iso_day.then(|| day.to_string())
+}
+
+/// Word-wrap a single logical line to `width` columns, never panicking and
+/// always yielding at least one (possibly empty) line so blank lines survive.
+/// Over-long words are hard-split so they cannot overflow the popup. Pure for
+/// testing (#152).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        if word.chars().count() > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            current = chunk;
+            continue;
+        }
+
+        let sep = usize::from(!current.is_empty());
+        if current.chars().count() + sep + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        } else if sep == 1 {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    lines.push(current);
+    lines
+}
+
+/// Wrap the styled logical lines to `width` columns, producing the ratatui lines
+/// the details popup renders. Each wrapped fragment keeps its logical line's
+/// style. Pure for testing (#152).
+fn wrap_styled(content: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (text, style) in content {
+        for fragment in wrap_text(text, width) {
+            out.push(Line::from(Span::styled(fragment, *style)));
+        }
+    }
+    out
+}
+
+/// Draw the issue-details popup: a centered, scrollable modal showing the
+/// selected issue's title, metadata, body, and full comment thread, so the whole
+/// issue — comments included — is readable without leaving the TUI. Content is
+/// word-wrapped to the popup width and vertically scrollable, and the scroll is
+/// clamped to the last page so it can never run past the end. A [`Clear`]
+/// underneath wipes the cells so the list behind it does not show through (#152).
+fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let (number, content) = match app.details() {
+        Some(issue) => (issue.number, detail_content(issue)),
+        None => (
+            0,
+            vec![(
+                "No issue selected.".to_string(),
+                Style::new().fg(Color::DarkGray),
+            )],
+        ),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Issue #{number} "))
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k scroll · g/G top/bottom · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    let inner = block.inner(popup);
+    let lines = wrap_styled(&content, inner.width as usize);
+
+    // Clamp so the furthest scroll lands the last line at the bottom of the pane.
+    let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+    app.clamp_details_scroll(max_scroll);
+
+    let body = Paragraph::new(lines)
+        .block(block)
+        .scroll((app.details_scroll(), 0));
+    frame.render_widget(body, popup);
 }
 
 /// A rectangle of `width` columns and `height` rows centered within `area`,
@@ -1145,5 +1323,99 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("No closed issues."));
+    }
+
+    #[test]
+    fn footer_advertises_the_details_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("d details"));
+    }
+
+    #[test]
+    fn detail_content_includes_the_body_and_comments() {
+        let issue = crate::github::parse_issue(
+            r#"{"number":152,"title":"see details","body":"line one\nline two",
+                "labels":[{"name":"ready"}],"author":{"login":"octocat"},
+                "comments":[{"author":{"login":"hubot"},"body":"a reply",
+                             "createdAt":"2026-07-18T06:45:11Z"}]}"#,
+        )
+        .unwrap();
+        let text: Vec<String> = detail_content(&issue)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+
+        assert!(text.contains(&"see details".to_string()));
+        assert!(
+            text.iter()
+                .any(|l| l.contains("#152") && l.contains("@octocat"))
+        );
+        assert!(text.contains(&"line one".to_string()));
+        assert!(text.contains(&"line two".to_string()));
+        assert!(text.contains(&"Comments (1)".to_string()));
+        assert!(text.contains(&"@hubot · 2026-07-18".to_string()));
+        assert!(text.contains(&"a reply".to_string()));
+    }
+
+    #[test]
+    fn detail_content_notes_an_empty_body_and_no_comments() {
+        let issue = crate::github::parse_issue(r#"{"number":1,"title":"bare"}"#).unwrap();
+        let text: Vec<String> = detail_content(&issue)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+
+        assert!(text.contains(&"(no description)".to_string()));
+        assert!(text.contains(&"Comments (0)".to_string()));
+        assert!(text.contains(&"(no comments)".to_string()));
+    }
+
+    #[test]
+    fn comment_date_takes_the_calendar_day_only() {
+        assert_eq!(
+            comment_date("2026-07-18T06:45:11Z").as_deref(),
+            Some("2026-07-18")
+        );
+        assert_eq!(comment_date(""), None);
+        assert_eq!(comment_date("not-a-date"), None);
+    }
+
+    #[test]
+    fn wrap_text_wraps_on_word_boundaries_and_keeps_blank_lines() {
+        assert_eq!(wrap_text("hello world foo", 11), vec!["hello world", "foo"]);
+        // A blank logical line survives as one empty rendered line.
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
+        // An over-long word is hard-split so it cannot overflow the popup.
+        assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn renders_the_details_popup_with_body_and_comments() {
+        let issue = crate::github::parse_issue(
+            r#"{"number":152,"title":"see details","body":"the description",
+                "author":{"login":"octocat"},
+                "comments":[{"author":{"login":"hubot"},"body":"a reply",
+                             "createdAt":"2026-07-18T06:45:11Z"}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(Vec::new());
+        app.open_details_with(issue);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Issue #152"));
+        assert!(text.contains("see details"));
+        assert!(text.contains("the description"));
+        assert!(text.contains("Comments (1)"));
+        assert!(text.contains("hubot"));
+        assert!(text.contains("a reply"));
     }
 }

@@ -17,13 +17,25 @@ pub struct Author {
     pub login: String,
 }
 
-/// A comment on an issue. Only the body is modelled; the TUI reads the loop's
-/// per-run cost out of it (the `AI Credits` line in a usage comment) so a closed
-/// issue's total spend can be shown (#145).
+/// A comment on an issue. The TUI reads the loop's per-run cost out of the body
+/// (the `AI Credits` line in a usage comment) so a closed issue's total spend
+/// can be shown (#145), and the details popup shows each comment's author, date,
+/// and body so the whole conversation is readable in the TUI (#152).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Comment {
     #[serde(default)]
+    pub author: Option<Author>,
+    #[serde(default)]
     pub body: String,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: String,
+}
+
+impl Comment {
+    /// The comment author's login, or an empty string when unknown.
+    pub fn author_login(&self) -> &str {
+        self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
+    }
 }
 
 /// A single GitHub issue, mapped from `gh issue list --json ...`.
@@ -35,9 +47,15 @@ pub struct Issue {
     pub labels: Vec<Label>,
     #[serde(default)]
     pub author: Option<Author>,
-    /// The issue's comments, requested only for the closed-issue view so each
-    /// row's AI Credits spend can be totalled. Empty for the open list, which
-    /// does not request comments (#145).
+    /// The issue's body (description). Requested for the details popup so the
+    /// full issue text is readable in the TUI; empty for the list views, which
+    /// do not request it (#152).
+    #[serde(default)]
+    pub body: String,
+    /// The issue's comments, requested for the closed-issue view so each row's
+    /// AI Credits spend can be totalled (#145) and for the details popup so the
+    /// conversation is readable (#152). Empty for the open list, which does not
+    /// request comments.
     #[serde(default)]
     pub comments: Vec<Comment>,
 }
@@ -125,6 +143,11 @@ const GH_JSON_FIELDS: &str = "number,title,labels,author";
 /// its comments, so the loop's per-run cost can be totalled per issue (#145).
 const GH_CLOSED_JSON_FIELDS: &str = "number,title,labels,author,comments";
 
+/// The `gh` JSON fields requested for a single issue's details view: the issue
+/// fields plus its body and comments, so the whole issue is readable in the TUI
+/// (#152).
+const GH_DETAILS_JSON_FIELDS: &str = "number,title,body,labels,author,comments";
+
 /// The `gh` JSON fields requested for each in-progress pull request.
 const GH_PR_JSON_FIELDS: &str = "number,title";
 
@@ -157,6 +180,11 @@ pub fn ready_label() -> String {
 /// Parse the JSON array produced by `gh issue list --json ...`.
 pub fn parse_issues(json: &str) -> Result<Vec<Issue>> {
     serde_json::from_str(json).context("failed to parse `gh issue list` JSON output")
+}
+
+/// Parse the single JSON object produced by `gh issue view --json ...` (#152).
+pub fn parse_issue(json: &str) -> Result<Issue> {
+    serde_json::from_str(json).context("failed to parse `gh issue view` JSON output")
 }
 
 /// Fetch open issues for the current repository using the `gh` CLI.
@@ -220,6 +248,35 @@ pub fn fetch_closed_issues(limit: u32) -> Result<Vec<Issue>> {
     }
 
     parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Fetch a single issue's full details — its body and comments — for the details
+/// popup, so the whole issue is readable in the TUI (#152).
+///
+/// Runs `gh issue view <number> --json ...` and parses the single JSON object it
+/// prints. Returns an error when `gh` is missing, not authenticated, the issue
+/// does not exist, or the command otherwise fails.
+pub fn fetch_issue_details(number: u64) -> Result<Issue> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "view",
+            &number.to_string(),
+            "--json",
+            GH_DETAILS_JSON_FIELDS,
+        ])
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue view` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    parse_issue(&String::from_utf8_lossy(&output.stdout))
 }
 pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
     serde_json::from_str(json).context("failed to parse `gh pr list` JSON output")
@@ -461,6 +518,31 @@ mod tests {
     #[test]
     fn reports_invalid_json() {
         assert!(parse_issues("not json").is_err());
+    }
+
+    #[test]
+    fn parses_a_single_issue_with_body_and_comments() {
+        let json = r#"{"number":152,"title":"see details","body":"the description",
+            "labels":[{"name":"ready"}],"author":{"login":"octocat"},
+            "comments":[{"author":{"login":"hubot"},"body":"first comment",
+                         "createdAt":"2026-07-18T06:45:11Z"}]}"#;
+        let issue = parse_issue(json).expect("should parse");
+        assert_eq!(issue.number, 152);
+        assert_eq!(issue.body, "the description");
+        assert_eq!(issue.comments.len(), 1);
+        assert_eq!(issue.comments[0].author_login(), "hubot");
+        assert_eq!(issue.comments[0].body, "first comment");
+        assert_eq!(issue.comments[0].created_at, "2026-07-18T06:45:11Z");
+    }
+
+    #[test]
+    fn details_tolerate_missing_body_and_comment_author() {
+        // `gh` omits an empty body, and a comment may lack an author.
+        let json = r#"{"number":1,"title":"bare","comments":[{"body":"hi"}]}"#;
+        let issue = parse_issue(json).expect("should parse");
+        assert_eq!(issue.body, "");
+        assert_eq!(issue.comments[0].author_login(), "");
+        assert_eq!(issue.comments[0].created_at, "");
     }
 
     #[test]

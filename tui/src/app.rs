@@ -116,6 +116,14 @@ pub struct App {
     closed_issues: Vec<Issue>,
     /// Selection within the closed-issues popup (#145).
     pub closed_state: ListState,
+    /// Whether the issue-details popup is open (#152).
+    details_open: bool,
+    /// The issue shown in the details popup, fetched with its body and comments
+    /// so the whole issue is readable in the TUI (#152). `None` until opened.
+    details: Option<Issue>,
+    /// Vertical scroll offset (in rendered lines) of the details popup, so long
+    /// issues and comment threads can be read top to bottom (#152).
+    details_scroll: u16,
     /// Background fetcher that runs the `gh` issue/PR queries off the UI thread
     /// so the periodic auto-refresh never freezes input or redraws (#144).
     /// `None` when no worker is attached (unit tests, or before wiring).
@@ -157,6 +165,9 @@ impl App {
             closed_open: false,
             closed_issues: Vec::new(),
             closed_state: ListState::default(),
+            details_open: false,
+            details: None,
+            details_scroll: 0,
             fetcher: None,
         }
     }
@@ -766,6 +777,88 @@ impl App {
         self.closed_state.select(Some(prev));
     }
 
+    /// Whether the issue-details popup is open (#152).
+    pub fn details_open(&self) -> bool {
+        self.details_open
+    }
+
+    /// The issue whose details are being shown, if any (#152).
+    pub fn details(&self) -> Option<&Issue> {
+        self.details.as_ref()
+    }
+
+    /// The details popup's current scroll offset, in rendered lines (#152).
+    pub fn details_scroll(&self) -> u16 {
+        self.details_scroll
+    }
+
+    /// Present a fetched issue in the details popup: store it, reset the scroll
+    /// to the top, and mark the popup open. Shared by [`open_details`] and the
+    /// test seam so both present the issue the same way (#152).
+    fn present_details(&mut self, issue: Issue) {
+        self.details = Some(issue);
+        self.details_scroll = 0;
+        self.details_open = true;
+    }
+
+    /// Open the details popup for the selected issue, fetching its body and
+    /// comments so the whole issue is readable in the TUI (#152).
+    ///
+    /// The fetch is synchronous, matching the other `gh`-backed actions (e.g.
+    /// [`open_closed`]). On failure the popup is left closed and the error is put
+    /// on the status line rather than opening an empty popup. A no-op when no
+    /// issue is selected.
+    pub fn open_details(&mut self) {
+        let Some(number) = self.selected().map(|issue| issue.number) else {
+            return;
+        };
+        match github::fetch_issue_details(number) {
+            Ok(issue) => {
+                self.status = None;
+                self.present_details(issue);
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// Close the details popup, dropping the fetched issue (#152).
+    pub fn close_details(&mut self) {
+        self.details_open = false;
+        self.details = None;
+        self.details_scroll = 0;
+    }
+
+    /// Scroll the details popup down by one line. The offset is clamped against
+    /// the content on render, so this only ever grows it (#152).
+    pub fn details_scroll_down(&mut self) {
+        self.details_scroll = self.details_scroll.saturating_add(1);
+    }
+
+    /// Scroll the details popup up by one line, stopping at the top (#152).
+    pub fn details_scroll_up(&mut self) {
+        self.details_scroll = self.details_scroll.saturating_sub(1);
+    }
+
+    /// Jump the details popup to the top (#152).
+    pub fn details_scroll_top(&mut self) {
+        self.details_scroll = 0;
+    }
+
+    /// Jump the details popup to the bottom. The offset is clamped to the last
+    /// page on render, so a max value lands on the final lines (#152).
+    pub fn details_scroll_bottom(&mut self) {
+        self.details_scroll = u16::MAX;
+    }
+
+    /// Clamp the details scroll offset to `max`, called from render once the
+    /// content's wrapped height and the viewport are known so the popup can
+    /// never scroll past its last line (#152).
+    pub fn clamp_details_scroll(&mut self, max: u16) {
+        if self.details_scroll > max {
+            self.details_scroll = max;
+        }
+    }
+
     /// Whether the new-issue form is currently open.
     pub fn is_creating(&self) -> bool {
         self.mode == Mode::Create
@@ -891,6 +984,13 @@ impl App {
     pub fn open_closed_with(&mut self, issues: Vec<Issue>) {
         self.closed_issues = issues;
         self.present_closed();
+    }
+
+    /// Seed the details popup with an issue and open it (tests only), standing in
+    /// for the `gh issue view` fetch in [`open_details`] (#152).
+    #[cfg(test)]
+    pub fn open_details_with(&mut self, issue: Issue) {
+        self.present_details(issue);
     }
 }
 
@@ -1705,5 +1805,71 @@ mod tests {
         let json = r#"[{"number":10,"title":"t","comments":[{"body":"just a human comment"}]}]"#;
         app.open_closed_with(parse_issues(json).unwrap());
         assert_eq!(app.closed_total_credits(), None);
+    }
+
+    /// A single-issue JSON with a body and one comment, standing in for a
+    /// `gh issue view` fetch (#152).
+    fn detail_issue_json(number: u64) -> String {
+        format!(
+            r#"{{"number":{number},"title":"t{number}","body":"the description",
+                "comments":[{{"author":{{"login":"hubot"}},"body":"a comment",
+                             "createdAt":"2026-07-18T06:45:11Z"}}]}}"#
+        )
+    }
+
+    fn detail_issue(number: u64) -> Issue {
+        crate::github::parse_issue(&detail_issue_json(number)).unwrap()
+    }
+
+    #[test]
+    fn open_details_with_shows_the_issue_at_the_top() {
+        let mut app = app_with(2);
+        app.details_scroll = 9; // ensure the scroll is reset on open
+        app.open_details_with(detail_issue(10));
+        assert!(app.details_open());
+        assert_eq!(app.details_scroll(), 0);
+        let shown = app.details().expect("an issue is shown");
+        assert_eq!(shown.number, 10);
+        assert_eq!(shown.body, "the description");
+        assert_eq!(shown.comments.len(), 1);
+    }
+
+    #[test]
+    fn close_details_hides_the_popup_and_drops_the_issue() {
+        let mut app = app_with(2);
+        app.open_details_with(detail_issue(10));
+        app.close_details();
+        assert!(!app.details_open());
+        assert!(app.details().is_none());
+        assert_eq!(app.details_scroll(), 0);
+    }
+
+    #[test]
+    fn details_scroll_moves_and_clamps_at_the_top() {
+        let mut app = app_with(1);
+        app.open_details_with(detail_issue(10));
+
+        app.details_scroll_up(); // already at the top
+        assert_eq!(app.details_scroll(), 0);
+        app.details_scroll_down();
+        app.details_scroll_down();
+        assert_eq!(app.details_scroll(), 2);
+        app.details_scroll_up();
+        assert_eq!(app.details_scroll(), 1);
+        app.details_scroll_top();
+        assert_eq!(app.details_scroll(), 0);
+    }
+
+    #[test]
+    fn clamp_details_scroll_caps_at_the_content_height() {
+        let mut app = app_with(1);
+        app.open_details_with(detail_issue(10));
+        app.details_scroll_bottom();
+        assert_eq!(app.details_scroll(), u16::MAX);
+        app.clamp_details_scroll(4);
+        assert_eq!(app.details_scroll(), 4);
+        // A larger max leaves an already-in-range offset untouched.
+        app.clamp_details_scroll(10);
+        assert_eq!(app.details_scroll(), 4);
     }
 }

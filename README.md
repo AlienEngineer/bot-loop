@@ -114,13 +114,19 @@ with the grand total in the popup's title; issues closed by hand — with no
 recorded spend — show a `—`. Navigate with `j`/`k`; `Esc` (or `t`/`q`) closes it
 (#145).
 
+Press `d` to open a popup with the selected issue's full details — its title,
+number, author, labels, description, and the whole comment thread (each comment's
+author, date, and body) — so an issue can be read without leaving the TUI. The
+content is fetched fresh with `gh issue view`; scroll it with `j`/`k` (`g`/`G`
+jump to top/bottom) and `Esc` (or `d`/`q`) closes it (#152).
+
 ```sh
 cd tui
 cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-toggle the ready label (mark ready, or remove it if already ready), `x` close the selected issue (confirm with `y`), `l` start/stop
+toggle the ready label (mark ready, or remove it if already ready), `x` close the selected issue (confirm with `y`), `d` view the selected issue's details and comments, `l` start/stop
 the background loop, `m` pick the model, `o`
 show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
 issues and their cost, `r` refresh, `q` (or
