@@ -95,6 +95,8 @@ pub struct App {
     /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
     /// can announce when the loop *starts* a new issue (#119).
     known_in_progress: Vec<u64>,
+    /// Whether the next loop start enables GitHub auto-merge on each PR (#135).
+    auto_merge: bool,
     /// Monotonic id for the next worker, so each gets its own capture log
     /// (`loop-<id>.log`) even as workers come and go (#134).
     next_worker_id: usize,
@@ -157,6 +159,7 @@ impl App {
             show_output: false,
             close_confirm: None,
             known_in_progress: Vec::new(),
+            auto_merge: false,
             next_worker_id: 1,
             in_progress_prs: Vec::new(),
             known_in_progress_prs: Vec::new(),
@@ -442,7 +445,10 @@ impl App {
         let was_idle = !self.runner.is_running();
         let log = runner::log_path(&repo, self.next_worker_id);
         let model = self.selected_model().map(str::to_owned);
-        match self.runner.start(&script, &repo, &log, model.as_deref()) {
+        match self
+            .runner
+            .start(&script, &repo, &log, model.as_deref(), self.auto_merge)
+        {
             Ok(pid) => {
                 self.next_worker_id += 1;
                 if was_idle {
@@ -450,8 +456,9 @@ impl App {
                 }
                 let count = self.runner.running_count();
                 self.status = Some(format!(
-                    "Worker started (pid {pid}, model {}). {count} running. Log: {}",
+                    "Worker started (pid {pid}, model {}, auto-merge {}). {count} running. Log: {}",
                     self.current_model_label(),
+                    if self.auto_merge { "on" } else { "off" },
                     log.display()
                 ));
             }
@@ -514,6 +521,26 @@ impl App {
     /// A human label for the current model: the id, or `auto` when unset.
     pub fn current_model_label(&self) -> &str {
         self.selected_model.as_deref().unwrap_or(models::AUTO_MODEL)
+    }
+
+    /// Whether the loop will be started with GitHub auto-merge enabled (#135).
+    pub fn auto_merge(&self) -> bool {
+        self.auto_merge
+    }
+
+    /// Toggle whether the loop auto-merges each PR (#135).
+    ///
+    /// Like the model, the setting is read when the loop is *started*, so a
+    /// running loop keeps its behaviour and the status line says the change
+    /// applies on the next start.
+    pub fn toggle_auto_merge(&mut self) {
+        self.auto_merge = !self.auto_merge;
+        let state = if self.auto_merge { "on" } else { "off" };
+        self.status = Some(if self.runner.is_running() {
+            format!("Auto-merge {state} (applies when the loop restarts).")
+        } else {
+            format!("Auto-merge {state}.")
+        });
     }
 
     /// Open the model picker, highlighting the currently selected model.
@@ -1508,6 +1535,20 @@ mod tests {
         assert!(!app.model_picker_open());
         // Cancelled without confirming: still auto.
         assert_eq!(app.selected_model(), None);
+    }
+
+    #[test]
+    fn auto_merge_defaults_off_and_toggles() {
+        let mut app = app_with(0);
+        assert!(!app.auto_merge());
+
+        app.toggle_auto_merge();
+        assert!(app.auto_merge());
+        assert_eq!(app.status.as_deref(), Some("Auto-merge on."));
+
+        app.toggle_auto_merge();
+        assert!(!app.auto_merge());
+        assert_eq!(app.status.as_deref(), Some("Auto-merge off."));
     }
 
     #[test]

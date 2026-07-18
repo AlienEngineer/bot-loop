@@ -142,6 +142,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') => app.request_close(),
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
+        KeyCode::Char('a') => app.toggle_auto_merge(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),

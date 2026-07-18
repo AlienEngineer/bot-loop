@@ -40,8 +40,10 @@ pub fn loop_script_candidates(env_override: Option<String>, repo_root: &Path) ->
 /// point it at the repo and keep its log to clean status lines (the full Copilot
 /// transcript still lands under `<repo>/.copilot-loop/logs/`). When a `model` is
 /// given it is forwarded as `--model` so the loop runs on the user's choice;
-/// `None` (auto) leaves it off so Copilot picks. Pure for testing.
-pub fn loop_args(repo_dir: &Path, model: Option<&str>) -> Vec<String> {
+/// `None` (auto) leaves it off so Copilot picks. When `auto_merge` is set,
+/// `--auto-merge` is forwarded so each PR merges without manual review (#135).
+/// Pure for testing.
+pub fn loop_args(repo_dir: &Path, model: Option<&str>, auto_merge: bool) -> Vec<String> {
     let mut args = vec![
         "--repo-dir".to_string(),
         repo_dir.display().to_string(),
@@ -50,6 +52,9 @@ pub fn loop_args(repo_dir: &Path, model: Option<&str>) -> Vec<String> {
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+    if auto_merge {
+        args.push("--auto-merge".to_string());
     }
     args
 }
@@ -128,8 +133,9 @@ impl LoopRunner {
     }
 
     /// Start another worker against `repo_dir`, capturing output to `log` and
-    /// running on `model` (`None` = auto). Errors when the process cannot be
-    /// spawned. Returns the new process id.
+    /// running on `model` (`None` = auto). When `auto_merge` is set the loop is
+    /// told to merge each PR automatically (`--auto-merge`, #135). Errors when the
+    /// process cannot be spawned. Returns the new process id.
     ///
     /// Unlike a single-loop model, this never refuses because one is already
     /// running: the loop keeps workers on different issues, so more can be added
@@ -140,8 +146,9 @@ impl LoopRunner {
         repo_dir: &Path,
         log: &Path,
         model: Option<&str>,
+        auto_merge: bool,
     ) -> Result<u32> {
-        let child = spawn_detached(script, &loop_args(repo_dir, model), log)?;
+        let child = spawn_detached(script, &loop_args(repo_dir, model, auto_merge), log)?;
         let pid = child.id();
         self.workers.push(child);
         Ok(pid)
@@ -260,7 +267,7 @@ mod tests {
     #[test]
     fn loop_args_target_repo_and_quiet() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), None),
+            loop_args(Path::new("/work/repo"), None, false),
             vec!["--repo-dir", "/work/repo", "--quiet"]
         );
     }
@@ -268,7 +275,7 @@ mod tests {
     #[test]
     fn loop_args_forward_the_model_when_set() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), Some("gpt-5.4")),
+            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), false),
             vec!["--repo-dir", "/work/repo", "--quiet", "--model", "gpt-5.4"]
         );
     }
@@ -276,8 +283,31 @@ mod tests {
     #[test]
     fn loop_args_skip_blank_models() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), Some("   ")),
+            loop_args(Path::new("/work/repo"), Some("   "), false),
             vec!["--repo-dir", "/work/repo", "--quiet"]
+        );
+    }
+
+    #[test]
+    fn loop_args_forward_auto_merge_when_set() {
+        assert_eq!(
+            loop_args(Path::new("/work/repo"), None, true),
+            vec!["--repo-dir", "/work/repo", "--quiet", "--auto-merge"]
+        );
+    }
+
+    #[test]
+    fn loop_args_combine_model_and_auto_merge() {
+        assert_eq!(
+            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), true),
+            vec![
+                "--repo-dir",
+                "/work/repo",
+                "--quiet",
+                "--model",
+                "gpt-5.4",
+                "--auto-merge"
+            ]
         );
     }
 
@@ -340,7 +370,7 @@ mod tests {
     #[cfg(unix)]
     fn start_worker(runner: &mut LoopRunner, script: &Path, dir: &Path, log: &Path) -> u32 {
         for attempt in 1..=50 {
-            match runner.start(script, dir, log, None) {
+            match runner.start(script, dir, log, None, false) {
                 Ok(pid) => return pid,
                 Err(err) if attempt < 50 && is_text_file_busy(&err) => {
                     std::thread::sleep(Duration::from_millis(20));
