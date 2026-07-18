@@ -1,9 +1,12 @@
 //! Background `copilot-loop.sh` process management for the TUI.
 //!
-//! Lets the TUI start a loop that works through ready issues while the user
-//! keeps browsing, mirroring the bash TUI's detached-bot model: the loop runs
-//! in its own process group with its output captured to a log, and it keeps
-//! running after the TUI exits (dropping the child handle never kills it).
+//! Lets the TUI start one or more workers that work through ready issues while
+//! the user keeps browsing, mirroring the bash TUI's detached-bot model: each
+//! worker is an ordinary `copilot-loop.sh` run in its own process group with its
+//! output captured to a log, and it keeps running after the TUI exits (dropping
+//! the child handle never kills it). Running several workers against one repo is
+//! safe because the loop claims issues under a GitHub lock (and isolates each in
+//! its own git worktree), so workers always pick *different* issues (#134).
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -51,9 +54,13 @@ pub fn loop_args(repo_dir: &Path, model: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Where the background loop's captured output is written.
-pub fn log_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".copilot-loop").join("tui").join("loop.log")
+/// Where a background worker's captured output is written. Each worker gets its
+/// own file (`loop-<id>.log`) so concurrent workers never clobber a shared log.
+pub fn log_path(repo_root: &Path, worker_id: usize) -> PathBuf {
+    repo_root
+        .join(".copilot-loop")
+        .join("tui")
+        .join(format!("loop-{worker_id}.log"))
 }
 
 /// The first candidate path that exists as a file, if any.
@@ -86,41 +93,47 @@ pub fn repo_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Manages a single background `copilot-loop.sh` process for the TUI session.
+/// Manages the background `copilot-loop.sh` workers for the TUI session.
+///
+/// Holds a handle per running worker. Several may run at once; the loop's own
+/// GitHub-lock claiming keeps them on different issues (#134).
 #[derive(Default)]
 pub struct LoopRunner {
-    child: Option<Child>,
+    workers: Vec<Child>,
 }
 
 impl LoopRunner {
-    /// A runner with no loop started yet.
+    /// A runner with no workers started yet.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Whether a background loop is currently running. Reaps the child and
-    /// clears the handle once it has exited so the state stays accurate.
-    pub fn is_running(&mut self) -> bool {
-        let Some(child) = self.child.as_mut() else {
-            return false;
-        };
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                self.child = None;
-                false
-            }
-            Ok(None) => true,
-            // An errored wait means we can no longer track it; treat as stopped.
-            Err(_) => {
-                self.child = None;
-                false
-            }
-        }
+    /// Drop the handles of workers that have exited so counts stay accurate.
+    /// An errored wait means we can no longer track that worker, so it too is
+    /// dropped (treated as stopped).
+    fn reap(&mut self) {
+        self.workers
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 
-    /// Start the loop against `repo_dir`, capturing output to `log` and running
-    /// on `model` (`None` = auto). Errors when a loop is already running or the
-    /// process cannot be spawned. Returns the new process id.
+    /// How many workers are currently running. Reaps exited workers first.
+    pub fn running_count(&mut self) -> usize {
+        self.reap();
+        self.workers.len()
+    }
+
+    /// Whether any background worker is currently running.
+    pub fn is_running(&mut self) -> bool {
+        self.running_count() > 0
+    }
+
+    /// Start another worker against `repo_dir`, capturing output to `log` and
+    /// running on `model` (`None` = auto). Errors when the process cannot be
+    /// spawned. Returns the new process id.
+    ///
+    /// Unlike a single-loop model, this never refuses because one is already
+    /// running: the loop keeps workers on different issues, so more can be added
+    /// (#134).
     pub fn start(
         &mut self,
         script: &Path,
@@ -128,20 +141,17 @@ impl LoopRunner {
         log: &Path,
         model: Option<&str>,
     ) -> Result<u32> {
-        if self.is_running() {
-            anyhow::bail!("a background loop is already running");
-        }
         let child = spawn_detached(script, &loop_args(repo_dir, model), log)?;
         let pid = child.id();
-        self.child = Some(child);
+        self.workers.push(child);
         Ok(pid)
     }
 
-    /// Stop the running loop (TERM its process group, escalating to KILL after a
-    /// grace period that matches the bash TUI's `stop_bot`). A no-op when nothing
-    /// is running.
-    pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+    /// Stop every running worker (TERM each process group, escalating to KILL
+    /// after a grace period that matches the bash TUI's `stop_bot`). A no-op when
+    /// nothing is running.
+    pub fn stop_all(&mut self) {
+        for mut child in std::mem::take(&mut self.workers) {
             terminate(&mut child);
             let _ = child.wait();
         }
@@ -274,8 +284,8 @@ mod tests {
     #[test]
     fn log_path_is_under_the_state_dir() {
         assert_eq!(
-            log_path(Path::new("/repo")),
-            PathBuf::from("/repo/.copilot-loop/tui/loop.log")
+            log_path(Path::new("/repo"), 3),
+            PathBuf::from("/repo/.copilot-loop/tui/loop-3.log")
         );
     }
 
@@ -306,6 +316,84 @@ mod tests {
     fn runner_is_not_running_by_default() {
         let mut runner = LoopRunner::new();
         assert!(!runner.is_running());
+        assert_eq!(runner.running_count(), 0);
+    }
+
+    /// Whether `err`'s chain carries an `ETXTBSY` ("Text file busy", `os error
+    /// 26`) failure.
+    #[cfg(unix)]
+    fn is_text_file_busy(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(26)
+        })
+    }
+
+    /// Start a worker, retrying briefly while exec fails with `ETXTBSY`. Writing
+    /// an executable and then exec'ing it inside a multithreaded process is
+    /// inherently racy: a *concurrent* test's fork can momentarily inherit our
+    /// still-open write handle to the freshly written script, so the kernel
+    /// refuses to exec it until that child execs and the handle closes. A short
+    /// retry makes the test deterministic without weakening what it checks.
+    #[cfg(unix)]
+    fn start_worker(runner: &mut LoopRunner, script: &Path, dir: &Path, log: &Path) -> u32 {
+        for attempt in 1..=50 {
+            match runner.start(script, dir, log, None) {
+                Ok(pid) => return pid,
+                Err(err) if attempt < 50 && is_text_file_busy(&err) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("start worker: {err:#}"),
+            }
+        }
+        unreachable!("the loop returns or panics before exhausting its attempts")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_text_file_busy_in_an_error_chain() {
+        let busy = Err::<(), _>(std::io::Error::from_raw_os_error(26))
+            .context("failed to start /tmp/fake.sh")
+            .unwrap_err();
+        assert!(is_text_file_busy(&busy));
+
+        let missing = Err::<(), _>(std::io::Error::from_raw_os_error(2))
+            .context("failed to start /tmp/fake.sh")
+            .unwrap_err();
+        assert!(!is_text_file_busy(&missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_tracks_multiple_workers_and_stop_all_ends_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A tiny script that ignores start()'s fixed loop_args and just sleeps,
+        // so we can exercise tracking several live workers at once.
+        let mut script = std::env::temp_dir();
+        script.push(format!("copilot-loop-fake-{}.sh", std::process::id()));
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = std::env::temp_dir();
+        let log1 = dir.join(format!("copilot-loop-w1-{}.log", std::process::id()));
+        let log2 = dir.join(format!("copilot-loop-w2-{}.log", std::process::id()));
+
+        let mut runner = LoopRunner::new();
+        start_worker(&mut runner, &script, &dir, &log1);
+        start_worker(&mut runner, &script, &dir, &log2);
+        assert_eq!(runner.running_count(), 2);
+        assert!(runner.is_running());
+
+        runner.stop_all();
+        assert_eq!(runner.running_count(), 0);
+        assert!(!runner.is_running());
+
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&log1);
+        let _ = fs::remove_file(&log2);
     }
 
     #[cfg(unix)]

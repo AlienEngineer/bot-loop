@@ -14,7 +14,8 @@ use crate::logs;
 
 /// Draw the whole UI: header, issue list (or placeholder), and footer.
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let loop_running = app.loop_running();
+    let workers = app.workers_running();
+    let loop_running = workers > 0;
     let [header_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -22,9 +23,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, app, loop_running);
+    render_header(frame, header_area, app, workers);
     render_body(frame, body_area, app, loop_running);
-    render_footer(frame, footer_area, app, loop_running);
+    render_footer(frame, footer_area, app);
 
     // The model picker floats above everything else when open.
     if app.model_picker_open() {
@@ -99,15 +100,16 @@ fn pr_summary(prs: &[u64]) -> Option<String> {
 }
 
 /// Build the header line spans: issue count, the viewed issue, the loop state,
-/// and the model. When the loop runs a turning spinner and the work it is doing
-/// — the issues *and* any PRs it is resolving, or "waiting for work" when idle —
-/// are shown so it is clear something is happening and on what (#115, #133).
-/// Pure so the running branch — which otherwise needs a live child process — is
+/// and the model. When workers run a turning spinner, how many workers are
+/// running, and the work they are doing — the issues *and* any PRs being
+/// resolved, or "waiting for work" when idle — are shown so it is clear
+/// something is happening and on what (#115, #133, #134). Pure so the running
+/// branch — which otherwise needs live child processes — is
 /// unit-testable.
 fn header_spans(
     count: usize,
     viewing: Option<u64>,
-    loop_running: bool,
+    workers: usize,
     working: &[u64],
     working_prs: &[u64],
     model_label: &str,
@@ -132,10 +134,17 @@ fn header_spans(
             Style::new().fg(Color::DarkGray),
         ));
     }
-    if loop_running {
+    if workers > 0 {
         spans.push(Span::styled(
             format!("  ·  {spinner} loop: running"),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(
+                "  ·  {workers} worker{}",
+                if workers == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         let mut idle = true;
         if let Some(summary) = working_summary(working) {
@@ -171,11 +180,11 @@ fn header_spans(
     spans
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, workers: usize) {
     let spans = header_spans(
         app.issues.len(),
         app.selected().map(|issue| issue.number),
-        loop_running,
+        workers,
         &app.in_progress_numbers(),
         &app.in_progress_pr_numbers(),
         app.current_model_label(),
@@ -264,7 +273,7 @@ fn render_output_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     }
 }
 
-fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
+fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some(status) = &app.status {
         spans.push(Span::styled(
@@ -273,18 +282,13 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         ));
         spans.push(Span::raw("  "));
     }
-    let loop_key = if loop_running {
-        "l stop-loop"
-    } else {
-        "l start-loop"
-    };
     let ready_key = if app.selected_is_ready() {
         "s unready"
     } else {
         "s ready"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · {loop_key} · m models · o output · p pr-output · t closed · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -751,7 +755,7 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("loop: off"));
-        assert!(text.contains("start-loop"));
+        assert!(text.contains("add-worker"));
     }
 
     #[test]
@@ -866,17 +870,34 @@ mod tests {
 
     #[test]
     fn header_shows_spinner_and_working_issue_when_loop_runs() {
-        let text = spans_text(&header_spans(3, Some(96), true, &[96], &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, Some(96), 1, &[96], &[], "auto", "⠋"));
         assert!(text.contains("⠋ loop: running"));
+        assert!(text.contains("1 worker"));
         assert!(text.contains("working #96"));
         assert!(text.contains("model: auto"));
+    }
+
+    #[test]
+    fn header_shows_the_worker_count_for_several_workers() {
+        let text = spans_text(&header_spans(
+            5,
+            Some(96),
+            3,
+            &[96, 97, 98],
+            &[],
+            "auto",
+            "⠋",
+        ));
+        assert!(text.contains("loop: running"));
+        assert!(text.contains("3 workers"));
+        assert!(text.contains("working #96, #97, #98"));
     }
 
     #[test]
     fn header_shows_pr_work_when_the_loop_resolves_a_pr() {
         // A PR being resolved is not in the issue list, so the header is the
         // only place the user learns the loop is busy (#133).
-        let text = spans_text(&header_spans(3, None, true, &[], &[12], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[], &[12], "auto", "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("resolving PR #12"));
         // With PR work in flight the loop is not idle.
@@ -885,23 +906,24 @@ mod tests {
 
     #[test]
     fn header_shows_both_issue_and_pr_work() {
-        let text = spans_text(&header_spans(3, None, true, &[96], &[12], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[96], &[12], "auto", "⠋"));
         assert!(text.contains("working #96"));
         assert!(text.contains("resolving PR #12"));
     }
 
     #[test]
     fn header_says_waiting_when_loop_runs_without_an_issue() {
-        let text = spans_text(&header_spans(3, None, true, &[], &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[], &[], "auto", "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("waiting for work"));
     }
 
     #[test]
     fn header_hides_loop_details_when_off() {
-        let text = spans_text(&header_spans(3, Some(96), false, &[96], &[12], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, Some(96), 0, &[96], &[12], "auto", "⠋"));
         assert!(text.contains("loop: off"));
         assert!(!text.contains("working"));
+        assert!(!text.contains("worker"));
         assert!(!text.contains("resolving PR"));
         assert!(!text.contains("⠋"));
     }
