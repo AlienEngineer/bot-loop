@@ -9,6 +9,7 @@ mod logs;
 mod models;
 mod runner;
 mod ui;
+mod worker;
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,10 @@ fn main() -> Result<()> {
         Err(err) => app.status = Some(format!("Error: {err}")),
     }
 
+    // Run the `gh` issue/PR queries on a worker thread so the periodic
+    // auto-refresh never blocks the UI loop (#144).
+    app.set_fetcher(worker::IssueFetcher::spawn(DEFAULT_LIMIT));
+
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
@@ -50,6 +55,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_refresh = Instant::now();
     let mut loop_was_running = false;
     while !app.should_quit {
+        // Fold in any issue/PR data the worker thread finished fetching, so the
+        // list tracks the loop without the UI thread ever blocking on `gh`.
+        app.poll_fetch_results();
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if event::poll(Duration::from_millis(250))?
