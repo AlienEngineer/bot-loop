@@ -1,0 +1,107 @@
+name: release
+
+# Every push to main cuts a new patch release: bump the version in the sources,
+# tag it, publish a GitHub release, and repoint the Homebrew formula at the new
+# tag's tarball so `brew upgrade` picks it up. The two bot commits carry
+# "[skip ci]" so this workflow never retriggers itself.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Skip the workflow's own version-bump / formula commits.
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute next version
+        id: version
+        run: |
+          git fetch --tags --force
+          latest="$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)"
+          if [ -z "$latest" ]; then
+            next="0.1.0"
+          else
+            base="${latest#v}"
+            major="${base%%.*}"
+            rest="${base#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            next="${major}.${minor}.$((patch + 1))"
+          fi
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "tag=v$next" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$next (previous: ${latest:-none})"
+
+      - name: Write the version into the sources
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i -E "s/^COPILOT_LOOP_VERSION=.*/COPILOT_LOOP_VERSION=\"${VERSION}\"/" copilot-loop.sh
+          sed -i -E "0,/^version = \".*\"/s//version = \"${VERSION}\"/" tui/Cargo.toml
+          # Keep Cargo.lock's own package entry in step so `--locked` builds work.
+          ( cd tui && cargo update -p copilot-loop-tui --precise "${VERSION}" --offline \
+              || cargo update -p copilot-loop-tui --precise "${VERSION}" )
+
+      - name: Commit, tag and push the version bump
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git add copilot-loop.sh tui/Cargo.toml tui/Cargo.lock
+          git commit -m "Release ${TAG} [skip ci]"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin HEAD:main
+          git push origin "${TAG}"
+
+      - name: Download the tag tarball and compute its sha256
+        id: sha
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          # GitHub materialises the archive a moment after the tag lands; retry.
+          for _ in $(seq 1 10); do
+            if curl -fsSL "$url" -o release.tar.gz; then break; fi
+            sleep 3
+          done
+          sha="$(sha256sum release.tar.gz | cut -d' ' -f1)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha"
+
+      - name: Repoint the Homebrew formula at the new release
+        env:
+          URL: ${{ steps.sha.outputs.url }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          sed -i -E "s|^  url \".*\"|  url \"${URL}\"|" Formula/bot-loop.rb
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" Formula/bot-loop.rb
+          git add Formula/bot-loop.rb
+          git commit -m "Update Homebrew formula for ${TAG} [skip ci]"
+          git push origin HEAD:main
+
+      - name: Publish the GitHub release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${TAG}" --title "${TAG}" --generate-notes release.tar.gz

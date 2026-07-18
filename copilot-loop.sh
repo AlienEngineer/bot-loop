@@ -146,6 +146,7 @@
 #                            Delete a merged issue's remote branch (default: auto,
 #                            on only when the repo does not auto-delete on merge).
 #   -h, --help               Show help and exit.
+#   -V, --version            Print the copilot-loop version and exit.
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
@@ -163,6 +164,12 @@
 # 5 attempts, 3s apart; set MERGEABILITY_WAIT_ATTEMPTS=0 to disable the wait.
 #
 set -uo pipefail
+
+# Version of this script. Reported by -V/--version and bumped automatically by
+# .github/workflows/release.yml on every push to main (kept in step with the
+# Homebrew formula and the TUI). Keep this on its own line: the release workflow
+# rewrites it with sed.
+COPILOT_LOOP_VERSION="0.1.0"
 
 # Preserve the original invocation so self-update can re-exec the loop with the
 # same options after pulling a newer copy of this script (see self_update).
@@ -419,6 +426,7 @@ work:
   --no-delete-remote-branch
                            Never delete remote branches; leave that to GitHub.
   -h, --help               Show this help and exit.
+  -V, --version            Print the copilot-loop version and exit.
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
@@ -745,6 +753,7 @@ while [ $# -gt 0 ]; do
     --cleanup-merged)          CLEANUP_MERGED=1 ;;
     --no-cleanup-merged)       CLEANUP_MERGED=0 ;;
     -h|--help)         usage; exit 0 ;;
+    -V|--version)      printf 'copilot-loop %s\n' "$COPILOT_LOOP_VERSION"; exit 0 ;;
     *)                 die "unknown argument: $1 (use --help)" ;;
   esac
   shift
