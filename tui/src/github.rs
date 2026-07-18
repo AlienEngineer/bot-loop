@@ -17,6 +17,27 @@ pub struct Author {
     pub login: String,
 }
 
+/// A comment on an issue. The TUI reads the loop's per-run cost out of the body
+/// (the `AI Credits` line in a usage comment) so a closed issue's total spend
+/// can be shown (#145), and the details popup shows each comment's author, date,
+/// and body so the whole conversation is readable in the TUI (#152).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Comment {
+    #[serde(default)]
+    pub author: Option<Author>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: String,
+}
+
+impl Comment {
+    /// The comment author's login, or an empty string when unknown.
+    pub fn author_login(&self) -> &str {
+        self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
+    }
+}
+
 /// A single GitHub issue, mapped from `gh issue list --json ...`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
@@ -26,6 +47,17 @@ pub struct Issue {
     pub labels: Vec<Label>,
     #[serde(default)]
     pub author: Option<Author>,
+    /// The issue's body (description). Requested for the details popup so the
+    /// full issue text is readable in the TUI; empty for the list views, which
+    /// do not request it (#152).
+    #[serde(default)]
+    pub body: String,
+    /// The issue's comments, requested for the closed-issue view so each row's
+    /// AI Credits spend can be totalled (#145) and for the details popup so the
+    /// conversation is readable (#152). Empty for the open list, which does not
+    /// request comments.
+    #[serde(default)]
+    pub comments: Vec<Comment>,
 }
 
 impl Issue {
@@ -49,13 +81,83 @@ impl Issue {
     pub fn author_login(&self) -> &str {
         self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
     }
+
+    /// Total AI Credits the loop spent on this issue, summed across every
+    /// copilot-loop usage comment in its thread, or `None` when the issue
+    /// carries no usage comment (e.g. closed by hand or never worked) (#145).
+    pub fn credits_spent(&self) -> Option<f64> {
+        let mut total = 0.0;
+        let mut found = false;
+        for comment in &self.comments {
+            if let Some(credits) = parse_comment_credits(&comment.body) {
+                total += credits;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+}
+
+/// Parse the AI Credits figure from a single copilot-loop usage comment body, or
+/// `None` when the comment is not a usage comment (missing [`USAGE_MARKER`]) or
+/// carries no recognisable credits line. Both the current `AI Credits` label and
+/// the legacy `Premium requests` label are accepted, mirroring
+/// `parse_usage_stats` in `copilot-loop.sh`. Pure for testing (#145).
+fn parse_comment_credits(body: &str) -> Option<f64> {
+    if !body.contains(USAGE_MARKER) {
+        return None;
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        for label in ["AI Credits", "Premium requests"] {
+            if let Some(rest) = line.strip_prefix(label) {
+                let number: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(value) = number.parse::<f64>() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A pull request the loop is working, mapped from `gh pr list --json ...`.
+///
+/// Only the fields the TUI needs to name the PR are modelled; the loop keys a
+/// PR as "being worked" off the same [`IN_PROGRESS_LABEL`] it adds to issues, so
+/// the query filters on that label rather than carrying it here (#133).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
 }
 
 /// The `gh` JSON fields requested for each issue.
 const GH_JSON_FIELDS: &str = "number,title,labels,author";
 
+/// The `gh` JSON fields requested for each closed issue: the issue fields plus
+/// its comments, so the loop's per-run cost can be totalled per issue (#145).
+const GH_CLOSED_JSON_FIELDS: &str = "number,title,labels,author,comments";
+
+/// The `gh` JSON fields requested for a single issue's details view: the issue
+/// fields plus its body and comments, so the whole issue is readable in the TUI
+/// (#152).
+const GH_DETAILS_JSON_FIELDS: &str = "number,title,body,labels,author,comments";
+
+/// The `gh` JSON fields requested for each in-progress pull request.
+const GH_PR_JSON_FIELDS: &str = "number,title";
+
 /// The label the loop watches for, when `TRIGGER_LABEL` is unset.
 pub const READY_LABEL: &str = "ready";
+
+/// Hidden marker `copilot-loop.sh` tags every per-run cost comment with (its
+/// `USAGE_MARKER`), so the TUI can pick the loop's usage comments out of an
+/// issue's thread when totalling spend (#145).
+pub const USAGE_MARKER: &str = "<!-- copilot-loop:usage -->";
 
 /// The label the loop adds to an issue while it is actively working on it,
 /// mirroring `INPROGRESS_LABEL` in `copilot-loop.sh`. The TUI keys its
@@ -78,6 +180,11 @@ pub fn ready_label() -> String {
 /// Parse the JSON array produced by `gh issue list --json ...`.
 pub fn parse_issues(json: &str) -> Result<Vec<Issue>> {
     serde_json::from_str(json).context("failed to parse `gh issue list` JSON output")
+}
+
+/// Parse the single JSON object produced by `gh issue view --json ...` (#152).
+pub fn parse_issue(json: &str) -> Result<Issue> {
+    serde_json::from_str(json).context("failed to parse `gh issue view` JSON output")
 }
 
 /// Fetch open issues for the current repository using the `gh` CLI.
@@ -108,6 +215,101 @@ pub fn fetch_issues(limit: u32) -> Result<Vec<Issue>> {
     }
 
     parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Fetch the most recently updated closed issues for the current repository,
+/// including their comments so the loop's per-run cost can be totalled per issue
+/// (#145).
+///
+/// Runs `gh issue list --state closed` requesting each issue's comments, then
+/// parses the JSON. Returns an error when `gh` is missing, not authenticated, or
+/// the command otherwise fails.
+pub fn fetch_closed_issues(limit: u32) -> Result<Vec<Issue>> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "list",
+            "--state",
+            "closed",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            GH_CLOSED_JSON_FIELDS,
+        ])
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue list` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Fetch a single issue's full details — its body and comments — for the details
+/// popup, so the whole issue is readable in the TUI (#152).
+///
+/// Runs `gh issue view <number> --json ...` and parses the single JSON object it
+/// prints. Returns an error when `gh` is missing, not authenticated, the issue
+/// does not exist, or the command otherwise fails.
+pub fn fetch_issue_details(number: u64) -> Result<Issue> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "view",
+            &number.to_string(),
+            "--json",
+            GH_DETAILS_JSON_FIELDS,
+        ])
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue view` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    parse_issue(&String::from_utf8_lossy(&output.stdout))
+}
+pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
+    serde_json::from_str(json).context("failed to parse `gh pr list` JSON output")
+}
+
+/// Fetch the open pull requests the loop is currently working, i.e. those
+/// carrying the in-progress label (#133).
+///
+/// PRs are not returned by `gh issue list`, so a PR the loop is resolving
+/// (conflicts or failing checks) is invisible to the issue view. Listing the
+/// in-progress ones lets the TUI show that work is happening. Returns an error
+/// when `gh` is missing, not authenticated, or the command otherwise fails.
+pub fn fetch_in_progress_prs() -> Result<Vec<PullRequest>> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            IN_PROGRESS_LABEL,
+            "--json",
+            GH_PR_JSON_FIELDS,
+        ])
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("`gh pr list` failed: {}", stderr.trim().replace('\n', " "));
+    }
+
+    parse_pull_requests(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Build the `gh issue edit` arguments to add a label. Pure for testing.
@@ -148,6 +350,39 @@ pub fn add_label(number: u64, label: &str) -> Result<()> {
 
     let output = Command::new("gh")
         .args(add_label_args(number, label))
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue edit` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Build the `gh issue edit` arguments to remove a label. Pure for testing.
+fn remove_label_args(number: u64, label: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        number.to_string(),
+        "--remove-label".to_string(),
+        label.to_string(),
+    ]
+}
+
+/// Remove a label from an issue using the `gh` CLI.
+///
+/// Runs `gh issue edit <number> --remove-label <label>`. Unlike [`add_label`]
+/// there is no need to ensure the label exists first. Returns an error when
+/// `gh` is missing, not authenticated, or the edit fails.
+pub fn remove_label(number: u64, label: &str) -> Result<()> {
+    let output = Command::new("gh")
+        .args(remove_label_args(number, label))
         .output()
         .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
 
@@ -286,6 +521,59 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_single_issue_with_body_and_comments() {
+        let json = r#"{"number":152,"title":"see details","body":"the description",
+            "labels":[{"name":"ready"}],"author":{"login":"octocat"},
+            "comments":[{"author":{"login":"hubot"},"body":"first comment",
+                         "createdAt":"2026-07-18T06:45:11Z"}]}"#;
+        let issue = parse_issue(json).expect("should parse");
+        assert_eq!(issue.number, 152);
+        assert_eq!(issue.body, "the description");
+        assert_eq!(issue.comments.len(), 1);
+        assert_eq!(issue.comments[0].author_login(), "hubot");
+        assert_eq!(issue.comments[0].body, "first comment");
+        assert_eq!(issue.comments[0].created_at, "2026-07-18T06:45:11Z");
+    }
+
+    #[test]
+    fn details_tolerate_missing_body_and_comment_author() {
+        // `gh` omits an empty body, and a comment may lack an author.
+        let json = r#"{"number":1,"title":"bare","comments":[{"body":"hi"}]}"#;
+        let issue = parse_issue(json).expect("should parse");
+        assert_eq!(issue.body, "");
+        assert_eq!(issue.comments[0].author_login(), "");
+        assert_eq!(issue.comments[0].created_at, "");
+    }
+
+    #[test]
+    fn parses_a_list_of_pull_requests() {
+        let json = r#"[
+            {"number": 12, "title": "resolve conflicts"},
+            {"number": 15, "title": "fix failing checks"}
+        ]"#;
+        let prs = parse_pull_requests(json).expect("should parse");
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 12);
+        assert_eq!(prs[0].title, "resolve conflicts");
+        assert_eq!(prs[1].number, 15);
+    }
+
+    #[test]
+    fn parses_an_empty_pull_request_list() {
+        assert!(parse_pull_requests("[]").expect("should parse").is_empty());
+    }
+
+    #[test]
+    fn pull_request_parsing_ignores_extra_fields() {
+        // Real `gh pr list --json` output carries fields the TUI does not model.
+        let json = r#"[{"number": 12, "title": "t", "mergeable": "CONFLICTING",
+                        "labels": [{"name": "in-progress"}]}]"#;
+        let prs = parse_pull_requests(json).expect("should ignore unknown fields");
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 12);
+    }
+
+    #[test]
     fn detects_labels_by_name() {
         let json = r#"[{"number":1,"title":"t","labels":[{"name":"ready"}]}]"#;
         let issue = &parse_issues(json).unwrap()[0];
@@ -314,6 +602,14 @@ mod tests {
         assert_eq!(
             add_label_args(96, "ready"),
             vec!["issue", "edit", "96", "--add-label", "ready"]
+        );
+    }
+
+    #[test]
+    fn builds_remove_label_args() {
+        assert_eq!(
+            remove_label_args(96, "ready"),
+            vec!["issue", "edit", "96", "--remove-label", "ready"]
         );
     }
 
@@ -390,5 +686,62 @@ mod tests {
         assert_eq!(issues[0].number, 96);
         assert_eq!(issues[0].author_login(), "AlienEngineer");
         assert_eq!(issues[0].label_names(), vec!["in-progress"]);
+    }
+
+    /// A realistic usage comment body as `copilot-loop.sh` posts it (#145).
+    fn usage_comment(credits: &str) -> String {
+        format!(
+            "**copilot-loop usage** (model: claude-opus-4.5)\n\n```\nAI Credits {credits} (9m 0s)\nTokens     ↑ 3.4m (3.2m cached) • ↓ 39.2k\n```\n\n<!-- copilot-loop:usage -->"
+        )
+    }
+
+    #[test]
+    fn parses_credits_from_a_usage_comment() {
+        assert_eq!(parse_comment_credits(&usage_comment("335")), Some(335.0));
+        assert_eq!(parse_comment_credits(&usage_comment("25.7")), Some(25.7));
+    }
+
+    #[test]
+    fn parses_the_legacy_premium_requests_label() {
+        let body = "```\nPremium requests 1.5 (8s)\n```\n<!-- copilot-loop:usage -->";
+        assert_eq!(parse_comment_credits(body), Some(1.5));
+    }
+
+    #[test]
+    fn credits_require_the_usage_marker() {
+        // Same credits line, but no marker — not a loop usage comment.
+        assert_eq!(parse_comment_credits("AI Credits 335 (9m 0s)"), None);
+    }
+
+    #[test]
+    fn credits_are_none_when_the_marker_has_no_credits_line() {
+        assert_eq!(
+            parse_comment_credits("a human note <!-- copilot-loop:usage -->"),
+            None
+        );
+    }
+
+    #[test]
+    fn totals_credits_across_all_usage_comments() {
+        let json = format!(
+            r#"[{{"number":1,"title":"t","comments":[
+                {{"body":{first}}},
+                {{"body":{second}}},
+                {{"body":"just a human comment"}}
+            ]}}]"#,
+            first = serde_json::to_string(&usage_comment("100")).unwrap(),
+            second = serde_json::to_string(&usage_comment("50.5")).unwrap(),
+        );
+        let issue = &parse_issues(&json).unwrap()[0];
+        assert_eq!(issue.credits_spent(), Some(150.5));
+    }
+
+    #[test]
+    fn credits_spent_is_none_without_usage_comments() {
+        let with_human = r#"[{"number":1,"title":"t","comments":[{"body":"hi"}]}]"#;
+        assert_eq!(parse_issues(with_human).unwrap()[0].credits_spent(), None);
+        // No comments field at all (the open-list shape).
+        let bare = r#"[{"number":1,"title":"t"}]"#;
+        assert_eq!(parse_issues(bare).unwrap()[0].credits_spent(), None);
     }
 }

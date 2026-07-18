@@ -4,10 +4,11 @@ use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
 
-use crate::github::{self, Issue, Label};
+use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
 use crate::models;
 use crate::runner::{self, LoopRunner};
+use crate::worker::{FetchOutcome, IssueFetcher};
 
 /// Default number of issues to request from `gh`.
 pub const DEFAULT_LIMIT: u32 = 200;
@@ -96,6 +97,39 @@ pub struct App {
     known_in_progress: Vec<u64>,
     /// Whether the next loop start enables GitHub auto-merge on each PR (#135).
     auto_merge: bool,
+    /// Monotonic id for the next worker, so each gets its own capture log
+    /// (`loop-<id>.log`) even as workers come and go (#134).
+    next_worker_id: usize,
+    /// Open pull requests the loop is currently working (carry the in-progress
+    /// label). PRs are absent from `gh issue list`, so these are tracked
+    /// separately so the TUI can show PR work is happening (#133).
+    in_progress_prs: Vec<PullRequest>,
+    /// In-progress PR numbers seen at the last refresh, mirroring
+    /// `known_in_progress` so a newly started PR is announced once (#133).
+    known_in_progress_prs: Vec<u64>,
+    /// Whether the PR-output popup is open (#143).
+    pr_output_open: bool,
+    /// Selection within the PR-output popup's PR list (#143).
+    pub pr_output_state: ListState,
+    /// Whether the closed-issues (spend) popup is open (#145).
+    closed_open: bool,
+    /// The closed issues shown in that popup, fetched with their comments so
+    /// each row's AI Credits spend can be totalled (#145).
+    closed_issues: Vec<Issue>,
+    /// Selection within the closed-issues popup (#145).
+    pub closed_state: ListState,
+    /// Whether the issue-details popup is open (#152).
+    details_open: bool,
+    /// The issue shown in the details popup, fetched with its body and comments
+    /// so the whole issue is readable in the TUI (#152). `None` until opened.
+    details: Option<Issue>,
+    /// Vertical scroll offset (in rendered lines) of the details popup, so long
+    /// issues and comment threads can be read top to bottom (#152).
+    details_scroll: u16,
+    /// Background fetcher that runs the `gh` issue/PR queries off the UI thread
+    /// so the periodic auto-refresh never freezes input or redraws (#144).
+    /// `None` when no worker is attached (unit tests, or before wiring).
+    fetcher: Option<IssueFetcher>,
 }
 
 impl App {
@@ -126,6 +160,18 @@ impl App {
             close_confirm: None,
             known_in_progress: Vec::new(),
             auto_merge: false,
+            next_worker_id: 1,
+            in_progress_prs: Vec::new(),
+            known_in_progress_prs: Vec::new(),
+            pr_output_open: false,
+            pr_output_state: ListState::default(),
+            closed_open: false,
+            closed_issues: Vec::new(),
+            closed_state: ListState::default(),
+            details_open: false,
+            details: None,
+            details_scroll: 0,
+            fetcher: None,
         }
     }
 
@@ -150,6 +196,7 @@ impl App {
 
     /// Re-fetch issues from GitHub, updating the status line on error.
     pub fn refresh(&mut self) {
+        self.refresh_in_progress_prs();
         match github::fetch_issues(self.limit) {
             Ok(issues) => {
                 self.status = if issues.is_empty() {
@@ -163,17 +210,83 @@ impl App {
         }
     }
 
-    /// Silently re-fetch issues so the list (and its in-progress labels) tracks
-    /// the running loop without a manual refresh (#115), announcing when the
-    /// loop *starts* on a new issue so the user gets feedback (#119).
+    /// Best-effort refresh of the in-progress PR list (#133).
     ///
-    /// Unlike [`refresh`], this leaves the status line untouched on a plain
-    /// refresh and swallows errors: it runs on a timer while the loop works, so
-    /// a transient `gh` hiccup must not clobber the current status or spam the
-    /// footer — a manual `r` still surfaces failures. The one time it does set
-    /// the status is the discrete "loop started #N" event (#119).
+    /// Swallows errors so a `gh pr list` hiccup never clobbers the issue view or
+    /// its status line — the PR indicator simply keeps its last value until the
+    /// next tick. Leaves the list unchanged on failure rather than blanking it.
+    fn refresh_in_progress_prs(&mut self) {
+        if let Ok(prs) = github::fetch_in_progress_prs() {
+            let previous = self.selected_pr_number();
+            self.in_progress_prs = prs;
+            self.reselect_pr_output(previous);
+        }
+    }
+
+    /// Attach the background issue fetcher so refreshes run off the UI thread
+    /// (#144). Wired once at startup; unit tests leave it unset and drive the
+    /// apply path directly.
+    pub fn set_fetcher(&mut self, fetcher: IssueFetcher) {
+        self.fetcher = Some(fetcher);
+    }
+
+    /// Request a silent, off-thread re-fetch of issues so the list (and its
+    /// in-progress labels) tracks the running loop without a manual refresh
+    /// (#115), announcing when the loop *starts* on a new issue (#119).
+    ///
+    /// The blocking `gh` calls run on the worker thread, so this returns
+    /// immediately and the UI keeps redrawing and handling input while the
+    /// fetch is in flight (#144). Results land via [`poll_fetch_results`]. When
+    /// no worker is attached it falls back to a synchronous fetch so behaviour
+    /// is preserved.
+    ///
+    /// Unlike [`refresh`], applying the result leaves the status line untouched
+    /// on a plain refresh and swallows errors: it runs on a timer while the loop
+    /// works, so a transient `gh` hiccup must not clobber the current status or
+    /// spam the footer — a manual `r` still surfaces failures. The one time it
+    /// does set the status is the discrete "loop started #N" event (#119).
     pub fn auto_refresh(&mut self) {
+        match self.fetcher.as_ref() {
+            Some(fetcher) => fetcher.request(),
+            None => self.auto_refresh_blocking(),
+        }
+    }
+
+    /// Synchronous fallback for [`auto_refresh`] when no worker is attached.
+    /// Mirrors the pre-#144 inline behaviour: fetch on the UI thread and fold
+    /// the result in.
+    fn auto_refresh_blocking(&mut self) {
+        self.refresh_in_progress_prs();
         if let Ok(issues) = github::fetch_issues(self.limit) {
+            self.set_issues(issues);
+            if let Some(message) = self.take_started_feedback() {
+                self.status = Some(message);
+            }
+        }
+    }
+
+    /// Fold any completed background fetches into the app state. Called each UI
+    /// tick so the list and in-progress markers track the loop without the UI
+    /// thread ever blocking on `gh` (#144).
+    pub fn poll_fetch_results(&mut self) {
+        let Some(outcomes) = self.fetcher.as_ref().map(IssueFetcher::drain) else {
+            return;
+        };
+        for outcome in outcomes {
+            self.apply_fetch_outcome(outcome);
+        }
+    }
+
+    /// Apply one completed background fetch, matching the old silent
+    /// `auto_refresh`: update the PR list on success, refresh the issue list,
+    /// and announce any newly started issues/PRs. Errors are swallowed so a
+    /// transient `gh` hiccup never clobbers the status line — a manual `r` still
+    /// surfaces failures (#144).
+    fn apply_fetch_outcome(&mut self, outcome: FetchOutcome) {
+        if let Ok(prs) = outcome.prs {
+            self.in_progress_prs = prs;
+        }
+        if let Ok(issues) = outcome.issues {
             self.set_issues(issues);
             if let Some(message) = self.take_started_feedback() {
                 self.status = Some(message);
@@ -190,15 +303,23 @@ impl App {
         let current = self.in_progress_numbers();
         let started = newly_started(&current, &self.known_in_progress);
         self.known_in_progress = current;
-        started_message(&started, &self.issues)
+
+        let current_prs = self.in_progress_pr_numbers();
+        let started_prs = newly_started(&current_prs, &self.known_in_progress_prs);
+        self.known_in_progress_prs = current_prs;
+
+        let issue_msg = started_message(&started, &self.issues);
+        let pr_msg = pr_started_message(&started_prs, &self.in_progress_prs);
+        combine_feedback(issue_msg, pr_msg)
     }
 
     /// Baseline the in-progress set to what is already labelled, so a later
-    /// [`auto_refresh`] only announces issues the loop *newly* starts. Called
-    /// when the loop starts so pre-existing in-progress labels are not
-    /// mistaken for fresh work (#119).
+    /// [`auto_refresh`] only announces issues (and PRs) the loop *newly* starts.
+    /// Called when the loop starts so pre-existing in-progress labels are not
+    /// mistaken for fresh work (#119, #133).
     fn seed_in_progress_baseline(&mut self) {
         self.known_in_progress = self.in_progress_numbers();
+        self.known_in_progress_prs = self.in_progress_pr_numbers();
     }
 
     /// The currently selected issue, if any.
@@ -206,11 +327,13 @@ impl App {
         self.state.selected().and_then(|i| self.issues.get(i))
     }
 
-    /// Mark the selected issue ready so the loop can pick it up.
+    /// Toggle the trigger label on the selected issue.
     ///
-    /// Adds the trigger label via `gh`, reflects it locally so the row updates
-    /// without a refetch, and reports progress on the status line.
-    pub fn mark_ready(&mut self) {
+    /// Adds the label via `gh` when the issue lacks it so the loop picks it up,
+    /// or removes it when present so a mistakenly-queued issue can be pulled
+    /// back out (#146). Either way the change is reflected locally so the row
+    /// updates without a refetch, and progress is reported on the status line.
+    pub fn toggle_ready(&mut self) {
         let Some(index) = self.state.selected() else {
             return;
         };
@@ -222,19 +345,31 @@ impl App {
         let label = github::ready_label();
 
         if issue.has_label(&label) {
-            self.status = Some(format!("#{number} already labelled '{label}'."));
-            return;
-        }
-
-        match github::add_label(number, &label) {
-            Ok(()) => {
-                self.issues[index].labels.push(Label {
-                    name: label.clone(),
-                });
-                self.status = Some(format!("#{number} marked '{label}'."));
+            match github::remove_label(number, &label) {
+                Ok(()) => {
+                    self.issues[index].labels.retain(|l| l.name != label);
+                    self.status = Some(format!("#{number} unmarked '{label}'."));
+                }
+                Err(err) => self.status = Some(format!("Error: {err}")),
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+        } else {
+            match github::add_label(number, &label) {
+                Ok(()) => {
+                    self.issues[index].labels.push(Label {
+                        name: label.clone(),
+                    });
+                    self.status = Some(format!("#{number} marked '{label}'."));
+                }
+                Err(err) => self.status = Some(format!("Error: {err}")),
+            }
         }
+    }
+
+    /// Whether the selected issue already carries the trigger label, so the
+    /// footer can offer `s unready` instead of `s ready` (#146).
+    pub fn selected_is_ready(&self) -> bool {
+        let label = github::ready_label();
+        self.selected().is_some_and(|issue| issue.has_label(&label))
     }
 
     /// The number of the issue awaiting a close confirmation, if any (#118).
@@ -288,18 +423,13 @@ impl App {
         }
     }
 
-    /// Start or stop the background loop that works through ready issues.
+    /// Start another background worker that works through the ready issues.
     ///
-    /// When one is running it is stopped; otherwise a detached `copilot-loop.sh`
-    /// is launched against this repository (output captured to a log). The loop
-    /// keeps running after the TUI quits, matching the bash TUI's behaviour.
-    pub fn toggle_loop(&mut self) {
-        if self.runner.is_running() {
-            self.runner.stop();
-            self.status = Some("Background loop stopped.".to_string());
-            return;
-        }
-
+    /// Each call launches a new detached `copilot-loop.sh`. Because the loop
+    /// claims issues under a GitHub lock (and isolates each in its own git
+    /// worktree), several workers run safely on *different* issues (#134). A
+    /// worker keeps running after the TUI quits, matching the bash TUI.
+    pub fn start_worker(&mut self) {
         let repo = self.repo_root.clone();
         let Some(script) = runner::resolve_loop_script(&repo) else {
             self.status = Some(format!(
@@ -310,18 +440,23 @@ impl App {
             return;
         };
 
-        let log = runner::log_path(&repo);
+        // Baseline the in-progress set only when the first worker starts, so any
+        // already-labelled in-progress issue predates the workers (#119).
+        let was_idle = !self.runner.is_running();
+        let log = runner::log_path(&repo, self.next_worker_id);
         let model = self.selected_model().map(str::to_owned);
         match self
             .runner
             .start(&script, &repo, &log, model.as_deref(), self.auto_merge)
         {
             Ok(pid) => {
-                // Only announce issues the loop starts *after* this point; any
-                // already-labelled in-progress issue predates the loop (#119).
-                self.seed_in_progress_baseline();
+                self.next_worker_id += 1;
+                if was_idle {
+                    self.seed_in_progress_baseline();
+                }
+                let count = self.runner.running_count();
                 self.status = Some(format!(
-                    "Background loop started (pid {pid}, model {}, auto-merge {}). Log: {}",
+                    "Worker started (pid {pid}, model {}, auto-merge {}). {count} running. Log: {}",
                     self.current_model_label(),
                     if self.auto_merge { "on" } else { "off" },
                     log.display()
@@ -331,7 +466,27 @@ impl App {
         }
     }
 
-    /// Whether the background loop is currently running.
+    /// Stop every running background worker (#134). Reports how many were stopped,
+    /// or that none were running.
+    pub fn stop_all_workers(&mut self) {
+        let count = self.runner.running_count();
+        if count == 0 {
+            self.status = Some("No workers running.".to_string());
+            return;
+        }
+        self.runner.stop_all();
+        self.status = Some(format!(
+            "Stopped {count} worker{}.",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// How many background workers are currently running (#134).
+    pub fn workers_running(&mut self) -> usize {
+        self.runner.running_count()
+    }
+
+    /// Whether any background worker is currently running.
     pub fn loop_running(&mut self) -> bool {
         self.runner.is_running()
     }
@@ -344,6 +499,12 @@ impl App {
             .filter(|issue| issue.is_in_progress())
             .map(|issue| issue.number)
             .collect()
+    }
+
+    /// Numbers of the pull requests the loop is currently working (carry the
+    /// in-progress label), in list order (#133).
+    pub fn in_progress_pr_numbers(&self) -> Vec<u64> {
+        self.in_progress_prs.iter().map(|pr| pr.number).collect()
     }
 
     /// Whether the model picker popup is currently open.
@@ -445,7 +606,7 @@ impl App {
 
         let label = self.current_model_label().to_string();
         self.status = Some(if self.runner.is_running() {
-            format!("Model set to {label} (applies when the loop restarts).")
+            format!("Model set to {label} (applies to workers started next).")
         } else {
             format!("Model set to {label}.")
         });
@@ -468,6 +629,261 @@ impl App {
         let path = logs::latest_issue_log(&logs::logs_dir(&self.repo_root), number)?;
         let raw = logs::read_log_tail(&path, max_bytes).ok()?;
         Some((path, logs::sanitize(&raw)))
+    }
+
+    /// The pull requests the loop is currently resolving, in list order (#143).
+    pub fn in_progress_prs(&self) -> &[PullRequest] {
+        &self.in_progress_prs
+    }
+
+    /// Whether the PR-output popup is open (#143).
+    pub fn pr_output_open(&self) -> bool {
+        self.pr_output_open
+    }
+
+    /// Open the PR-output popup, keeping a valid selection when PRs exist (#143).
+    ///
+    /// The popup shows the transcript of whatever PR the loop is resolving; the
+    /// in-progress PR list is kept current by the periodic refresh (and `r`), so
+    /// opening the popup just surfaces it rather than making its own `gh` call.
+    pub fn open_pr_output(&mut self) {
+        let previous = self.selected_pr_number();
+        self.reselect_pr_output(previous);
+        self.pr_output_open = true;
+    }
+
+    /// Close the PR-output popup.
+    pub fn close_pr_output(&mut self) {
+        self.pr_output_open = false;
+    }
+
+    /// Move the PR-output highlight down by one, clamped to the last PR (#143).
+    pub fn pr_output_next(&mut self) {
+        if self.in_progress_prs.is_empty() {
+            return;
+        }
+        let last = self.in_progress_prs.len() - 1;
+        let next = self
+            .pr_output_state
+            .selected()
+            .map_or(0, |i| (i + 1).min(last));
+        self.pr_output_state.select(Some(next));
+    }
+
+    /// Move the PR-output highlight up by one, clamped to the first PR (#143).
+    pub fn pr_output_previous(&mut self) {
+        if self.in_progress_prs.is_empty() {
+            return;
+        }
+        let prev = self
+            .pr_output_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.pr_output_state.select(Some(prev));
+    }
+
+    /// The number of the PR selected in the PR-output popup, if any (#143).
+    fn selected_pr_number(&self) -> Option<u64> {
+        self.pr_output_state
+            .selected()
+            .and_then(|i| self.in_progress_prs.get(i))
+            .map(|pr| pr.number)
+    }
+
+    /// Point the PR-output selection at `previous` again after the list changed,
+    /// falling back to the clamped prior index, or clearing it when no PR is left
+    /// (#143). Keeps the highlight on the same PR as the list refreshes.
+    fn reselect_pr_output(&mut self, previous: Option<u64>) {
+        if self.in_progress_prs.is_empty() {
+            self.pr_output_state.select(None);
+            return;
+        }
+        let max = self.in_progress_prs.len() - 1;
+        let index = previous
+            .and_then(|n| self.in_progress_prs.iter().position(|pr| pr.number == n))
+            .unwrap_or_else(|| self.pr_output_state.selected().unwrap_or(0).min(max));
+        self.pr_output_state.select(Some(index));
+    }
+
+    /// The selected in-progress PR's number and its sanitized log tail, or `None`
+    /// when no PR is selected or the loop has produced no log for it yet (#143).
+    pub fn selected_pr_output(&self, max_bytes: u64) -> Option<(u64, String)> {
+        let number = self.selected_pr_number()?;
+        let path = logs::latest_issue_log(&logs::logs_dir(&self.repo_root), number)?;
+        let raw = logs::read_log_tail(&path, max_bytes).ok()?;
+        Some((number, logs::sanitize(&raw)))
+    }
+
+    /// Whether the closed-issues (spend) popup is open (#145).
+    pub fn closed_open(&self) -> bool {
+        self.closed_open
+    }
+
+    /// The closed issues shown in the popup, in list order (#145).
+    pub fn closed_issues(&self) -> &[Issue] {
+        &self.closed_issues
+    }
+
+    /// Total AI Credits spent across every closed issue currently shown, or
+    /// `None` when none of them carries a usage comment to total (#145).
+    pub fn closed_total_credits(&self) -> Option<f64> {
+        let mut total = 0.0;
+        let mut found = false;
+        for issue in &self.closed_issues {
+            if let Some(credits) = issue.credits_spent() {
+                total += credits;
+                found = true;
+            }
+        }
+        found.then_some(total)
+    }
+
+    /// Point the popup at the first closed issue (or nothing when empty) and mark
+    /// it open. Shared by [`open_closed`] and the test seam so both present the
+    /// list the same way (#145).
+    fn present_closed(&mut self) {
+        self.closed_state.select(if self.closed_issues.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        self.closed_open = true;
+    }
+
+    /// Open the closed-issues popup, fetching the closed issues (with their
+    /// comments) so each row's spend can be totalled (#145).
+    ///
+    /// The fetch is synchronous, matching the other `gh`-backed actions. On
+    /// failure the popup still opens with an empty list and the error on the
+    /// status line, rather than leaving the key feeling dead.
+    pub fn open_closed(&mut self) {
+        match github::fetch_closed_issues(self.limit) {
+            Ok(issues) => {
+                self.closed_issues = issues;
+                self.status = if self.closed_issues.is_empty() {
+                    Some("No closed issues found.".to_string())
+                } else {
+                    None
+                };
+            }
+            Err(err) => {
+                self.closed_issues = Vec::new();
+                self.status = Some(format!("Error: {err}"));
+            }
+        }
+        self.present_closed();
+    }
+
+    /// Close the closed-issues popup.
+    pub fn close_closed(&mut self) {
+        self.closed_open = false;
+    }
+
+    /// Move the closed-issues highlight down by one, clamped to the last (#145).
+    pub fn closed_next(&mut self) {
+        if self.closed_issues.is_empty() {
+            return;
+        }
+        let last = self.closed_issues.len() - 1;
+        let next = self
+            .closed_state
+            .selected()
+            .map_or(0, |i| (i + 1).min(last));
+        self.closed_state.select(Some(next));
+    }
+
+    /// Move the closed-issues highlight up by one, clamped to the first (#145).
+    pub fn closed_previous(&mut self) {
+        if self.closed_issues.is_empty() {
+            return;
+        }
+        let prev = self
+            .closed_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.closed_state.select(Some(prev));
+    }
+
+    /// Whether the issue-details popup is open (#152).
+    pub fn details_open(&self) -> bool {
+        self.details_open
+    }
+
+    /// The issue whose details are being shown, if any (#152).
+    pub fn details(&self) -> Option<&Issue> {
+        self.details.as_ref()
+    }
+
+    /// The details popup's current scroll offset, in rendered lines (#152).
+    pub fn details_scroll(&self) -> u16 {
+        self.details_scroll
+    }
+
+    /// Present a fetched issue in the details popup: store it, reset the scroll
+    /// to the top, and mark the popup open. Shared by [`open_details`] and the
+    /// test seam so both present the issue the same way (#152).
+    fn present_details(&mut self, issue: Issue) {
+        self.details = Some(issue);
+        self.details_scroll = 0;
+        self.details_open = true;
+    }
+
+    /// Open the details popup for the selected issue, fetching its body and
+    /// comments so the whole issue is readable in the TUI (#152).
+    ///
+    /// The fetch is synchronous, matching the other `gh`-backed actions (e.g.
+    /// [`open_closed`]). On failure the popup is left closed and the error is put
+    /// on the status line rather than opening an empty popup. A no-op when no
+    /// issue is selected.
+    pub fn open_details(&mut self) {
+        let Some(number) = self.selected().map(|issue| issue.number) else {
+            return;
+        };
+        match github::fetch_issue_details(number) {
+            Ok(issue) => {
+                self.status = None;
+                self.present_details(issue);
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// Close the details popup, dropping the fetched issue (#152).
+    pub fn close_details(&mut self) {
+        self.details_open = false;
+        self.details = None;
+        self.details_scroll = 0;
+    }
+
+    /// Scroll the details popup down by one line. The offset is clamped against
+    /// the content on render, so this only ever grows it (#152).
+    pub fn details_scroll_down(&mut self) {
+        self.details_scroll = self.details_scroll.saturating_add(1);
+    }
+
+    /// Scroll the details popup up by one line, stopping at the top (#152).
+    pub fn details_scroll_up(&mut self) {
+        self.details_scroll = self.details_scroll.saturating_sub(1);
+    }
+
+    /// Jump the details popup to the top (#152).
+    pub fn details_scroll_top(&mut self) {
+        self.details_scroll = 0;
+    }
+
+    /// Jump the details popup to the bottom. The offset is clamped to the last
+    /// page on render, so a max value lands on the final lines (#152).
+    pub fn details_scroll_bottom(&mut self) {
+        self.details_scroll = u16::MAX;
+    }
+
+    /// Clamp the details scroll offset to `max`, called from render once the
+    /// content's wrapped height and the viewport are known so the popup can
+    /// never scroll past its last line (#152).
+    pub fn clamp_details_scroll(&mut self, max: u16) {
+        if self.details_scroll > max {
+            self.details_scroll = max;
+        }
     }
 
     /// Whether the new-issue form is currently open.
@@ -579,6 +995,30 @@ impl App {
     pub fn set_repo_root(&mut self, repo_root: PathBuf) {
         self.repo_root = repo_root;
     }
+
+    /// Seed the in-progress PR list directly (tests only), standing in for a
+    /// `gh pr list` fetch. Reselects the PR-output highlight like a real refresh.
+    #[cfg(test)]
+    pub fn set_in_progress_prs(&mut self, prs: Vec<PullRequest>) {
+        let previous = self.selected_pr_number();
+        self.in_progress_prs = prs;
+        self.reselect_pr_output(previous);
+    }
+
+    /// Seed the closed-issues popup and open it (tests only), standing in for the
+    /// `gh issue list --state closed` fetch in [`open_closed`] (#145).
+    #[cfg(test)]
+    pub fn open_closed_with(&mut self, issues: Vec<Issue>) {
+        self.closed_issues = issues;
+        self.present_closed();
+    }
+
+    /// Seed the details popup with an issue and open it (tests only), standing in
+    /// for the `gh issue view` fetch in [`open_details`] (#152).
+    #[cfg(test)]
+    pub fn open_details_with(&mut self, issue: Issue) {
+        self.present_details(issue);
+    }
 }
 
 /// Issue numbers present in `current` but not `known` — the ones the loop has
@@ -599,6 +1039,13 @@ fn issue_title(issues: &[Issue], number: u64) -> Option<&str> {
         .map(|issue| issue.title.as_str())
 }
 
+/// The title of the pull request with `number`, if present. Pure for testing.
+fn pr_title(prs: &[PullRequest], number: u64) -> Option<&str> {
+    prs.iter()
+        .find(|pr| pr.number == number)
+        .map(|pr| pr.title.as_str())
+}
+
 /// Build the "loop started" feedback line for the issues that just entered the
 /// in-progress state, or `None` when none did. A single issue shows its title
 /// for context; several are listed by number. Pure for testing (#119).
@@ -617,6 +1064,40 @@ fn started_message(started: &[u64], issues: &[Issue]) -> Option<String> {
                 .join(", ");
             Some(format!("Loop started working on {list}."))
         }
+    }
+}
+
+/// Build the "loop started resolving" feedback line for the PRs that just
+/// entered the in-progress state, or `None` when none did. Mirrors
+/// [`started_message`] for pull requests: a single PR shows its title, several
+/// are listed by number. Pure for testing (#133).
+fn pr_started_message(started: &[u64], prs: &[PullRequest]) -> Option<String> {
+    match started {
+        [] => None,
+        [number] => Some(match pr_title(prs, *number) {
+            Some(title) => format!("Loop started resolving PR #{number}: {title}"),
+            None => format!("Loop started resolving PR #{number}."),
+        }),
+        many => {
+            let list = many
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("Loop started resolving PRs {list}."))
+        }
+    }
+}
+
+/// Join the issue and PR "started" lines into one status message, or `None`
+/// when both are empty. Keeps each announcement on the same status line so a
+/// tick that starts both an issue and a PR reports both. Pure for testing.
+fn combine_feedback(issue_msg: Option<String>, pr_msg: Option<String>) -> Option<String> {
+    match (issue_msg, pr_msg) {
+        (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -742,6 +1223,44 @@ mod tests {
     }
 
     #[test]
+    fn pr_started_message_wording_by_count() {
+        let prs =
+            github::parse_pull_requests(r#"[{"number":12,"title":"resolve conflicts"}]"#).unwrap();
+
+        assert!(pr_started_message(&[], &prs).is_none());
+        assert_eq!(
+            pr_started_message(&[12], &prs).as_deref(),
+            Some("Loop started resolving PR #12: resolve conflicts")
+        );
+        // A number with no matching PR falls back to just the number.
+        assert_eq!(
+            pr_started_message(&[99], &prs).as_deref(),
+            Some("Loop started resolving PR #99.")
+        );
+        assert_eq!(
+            pr_started_message(&[12, 15], &prs).as_deref(),
+            Some("Loop started resolving PRs #12, #15.")
+        );
+    }
+
+    #[test]
+    fn combine_feedback_joins_or_passes_through() {
+        assert_eq!(combine_feedback(None, None), None);
+        assert_eq!(
+            combine_feedback(Some("a".into()), None).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            combine_feedback(None, Some("b".into())).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            combine_feedback(Some("a".into()), Some("b".into())).as_deref(),
+            Some("a · b")
+        );
+    }
+
+    #[test]
     fn take_started_feedback_announces_each_start_once() {
         let json = r#"[
             {"number":10,"title":"a","labels":[{"name":"in-progress"}]},
@@ -770,26 +1289,121 @@ mod tests {
     }
 
     #[test]
-    fn mark_ready_is_safe_when_nothing_selected() {
-        let mut app = app_with(0);
-        app.mark_ready();
+    fn in_progress_pr_numbers_lists_the_worked_prs() {
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        assert_eq!(app.in_progress_pr_numbers(), vec![12, 15]);
+    }
+
+    #[test]
+    fn take_started_feedback_announces_pr_starts() {
+        // A PR the loop begins resolving is announced once, mirroring issues
+        // (#133). PRs are seeded via the test setter standing in for `gh`.
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"resolve conflicts"}]"#).unwrap(),
+        );
+
+        assert_eq!(
+            app.take_started_feedback().as_deref(),
+            Some("Loop started resolving PR #12: resolve conflicts")
+        );
+        // No change on the next check: the start is not re-announced.
+        assert!(app.take_started_feedback().is_none());
+    }
+
+    #[test]
+    fn take_started_feedback_reports_issue_and_pr_together() {
+        // A tick that starts both an issue and a PR reports both on one line.
+        let json = r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"b"}]"#).unwrap(),
+        );
+
+        let feedback = app
+            .take_started_feedback()
+            .expect("both should be announced");
+        assert!(feedback.contains("Loop started working on #10"));
+        assert!(feedback.contains("Loop started resolving PR #12"));
+    }
+
+    #[test]
+    fn apply_fetch_outcome_folds_in_issues_and_prs_and_announces() {
+        // A completed background fetch (#144) updates the list and PR set, and
+        // announces the freshly started issue and PR just like the old inline
+        // auto_refresh did — without touching `gh`.
+        let mut app = App::new(Vec::new());
+        let outcome = FetchOutcome {
+            issues: Ok(parse_issues(
+                r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#,
+            )
+            .unwrap()),
+            prs: Ok(github::parse_pull_requests(r#"[{"number":12,"title":"b"}]"#).unwrap()),
+        };
+
+        app.apply_fetch_outcome(outcome);
+
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.in_progress_pr_numbers(), vec![12]);
+        let status = app.status.as_deref().expect("a start is announced");
+        assert!(status.contains("Loop started working on #10"));
+        assert!(status.contains("Loop started resolving PR #12"));
+    }
+
+    #[test]
+    fn apply_fetch_outcome_swallows_errors_and_keeps_state() {
+        // A transient `gh` failure must not clobber the list or the status line
+        // (#144): both results erroring leaves everything as it was.
+        let json = r#"[{"number":7,"title":"keep"}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        let outcome = FetchOutcome {
+            issues: Err(anyhow::anyhow!("gh issue list failed")),
+            prs: Err(anyhow::anyhow!("gh pr list failed")),
+        };
+
+        app.apply_fetch_outcome(outcome);
+
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].number, 7);
+        assert!(app.status.is_none());
+        assert!(app.in_progress_pr_numbers().is_empty());
+    }
+
+    #[test]
+    fn poll_fetch_results_is_a_noop_without_a_fetcher() {
+        // Unit-test apps attach no worker, so draining is a harmless no-op.
+        let mut app = app_with(2);
+        app.poll_fetch_results();
+        assert_eq!(app.issues.len(), 2);
         assert!(app.status.is_none());
     }
 
     #[test]
-    fn mark_ready_short_circuits_when_already_labelled() {
+    fn toggle_ready_is_safe_when_nothing_selected() {
+        let mut app = app_with(0);
+        app.toggle_ready();
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn selected_is_ready_reflects_the_trigger_label() {
         let label = github::ready_label();
+
+        // Nothing selected: not ready.
+        assert!(!app_with(0).selected_is_ready());
+
+        // An unlabelled issue: not ready.
+        assert!(!app_with(1).selected_is_ready());
+
+        // An issue already carrying the trigger label: ready, so the footer
+        // offers `s unready` and `toggle_ready` would remove it (#146).
         let json = format!(r#"[{{"number":7,"title":"t","labels":[{{"name":"{label}"}}]}}]"#);
-        let mut app = App::new(parse_issues(&json).unwrap());
-
-        app.mark_ready();
-
-        // No gh call happened: label count is unchanged and the status explains why.
-        assert_eq!(app.issues[0].labels.len(), 1);
-        assert_eq!(
-            app.status.as_deref(),
-            Some(format!("#7 already labelled '{label}'.").as_str())
-        );
+        let app = App::new(parse_issues(&json).unwrap());
+        assert!(app.selected_is_ready());
     }
 
     #[test]
@@ -833,6 +1447,15 @@ mod tests {
     fn loop_is_not_running_before_it_is_started() {
         let mut app = app_with(0);
         assert!(!app.loop_running());
+        assert_eq!(app.workers_running(), 0);
+    }
+
+    #[test]
+    fn stop_all_workers_is_a_no_op_when_none_run() {
+        let mut app = app_with(1);
+        app.stop_all_workers();
+        // No worker was running, so nothing is stopped and the status says so.
+        assert_eq!(app.status.as_deref(), Some("No workers running."));
     }
 
     #[test]
@@ -965,6 +1588,111 @@ mod tests {
     }
 
     #[test]
+    fn pr_output_popup_is_hidden_by_default_and_toggles() {
+        let mut app = App::new(Vec::new());
+        assert!(!app.pr_output_open());
+        app.open_pr_output();
+        assert!(app.pr_output_open());
+        app.close_pr_output();
+        assert!(!app.pr_output_open());
+    }
+
+    #[test]
+    fn open_pr_output_selects_the_first_pr() {
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn pr_output_navigation_clamps_at_both_ends() {
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+
+        app.pr_output_previous(); // already at the top
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+        app.pr_output_next();
+        assert_eq!(app.pr_output_state.selected(), Some(1));
+        app.pr_output_next(); // clamp at the last PR
+        assert_eq!(app.pr_output_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn pr_output_navigation_is_safe_without_prs() {
+        let mut app = App::new(Vec::new());
+        app.open_pr_output();
+        app.pr_output_next();
+        app.pr_output_previous();
+        assert_eq!(app.pr_output_state.selected(), None);
+    }
+
+    #[test]
+    fn pr_output_selection_follows_the_pr_across_a_refresh() {
+        // The highlight tracks the same PR by number even when the list reorders
+        // or shrinks under it, so a background refresh never jumps it (#143).
+        let mut app = App::new(Vec::new());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+        app.pr_output_next(); // select #15 (index 1)
+
+        // Reordered so #15 is now first: the selection follows it.
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":15,"title":"b"},{"number":12,"title":"a"}]"#)
+                .unwrap(),
+        );
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+
+        // The selected PR finishing clears the highlight rather than dangling.
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"}]"#).unwrap(),
+        );
+        assert_eq!(app.pr_output_state.selected(), Some(0));
+        app.set_in_progress_prs(github::parse_pull_requests(r#"[]"#).unwrap());
+        assert_eq!(app.pr_output_state.selected(), None);
+    }
+
+    #[test]
+    fn selected_pr_output_reads_the_pr_log() {
+        let dir = std::env::temp_dir().join(format!("copilot-app-proutput-{}", std::process::id()));
+        let logs = dir.join(".copilot-loop").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("pr-12-20260101-000000.log"),
+            "\x1b[32mresolving\x1b[0m the conflict\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+        app.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"},{"number":15,"title":"b"}]"#)
+                .unwrap(),
+        );
+        app.open_pr_output();
+
+        let (number, text) = app.selected_pr_output(OUTPUT_TAIL_BYTES).expect("a PR log");
+        assert_eq!(number, 12);
+        assert_eq!(text, "resolving the conflict\n");
+
+        // The other PR has no log yet, so nothing is returned for it.
+        app.pr_output_next();
+        assert!(app.selected_pr_output(OUTPUT_TAIL_BYTES).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn open_create_enters_form_mode_with_empty_fields() {
         let mut app = app_with(3);
         app.status = Some("stale".to_string());
@@ -1046,5 +1774,143 @@ mod tests {
             app.status.as_deref(),
             Some("Title is required to create an issue.")
         );
+    }
+
+    /// A closed issue JSON with one usage comment worth `credits` AI Credits.
+    fn closed_issue_json(number: u64, credits: &str) -> String {
+        let body = format!("```\\nAI Credits {credits} (1s)\\n```\\n<!-- copilot-loop:usage -->");
+        format!(r#"{{"number":{number},"title":"t{number}","comments":[{{"body":"{body}"}}]}}"#)
+    }
+
+    #[test]
+    fn open_closed_with_selects_the_first_issue() {
+        let mut app = app_with(0);
+        let json = format!("[{}]", closed_issue_json(10, "100"));
+        app.open_closed_with(parse_issues(&json).unwrap());
+        assert!(app.closed_open());
+        assert_eq!(app.closed_state.selected(), Some(0));
+        assert_eq!(app.closed_issues().len(), 1);
+    }
+
+    #[test]
+    fn close_closed_hides_the_popup() {
+        let mut app = app_with(0);
+        app.open_closed_with(parse_issues(&format!("[{}]", closed_issue_json(10, "100"))).unwrap());
+        app.close_closed();
+        assert!(!app.closed_open());
+    }
+
+    #[test]
+    fn closed_navigation_clamps_at_both_ends() {
+        let mut app = app_with(0);
+        let json = format!(
+            "[{},{}]",
+            closed_issue_json(10, "100"),
+            closed_issue_json(11, "50")
+        );
+        app.open_closed_with(parse_issues(&json).unwrap());
+
+        app.closed_previous(); // already at the top
+        assert_eq!(app.closed_state.selected(), Some(0));
+        app.closed_next();
+        assert_eq!(app.closed_state.selected(), Some(1));
+        app.closed_next(); // clamp at the last issue
+        assert_eq!(app.closed_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn closed_navigation_is_safe_when_empty() {
+        let mut app = app_with(0);
+        app.open_closed_with(Vec::new());
+        assert_eq!(app.closed_state.selected(), None);
+        app.closed_next();
+        app.closed_previous();
+        assert_eq!(app.closed_state.selected(), None);
+    }
+
+    #[test]
+    fn closed_total_credits_sums_across_issues() {
+        let mut app = app_with(0);
+        let json = format!(
+            "[{},{}]",
+            closed_issue_json(10, "100"),
+            closed_issue_json(11, "50.5")
+        );
+        app.open_closed_with(parse_issues(&json).unwrap());
+        assert_eq!(app.closed_total_credits(), Some(150.5));
+    }
+
+    #[test]
+    fn closed_total_credits_is_none_without_any_spend() {
+        let mut app = app_with(0);
+        let json = r#"[{"number":10,"title":"t","comments":[{"body":"just a human comment"}]}]"#;
+        app.open_closed_with(parse_issues(json).unwrap());
+        assert_eq!(app.closed_total_credits(), None);
+    }
+
+    /// A single-issue JSON with a body and one comment, standing in for a
+    /// `gh issue view` fetch (#152).
+    fn detail_issue_json(number: u64) -> String {
+        format!(
+            r#"{{"number":{number},"title":"t{number}","body":"the description",
+                "comments":[{{"author":{{"login":"hubot"}},"body":"a comment",
+                             "createdAt":"2026-07-18T06:45:11Z"}}]}}"#
+        )
+    }
+
+    fn detail_issue(number: u64) -> Issue {
+        crate::github::parse_issue(&detail_issue_json(number)).unwrap()
+    }
+
+    #[test]
+    fn open_details_with_shows_the_issue_at_the_top() {
+        let mut app = app_with(2);
+        app.details_scroll = 9; // ensure the scroll is reset on open
+        app.open_details_with(detail_issue(10));
+        assert!(app.details_open());
+        assert_eq!(app.details_scroll(), 0);
+        let shown = app.details().expect("an issue is shown");
+        assert_eq!(shown.number, 10);
+        assert_eq!(shown.body, "the description");
+        assert_eq!(shown.comments.len(), 1);
+    }
+
+    #[test]
+    fn close_details_hides_the_popup_and_drops_the_issue() {
+        let mut app = app_with(2);
+        app.open_details_with(detail_issue(10));
+        app.close_details();
+        assert!(!app.details_open());
+        assert!(app.details().is_none());
+        assert_eq!(app.details_scroll(), 0);
+    }
+
+    #[test]
+    fn details_scroll_moves_and_clamps_at_the_top() {
+        let mut app = app_with(1);
+        app.open_details_with(detail_issue(10));
+
+        app.details_scroll_up(); // already at the top
+        assert_eq!(app.details_scroll(), 0);
+        app.details_scroll_down();
+        app.details_scroll_down();
+        assert_eq!(app.details_scroll(), 2);
+        app.details_scroll_up();
+        assert_eq!(app.details_scroll(), 1);
+        app.details_scroll_top();
+        assert_eq!(app.details_scroll(), 0);
+    }
+
+    #[test]
+    fn clamp_details_scroll_caps_at_the_content_height() {
+        let mut app = app_with(1);
+        app.open_details_with(detail_issue(10));
+        app.details_scroll_bottom();
+        assert_eq!(app.details_scroll(), u16::MAX);
+        app.clamp_details_scroll(4);
+        assert_eq!(app.details_scroll(), 4);
+        // A larger max leaves an already-in-range offset untouched.
+        app.clamp_details_scroll(10);
+        assert_eq!(app.details_scroll(), 4);
     }
 }

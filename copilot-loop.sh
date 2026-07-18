@@ -31,6 +31,12 @@
 #   0. Turn any markdown files in issues/ into GitHub issues (labelled with the
 #      trigger label, or per a "Label:" directive in the file) so file-based
 #      tasks enter the queue below.
+#   0b. Sync the local default branch with origin/<default> so the loop's
+#      baseline matches the remote before any work. A clean update fast-forwards;
+#      when the local default branch has diverged and the merge conflicts, the
+#      conflicts are handed to Copilot to resolve so the loop can move forward
+#      (the resolved merge is kept local, never pushed). Set SYNC_REMOTE=0 to
+#      turn this off (see the "sync-default helpers").
 #   1. Before starting any new task, check open PRs targeting the default branch
 #      for merge conflicts. GitHub computes mergeability asynchronously, so the
 #      loop first waits (bounded) for any PR still reported UNKNOWN to be
@@ -143,6 +149,9 @@
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
+# Plus SYNC_REMOTE (env-only, no flag): set to 0 to stop the loop syncing the
+# local default branch with the remote before each pass; on by default (see the
+# flow's step 0b — a diverged merge conflict is handed to Copilot to resolve).
 # Plus MERGEABILITY_WAIT_ATTEMPTS / MERGEABILITY_WAIT_SECONDS (env-only): bound
 # the wait for GitHub to finish computing PR mergeability before the conflict
 # check, so a still-UNKNOWN (not yet evaluated) conflict is not skipped. Defaults
@@ -199,10 +208,20 @@ ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
 QUIET="${QUIET:-}"
+# When non-empty, log() also appends its line to this per-run log file, so the
+# loop's own narration (branch creation, "running copilot", PR push, ...) lands
+# in the same issue-<n>/pr-<n> log as Copilot's transcript. The TUI's per-issue
+# output panel reads that file, so it then shows the full run — matching what the
+# bash loop prints to the terminal instead of "just the copilot output" (#126).
+CURRENT_RUN_LOG=""
 # Set SELF_UPDATE=0 to stop the loop pulling and restarting itself when this
 # script changes upstream. Left unset it is auto-enabled whenever the script is
 # a tracked file inside the repo it operates on.
 SELF_UPDATE="${SELF_UPDATE:-}"
+# Set SYNC_REMOTE=0 to stop the loop syncing the local default branch with the
+# remote before each pass. On by default; when the default branch has diverged
+# and the merge conflicts, Copilot is asked to resolve it so the loop can move on.
+SYNC_REMOTE="${SYNC_REMOTE:-}"
 # Whether each issue gets its own git worktree instead of switching branches in
 # the shared checkout. On by default so every task runs in a different folder;
 # set to 0 (or pass --no-worktrees) to work in place. 1/true/yes/on force it on.
@@ -263,8 +282,18 @@ FAILURE_MARKER="<!-- copilot-loop:failed -->"
 USAGE_MARKER="<!-- copilot-loop:usage -->"
 
 # --- Helpers -----------------------------------------------------------------
+# Emit a timestamped status line to stdout. When CURRENT_RUN_LOG is set (during a
+# per-issue or per-PR run) the same line is also appended to that run's log file,
+# so the loop's narration is interleaved with Copilot's transcript there and the
+# TUI's output panel shows the full run, not just Copilot's output (#126). The
+# mirror is best-effort: a write failure never breaks the loop.
 log() {
-  printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+  local line
+  line="$(printf '%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")"
+  printf '%s\n' "$line"
+  if [ -n "${CURRENT_RUN_LOG:-}" ]; then
+    printf '%s\n' "$line" >>"$CURRENT_RUN_LOG" 2>/dev/null || true
+  fi
 }
 
 die() {
@@ -580,9 +609,14 @@ ${capped}
 EOF
 )"
 
-  # Cheapest model, no color/logs; time-boxed. Append provider noise to the log
-  # for debugging but keep stdout to just the class. Fall back on any failure.
+  # Cheapest model, no color/logs; time-boxed. Pin to the issue workspace (when
+  # one exists) so triage never runs against the shared checkout. Append provider
+  # noise to the log for debugging but keep stdout to just the class. Fall back
+  # on any failure.
+  local -a _ws_args=()
+  [ -n "${WORKSPACE_DIR:-}" ] && _ws_args=(-C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR")
   raw="$(_run_with_timeout 60 copilot -p "$prompt" \
+           ${_ws_args[@]+"${_ws_args[@]}"} \
            --model "$TRIAGE_MODEL" --allow-all-tools --no-color --log-level none 2>>"$log_file")"
   class="$(normalize_triage_class "$raw")"
   [ -n "$class" ] && printf '%s' "$class"
@@ -852,6 +886,14 @@ if [ "$SELF_UPDATE" = 1 ]; then
   [ -n "$SCRIPT_REL" ] || SELF_UPDATE=0
 fi
 
+# Whether to sync the local default branch with origin/<default> before each pass
+# (see sync_default_branch, called at the top of the main loop). On unless an
+# explicit 0/false/no/off turns it off.
+case "$SYNC_REMOTE" in
+  0|false|no|off) SYNC_REMOTE=0 ;;
+  *)              SYNC_REMOTE=1 ;;
+esac
+
 # Decide whether to isolate each issue in its own git worktree. On by default so
 # every task works in a different folder and parallel instances never touch the
 # same checkout; pass --no-worktrees (or USE_WORKTREES=0) to work in place
@@ -956,6 +998,36 @@ _worktree_path() {
   printf '%s/%s' "$WORKTREE_BASE" "$(printf '%s' "$1" | tr '/' '-')"
 }
 
+# _worktree_lock_state <branch>
+# Classify the lock on the worktree that has <branch> checked out, so cleanup
+# can tell its own (reclaimable) worktree from one a *different* live run still
+# owns (#106):
+#   unlocked  -> not locked
+#   pid:<N>   -> locked by a copilot-loop run whose pid is <N> (see the reason
+#                prepare_workspace writes)
+#   locked    -> locked without our pid marker (e.g. a manual `git worktree lock`)
+# Matches on the branch ref rather than the path so it stays correct when git
+# reports a resolved path (e.g. macOS /var -> /private/var); the lock reason is
+# emitted on the `locked` line, unquoted for our plain reason.
+_worktree_lock_state() {
+  local branch="$1" line target=0 pid
+  [ -n "$branch" ] || { printf 'unlocked'; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) target=0 ;;
+      "branch refs/heads/$branch") target=1 ;;
+      locked|"locked "*)
+        if [ "$target" = 1 ]; then
+          pid="$(printf '%s\n' "$line" | sed -n 's/.*pid \([0-9][0-9]*\).*/\1/p')"
+          if [ -n "$pid" ]; then printf 'pid:%s' "$pid"; else printf 'locked'; fi
+          return 0
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  printf 'unlocked'
+}
+
 # prepare_workspace <branch> <start-ref>
 # Create (or reset) <branch> at <start-ref> and set WORKSPACE_DIR. Returns 1 if
 # the branch/worktree could not be created.
@@ -992,6 +1064,25 @@ cleanup_workspace() {
   local branch="$1"
   if [ "$USE_WORKTREES" = 1 ]; then
     local wt; wt="$(_worktree_path "$branch")"
+    # Never tear down a worktree a *different* live run still owns: removing it
+    # would delete an active Copilot session's working directory — the #106
+    # race. Our own lock (pid $$) and a crashed run's stale lock (a pid no
+    # longer alive) are safe to reclaim; a foreign live lock, or one placed by
+    # hand (no pid marker), is left strictly alone so the session survives.
+    local lock_state; lock_state="$(_worktree_lock_state "$branch")"
+    case "$lock_state" in
+      "pid:$$") : ;;                                   # our own lock -> reclaim
+      pid:*)
+        if kill -0 "${lock_state#pid:}" 2>/dev/null; then
+          WORKSPACE_DIR=""
+          return 0                                     # another live run owns it
+        fi
+        ;;                                             # dead pid -> reclaim
+      locked)
+        WORKSPACE_DIR=""
+        return 0                                       # locked by hand -> leave it
+        ;;
+    esac
     # Unlock first: prepare_workspace locked it while the run was live, and a
     # locked worktree cannot be removed with a single --force.
     git worktree unlock "$wt" >/dev/null 2>&1 || true
@@ -1103,6 +1194,13 @@ remove_local_branch() {
   local branch="$1" wt
   branch_is_ours "$branch" || return 0
   wt="$(_worktree_dir_for_branch "$branch")"
+  if [ -n "$wt" ] && _worktree_is_locked "$wt"; then
+    # Defence-in-depth (#106): a locked worktree belongs to a live Copilot
+    # session. Never remove it — nor delete its branch — even when this is
+    # reached directly or the lock was taken after the sweep's own guard ran.
+    log "cleanup: keeping $branch (worktree in use)"
+    return 0
+  fi
   if [ -n "$wt" ]; then
     git worktree remove --force "$wt" >/dev/null 2>&1 || true
   fi
@@ -1224,10 +1322,10 @@ process_issue() {
   commit_msg="Resolve #${num}: ${title}"
   pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
-  # Copilot writes here when it needs to ask the user something. Lives in the
-  # gitignored work dir so it is never committed; clear any stale copy.
-  question_file="$WORK_DIR/issue-${num}.question"
-  rm -f "$question_file"
+  # Mirror this run's status lines into the per-issue log so the TUI's output
+  # panel shows the branch creation and the rest of the loop's narration, not
+  # just Copilot's transcript (#126). Cleared at the top of the main loop.
+  CURRENT_RUN_LOG="$log_file"
 
   log "issue #$num on $REPO_SLUG: $title"
 
@@ -1247,6 +1345,15 @@ process_issue() {
     _fail_issue "$num" "$log_file" "could not create work branch $branch"
     return 1
   fi
+
+  # Copilot writes here when it needs to ask the user something instead of
+  # coding. Kept inside the per-issue workspace (never the shared checkout) under
+  # its gitignored control dir; the ask-path returns before any commit, so it is
+  # never included in a PR. A fresh worktree carries no stale copy, but clear it
+  # defensively.
+  question_file="$WORKSPACE_DIR/.copilot-loop/issue-${num}.question"
+  mkdir -p "$(dirname "$question_file")" 2>/dev/null || true
+  rm -f "$question_file"
 
   # Surface the freshly created branch before Copilot starts: log it and set the
   # terminal tab/window title (and tmux window name) to the branch name.
@@ -1281,10 +1388,11 @@ when you genuinely cannot proceed without their input.
 EOF
 )"
 
-  # Run Copilot non-interactively from the issue's workspace. All tools allowed
-  # and file access stays restricted to that checkout (we deliberately do not
-  # pass --allow-all-paths); WORK_DIR is additionally allowed so Copilot can
-  # write the question file there when its workspace is a separate worktree.
+  # Run Copilot non-interactively, pinned to the issue's workspace: -C makes that
+  # worktree Copilot's working directory and --add-dir keeps file access
+  # restricted to it (we deliberately do not pass --allow-all-paths), so Copilot
+  # only ever edits the created folder and never the shared checkout. The
+  # question file lives inside that workspace, so no other directory is granted.
   # Choose the coding model. When triage is enabled, classify the issue with the
   # cheap TRIAGE_MODEL and map the class to a coding model via TRIAGE_MAP; on any
   # failure, or a class with no mapping, fall back to the global COPILOT_MODEL so
@@ -1306,7 +1414,7 @@ EOF
     fi
   fi
 
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --add-dir "$WORK_DIR" --no-color --log-level none)
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
 
   log "issue #$num: running copilot (log: $log_file)"
@@ -1839,6 +1947,10 @@ resolve_pr_conflicts() {
       --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
   [ -n "$base" ] || base="$DEFAULT_BRANCH"
   log_file="$LOG_DIR/pr-${num}-$(date '+%Y%m%d-%H%M%S').log"
+  # Mirror this run's status lines into the per-PR log so the TUI's output panel
+  # shows the loop's narration alongside Copilot's transcript (#126). Cleared at
+  # the top of the main loop.
+  CURRENT_RUN_LOG="$log_file"
 
   if [ -z "$head" ]; then
     log "PR #$num: could not determine head branch, skipping"
@@ -1885,7 +1997,7 @@ branches — those steps are handled automatically outside this session. Only ed
 files to resolve the conflicts and verify.
 EOF
 )"
-    local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+    local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
@@ -1963,6 +2075,10 @@ resolve_pr_check_failures() {
       --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
   [ -n "$base" ] || base="$DEFAULT_BRANCH"
   log_file="$LOG_DIR/pr-${num}-checks-$(date '+%Y%m%d-%H%M%S').log"
+  # Mirror this run's status lines into the per-PR log so the TUI's output panel
+  # shows the loop's narration alongside Copilot's transcript (#126). Cleared at
+  # the top of the main loop.
+  CURRENT_RUN_LOG="$log_file"
 
   if [ -z "$head" ]; then
     log "PR #$num: could not determine head branch, skipping"
@@ -1997,7 +2113,7 @@ fix. Do NOT run git commit, git push, or create branches — those steps are han
 automatically outside this session. Only edit files and verify.
 EOF
 )"
-  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
 
   log "PR #$num: running copilot to fix failing checks (log: $log_file)"
@@ -2223,11 +2339,181 @@ self_update() {
   exec "$SCRIPT_PATH" ${SELF_ARGS[@]+"${SELF_ARGS[@]}"}
 }
 
+# --- Sync: bring the local default branch up to date with the remote ---------
+# Before starting any new work, sync the local default branch with
+# origin/<default> so the loop's baseline matches the remote. A clean update is a
+# fast-forward; when the local default branch has diverged (it carries commits
+# that conflict with what landed on the remote) the merge is handed to Copilot to
+# resolve so the loop can move forward instead of stalling on a stale branch. The
+# resolved merge is kept local only — the loop never pushes the default branch
+# (pull requests do that). Best effort: any inability to sync is logged and the
+# loop carries on, and an identical divergence Copilot already failed to resolve
+# is skipped (marker) so it is not re-run every pass.
+#
+# classify_sync_state is pure and, with sync_default_branch, is covered by
+# tests/sync-default-branch.test.sh between the markers — keep them intact.
+# >>> sync-default helpers >>>
+# classify_sync_state <upstream_is_ancestor_of_local> <local_is_ancestor_of_upstream>
+# Classify how the local default branch relates to its upstream from the two
+# `git merge-base --is-ancestor` outcomes (each "yes" when the ancestor test
+# passed, anything else means no):
+#   insync   - upstream already contained locally (equal, or local ahead): nothing to pull
+#   ff       - local strictly behind upstream with no divergence: fast-forward
+#   diverged - each side has unique commits: a real merge that may conflict
+# Pure string logic so it can be unit tested without git.
+classify_sync_state() {
+  case "$1" in yes) printf 'insync'; return ;; esac
+  case "$2" in yes) printf 'ff';     return ;; esac
+  printf 'diverged'
+}
+
+sync_default_branch() {
+  [ "$SYNC_REMOTE" = 1 ] || return 0
+
+  git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || return 0
+  local upstream="origin/${DEFAULT_BRANCH}" local_ref="refs/heads/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$upstream"  >/dev/null 2>&1 || return 0
+  # Nothing to sync when there is no local default branch (e.g. a detached or
+  # bare-worktree layout) — new work still bases off the fresh origin/<default>.
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$local_ref" >/dev/null 2>&1 || return 0
+
+  local upstream_anc=no local_anc=no state
+  git -C "$REPO_DIR" merge-base --is-ancestor "$upstream" "$local_ref" >/dev/null 2>&1 && upstream_anc=yes
+  git -C "$REPO_DIR" merge-base --is-ancestor "$local_ref" "$upstream" >/dev/null 2>&1 && local_anc=yes
+  state="$(classify_sync_state "$upstream_anc" "$local_anc")"
+  [ "$state" = insync ] && return 0
+
+  local cur_branch
+  cur_branch="$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+
+  if [ "$state" = ff ]; then
+    # No divergence: fast-forward the checkout when the default branch is checked
+    # out here, otherwise just advance the local ref (safe, no working-tree move).
+    if [ "$cur_branch" = "$DEFAULT_BRANCH" ]; then
+      git -C "$REPO_DIR" merge --ff-only "$upstream" >/dev/null 2>&1 \
+        && log "synced $DEFAULT_BRANCH with origin (fast-forward)"
+    else
+      git -C "$REPO_DIR" branch -f "$DEFAULT_BRANCH" "$upstream" >/dev/null 2>&1 \
+        && log "synced $DEFAULT_BRANCH with origin (fast-forward)"
+    fi
+    return 0
+  fi
+
+  # Diverged. Resolving means merging in the default branch's working tree, so we
+  # only do it when the default branch is the checkout the loop owns (REPO_DIR);
+  # when it is checked out elsewhere we must not touch that tree.
+  if [ "$cur_branch" != "$DEFAULT_BRANCH" ]; then
+    log "$DEFAULT_BRANCH has diverged from origin but is not checked out here; skipping sync"
+    return 0
+  fi
+
+  # Skip a divergence we already handed to Copilot and could not resolve, until
+  # either side moves, so an unresolvable conflict is not re-run every pass.
+  local local_sha upstream_sha marker
+  local_sha="$(git -C "$REPO_DIR" rev-parse "$local_ref" 2>/dev/null)"
+  upstream_sha="$(git -C "$REPO_DIR" rev-parse "$upstream" 2>/dev/null)"
+  marker="$WORK_DIR/sync-unresolved"
+  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "${local_sha} ${upstream_sha}" ]; then
+    return 0
+  fi
+
+  log "$DEFAULT_BRANCH has diverged from origin; syncing"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  local log_file
+  log_file="$LOG_DIR/sync-$(date '+%Y%m%d-%H%M%S').log"
+
+  # A clean merge means there was nothing to resolve; a failed one leaves conflict
+  # markers for Copilot (or failed for another reason, handled below).
+  if git -C "$REPO_DIR" merge --no-edit "$upstream" >>"$log_file" 2>&1; then
+    rm -f "$marker"
+    log "synced $DEFAULT_BRANCH with origin (merged, no conflicts)"
+    return 0
+  fi
+
+  local conflicts
+  conflicts="$(git -C "$REPO_DIR" diff --name-only --diff-filter=U 2>/dev/null)"
+  if [ -z "$conflicts" ]; then
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    log "could not sync $DEFAULT_BRANCH with origin; leaving it unchanged"
+    return 0
+  fi
+  log "resolving $DEFAULT_BRANCH sync conflicts in: $(printf '%s' "$conflicts" | tr '\n' ' ')"
+
+  local prompt
+  prompt="$(cat <<EOF
+You are working in a git repository. Merging the remote branch
+"origin/${DEFAULT_BRANCH}" into the local "${DEFAULT_BRANCH}" branch produced
+conflicts that must be resolved before the automation can continue.
+
+These files contain git conflict markers (<<<<<<<, =======, >>>>>>>):
+${conflicts}
+
+Resolve every conflict so the result is correct and preserves the intent of both
+sides, then remove all conflict markers. Run any build or test commands needed to
+verify your work. Do NOT run git commit, git merge, git push, or create
+branches — those steps are handled automatically outside this session. Only edit
+files to resolve the conflicts and verify.
+EOF
+)"
+  local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+
+  if ! cd "$REPO_DIR" 2>/dev/null; then
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    log "could not enter $REPO_DIR to resolve $DEFAULT_BRANCH sync conflicts; leaving it unchanged"
+    return 0
+  fi
+  log "running copilot to resolve $DEFAULT_BRANCH sync conflicts (log: $log_file)"
+  run_copilot "$log_file" "${copilot_args[@]}"
+  log "copilot exited with code $COPILOT_RC while resolving $DEFAULT_BRANCH sync"
+
+  # Bail if Copilot left conflict markers behind; record the divergence so we do
+  # not re-run it on the identical local/upstream pair next pass.
+  local f unresolved=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$REPO_DIR/$f" ] && grep -qE '^(<{7}|>{7})' "$REPO_DIR/$f" && unresolved="$unresolved $f"
+  done <<< "$conflicts"
+  if [ -n "$unresolved" ]; then
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    printf '%s %s\n' "$local_sha" "$upstream_sha" >"$marker" 2>/dev/null || true
+    log "could not resolve $DEFAULT_BRANCH sync conflicts (markers left in:$unresolved); leaving it unchanged"
+    return 0
+  fi
+
+  # Stage exactly the resolved conflict files (non-conflicted merge changes are
+  # already staged) so untracked files in the checkout are never swept into the
+  # merge commit, then complete the merge locally without pushing.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    git -C "$REPO_DIR" add -- "$f" >/dev/null 2>&1 || true
+  done <<< "$conflicts"
+  if git -C "$REPO_DIR" commit --no-edit >/dev/null 2>&1 \
+     || git -C "$REPO_DIR" commit -m "Merge origin/${DEFAULT_BRANCH} into ${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+    rm -f "$marker"
+    log "resolved $DEFAULT_BRANCH sync conflicts with origin (kept local, not pushed)"
+  else
+    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
+    log "failed to commit resolved $DEFAULT_BRANCH sync; leaving it unchanged"
+  fi
+  return 0
+}
+# <<< sync-default helpers <<<
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
+  # Each iteration's setup and queue-scanning logs belong to the loop itself, not
+  # to any one run, so drop the per-run mirror before the next run claims it
+  # (#126). process_issue / resolve_pr_* re-arm it once they know their log file.
+  CURRENT_RUN_LOG=""
+
   # Keep the loop current before starting any new work: pull the default branch
   # and re-exec if this script changed upstream.
   self_update
+
+  # Sync the local default branch with the remote so new work starts from the
+  # latest baseline; a diverged merge conflict is handed to Copilot to resolve.
+  sync_default_branch
 
   process_issue_files
 

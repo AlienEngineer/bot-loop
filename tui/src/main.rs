@@ -9,6 +9,7 @@ mod logs;
 mod models;
 mod runner;
 mod ui;
+mod worker;
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,10 @@ fn main() -> Result<()> {
         Err(err) => app.status = Some(format!("Error: {err}")),
     }
 
+    // Run the `gh` issue/PR queries on a worker thread so the periodic
+    // auto-refresh never blocks the UI loop (#144).
+    app.set_fetcher(worker::IssueFetcher::spawn(DEFAULT_LIMIT));
+
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
@@ -50,6 +55,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_refresh = Instant::now();
     let mut loop_was_running = false;
     while !app.should_quit {
+        // Fold in any issue/PR data the worker thread finished fetching, so the
+        // list tracks the loop without the UI thread ever blocking on `gh`.
+        app.poll_fetch_results();
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if event::poll(Duration::from_millis(250))?
@@ -98,6 +107,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The PR-output popup captures keys while it is open (#143).
+    if app.pr_output_open() {
+        handle_pr_output_key(app, key);
+        return;
+    }
+
+    // The closed-issues (spend) popup captures keys while it is open (#145).
+    if app.closed_open() {
+        handle_closed_key(app, key);
+        return;
+    }
+
+    // The issue-details popup captures keys while it is open (#152).
+    if app.details_open() {
+        handle_details_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -111,12 +138,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('G') | KeyCode::End => app.last(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('c') => app.open_create(),
-        KeyCode::Char('s') | KeyCode::Enter => app.mark_ready(),
+        KeyCode::Char('s') | KeyCode::Enter => app.toggle_ready(),
         KeyCode::Char('x') => app.request_close(),
-        KeyCode::Char('l') => app.toggle_loop(),
+        KeyCode::Char('l') => app.start_worker(),
+        KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('a') => app.toggle_auto_merge(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
+        KeyCode::Char('p') => app.open_pr_output(),
+        KeyCode::Char('t') => app.open_closed(),
+        KeyCode::Char('d') => app.open_details(),
         _ => {}
     }
 }
@@ -143,6 +174,41 @@ fn handle_close_confirm_key(app: &mut App, key: KeyEvent) {
         | KeyCode::Char('q')
         | KeyCode::Esc
         | KeyCode::Enter => app.cancel_close(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the PR-output popup is open: navigate the resolving PRs,
+/// and close on `q`, `Esc`, or `p` (#143).
+fn handle_pr_output_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.pr_output_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.pr_output_previous(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('p') => app.close_pr_output(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the closed-issues (spend) popup is open: navigate the
+/// closed issues, and close on `q`, `Esc`, or `t` (#145).
+fn handle_closed_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.closed_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.closed_previous(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('t') => app.close_closed(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the issue-details popup is open: scroll the body and
+/// comment thread, jump to top/bottom, and close on `q`, `Esc`, or `d` (#152).
+fn handle_details_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.details_scroll_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.details_scroll_up(),
+        KeyCode::Char('g') | KeyCode::Home => app.details_scroll_top(),
+        KeyCode::Char('G') | KeyCode::End => app.details_scroll_bottom(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('d') => app.close_details(),
         _ => {}
     }
 }

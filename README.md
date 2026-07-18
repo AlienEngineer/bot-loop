@@ -67,28 +67,43 @@ that spawns, monitors, and stops several loop instances ("bots") side by side.
 A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). The
 first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
-authenticated for the target repo. Press `s` (or `Enter`) to add the trigger
-label (`ready`, or `$TRIGGER_LABEL`) to the selected issue so the loop picks it
-up. Press `c` to create a new issue: fill in a title and description, then
+authenticated for the target repo. Press `s` (or `Enter`) to toggle the trigger
+label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
+absent so the loop picks the issue up, or removed when present so a
+mistakenly-queued issue can be pulled back out (#146). Press `c` to create a new issue: fill in a title and description, then
 `Ctrl+S` to submit it (no label is added by default). Press `x` to close the
 selected issue: a confirmation popup names it, then `y` closes it on GitHub
-(`n`/`Esc` cancels). Press `l` to start (or
-stop) a background `copilot-loop.sh` that works through the ready issues; it
-runs detached — output captured to `.copilot-loop/tui/loop.log` — and keeps
-going after you quit the TUI. The loop script is found at the repo root
+(`n`/`Esc` cancels). Press `l` to start a background `copilot-loop.sh` worker
+that works through the ready issues; press `l` again to add more workers running
+in parallel. Each worker claims issues under a GitHub lock (and isolates each in
+its own git worktree), so multiple workers safely pick *different* issues (#134).
+Press `L` (Shift+L) to stop every worker. Workers run detached — each one's
+output captured to `.copilot-loop/tui/loop-<n>.log` — and keep going after you
+quit the TUI. The loop script is found at the repo root
 (override with `$COPILOT_LOOP_SCRIPT`). Press `o` to open a side panel on the
 right that tails the running loop's output for the selected issue (its
 `.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
-to close it.
+to close it. That log holds the loop's own narration — branch creation, "running
+copilot", the PR push — interleaved with Copilot's transcript, so the panel shows
+the whole run just as the bash loop prints it to the terminal, not only Copilot's
+output (#126).
 
-While the loop runs the header shows a turning spinner next to `loop: running`
-and the issue it is working (`working #96`, or `waiting for work` when idle), and
-the list refreshes on its own so `in-progress` issues — flagged with a spinner in
-their row — appear as the loop claims them, without a manual refresh (#115).
+While workers run the header shows a turning spinner next to `loop: running`,
+how many workers are running, and the issues they are working (`working #96, #97`,
+or `waiting for work` when idle), and the list refreshes on its own so
+`in-progress` issues — flagged with a spinner in their row — appear as the
+workers claim them, without a manual refresh (#115). The workers also handle pull
+requests (resolving merge conflicts and fixing failing checks); since PRs are not
+in the issue list, the header calls that out with its own spinner and a
+`resolving PR #12` note, and the status line announces each PR a worker starts, so
+it is always clear a worker is busy on a PR (#133). Press `p` to open a popup that
+lists the PRs being resolved and tails the selected one's transcript (its
+`.copilot-loop/logs/pr-<n>-…log`); when several resolve at once, `j`/`k` switch
+between them, and `Esc` (or `p`/`q`) closes it (#143).
 
 Press `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
-`copilot-loop.sh` as `--model` the next time the loop starts; `auto` lets Copilot
+`copilot-loop.sh` as `--model` for workers started after that; `auto` lets Copilot
 pick. The picker's list defaults to a small built-in set — override it with
 `$COPILOT_MODELS` (a comma- or space-separated list).
 
@@ -98,15 +113,30 @@ repo allows it, otherwise an immediate merge); the header shows `auto-merge: on`
 Like the model, the setting takes effect the next time the loop starts, so a
 running loop keeps its behaviour until restarted.
 
+Press `t` to open a popup listing the repository's closed issues alongside how
+much each one cost to resolve. The spend is the sum of the `AI Credits` the loop
+posted on the issue (its `<!-- copilot-loop:usage -->` comments), shown per row
+with the grand total in the popup's title; issues closed by hand — with no
+recorded spend — show a `—`. Navigate with `j`/`k`; `Esc` (or `t`/`q`) closes it
+(#145).
+
+Press `d` to open a popup with the selected issue's full details — its title,
+number, author, labels, description, and the whole comment thread (each comment's
+author, date, and body) — so an issue can be read without leaving the TUI. The
+content is fetched fresh with `gh issue view`; scroll it with `j`/`k` (`g`/`G`
+jump to top/bottom) and `Esc` (or `d`/`q`) closes it (#152).
+
 ```sh
 cd tui
 cargo run
 ```
 
 Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-start (mark ready), `x` close the selected issue (confirm with `y`), `l` start/stop
+toggle the ready label (mark ready, or remove it if already ready), `x` close the selected issue (confirm with `y`), `d` view the selected issue's details and comments, `l` start/stop
 the background loop, `a` toggle auto-merge, `m` pick the model, `o`
-show/hide the output panel, `r` refresh, `q` (or `Esc`) quit. In the new-issue
+show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
+issues and their cost, `r` refresh, `q` (or
+`Esc`) quit. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
 
@@ -152,6 +182,22 @@ loop never interrupts in-flight CI. A PR whose checks Copilot cannot fix (it mak
 no changes, or the push fails) is labelled `checks-unresolved` and left alone
 rather than retried forever — remove that label by hand to let the loop try again.
 
+### Syncing with the remote
+
+Before starting any new work each pass, the loop syncs the local default branch
+with the remote so new tasks branch from the latest baseline. A clean update is a
+fast-forward. If the local default branch has *diverged* from the remote (it
+carries local commits that conflict with what landed upstream), the loop merges
+the remote in and, when that conflicts, hands the conflicted files to Copilot to
+resolve so it can move forward instead of stalling on a stale branch. The
+resolved merge is kept **local only** — the loop never pushes the default branch
+(pull requests do that). A divergence Copilot cannot resolve is left untouched
+and not re-tried until either side moves, so it never loops forever. Turn the
+whole step off with `SYNC_REMOTE=0`.
+
+This runs for every loop instance, including the ones the TUI starts, since the
+TUI drives the same `copilot-loop.sh`.
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
@@ -175,7 +221,9 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | Delete a merged issue's remote branch (default: auto) |
 
 Env-only settings: `SELF_UPDATE` (set to `0` to stop the loop pulling and
-re-execing itself when the script changes upstream).
+re-execing itself when the script changes upstream) and `SYNC_REMOTE` (set to
+`0` to stop the loop syncing the local default branch with the remote before each
+pass).
 
 Run `./copilot-loop.sh --help`, or read the header of
 [`copilot-loop.sh`](./copilot-loop.sh), for the complete and authoritative list.

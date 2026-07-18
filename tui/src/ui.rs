@@ -14,7 +14,8 @@ use crate::logs;
 
 /// Draw the whole UI: header, issue list (or placeholder), and footer.
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let loop_running = app.loop_running();
+    let workers = app.workers_running();
+    let loop_running = workers > 0;
     let [header_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -22,9 +23,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, app, loop_running);
+    render_header(frame, header_area, app, workers);
     render_body(frame, body_area, app, loop_running);
-    render_footer(frame, footer_area, app, loop_running);
+    render_footer(frame, footer_area, app);
 
     // The model picker floats above everything else when open.
     if app.model_picker_open() {
@@ -36,6 +37,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // The close-issue confirmation floats on top of the list (#118).
     if let Some(number) = app.close_confirm() {
         render_close_confirm(frame, frame.area(), app, number);
+    }
+    // The PR-output popup floats on top of everything else when open (#143).
+    if app.pr_output_open() {
+        render_pr_output(frame, frame.area(), app);
+    }
+    // The closed-issues (spend) popup floats on top when open (#145).
+    if app.closed_open() {
+        render_closed(frame, frame.area(), app);
+    }
+    // The issue-details popup floats on top of everything else when open (#152).
+    if app.details_open() {
+        render_details(frame, frame.area(), app);
     }
 }
 
@@ -71,16 +84,41 @@ fn working_summary(working: &[u64]) -> Option<String> {
     Some(format!("working {list}"))
 }
 
+/// A "resolving PR #12" / "resolving PRs #12, #13" summary of the pull requests
+/// the loop is currently working, or `None` when it holds none. PRs are absent
+/// from the issue list, so this is the surface that tells the user the loop is
+/// busy on a PR. Pure for testing (#133).
+fn pr_summary(prs: &[u64]) -> Option<String> {
+    match prs {
+        [] => None,
+        [one] => Some(format!("resolving PR #{one}")),
+        many => {
+            let list = many
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("resolving PRs {list}"))
+        }
+    }
+}
+
 /// Build the header line spans: issue count, the viewed issue, the loop state,
-/// and the model. When the loop runs a turning spinner and the issue it is
-/// working (or "waiting for work") are shown so it is clear something is
-/// happening and which issue it is (#115). Pure so the running branch — which
-/// otherwise needs a live child process — is unit-testable.
+/// and the model. When workers run a turning spinner, how many workers are
+/// running, and the work they are doing — the issues *and* any PRs being
+/// resolved, or "waiting for work" when idle — are shown so it is clear
+/// something is happening and on what (#115, #133, #134). Pure so the running
+/// branch — which otherwise needs live child processes — is
+/// unit-testable.
+// Combines the multi-worker header (#134) with the auto-merge indicator (#135),
+// which together push this one span past the arg-count lint.
+#[allow(clippy::too_many_arguments)]
 fn header_spans(
     count: usize,
     viewing: Option<u64>,
-    loop_running: bool,
+    workers: usize,
     working: &[u64],
+    working_prs: &[u64],
     model_label: &str,
     auto_merge: bool,
     spinner: &str,
@@ -104,20 +142,38 @@ fn header_spans(
             Style::new().fg(Color::DarkGray),
         ));
     }
-    if loop_running {
+    if workers > 0 {
         spans.push(Span::styled(
             format!("  ·  {spinner} loop: running"),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
-        match working_summary(working) {
-            Some(summary) => spans.push(Span::styled(
+        spans.push(Span::styled(
+            format!(
+                "  ·  {workers} worker{}",
+                if workers == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        let mut idle = true;
+        if let Some(summary) = working_summary(working) {
+            spans.push(Span::styled(
                 format!("  ·  {summary}"),
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            None => spans.push(Span::styled(
+            ));
+            idle = false;
+        }
+        if let Some(summary) = pr_summary(working_prs) {
+            spans.push(Span::styled(
+                format!("  ·  {spinner} {summary}"),
+                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            ));
+            idle = false;
+        }
+        if idle {
+            spans.push(Span::styled(
                 "  ·  waiting for work",
                 Style::new().fg(Color::DarkGray),
-            )),
+            ));
         }
     } else {
         spans.push(Span::styled(
@@ -140,12 +196,13 @@ fn header_spans(
     spans
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, workers: usize) {
     let spans = header_spans(
         app.issues.len(),
         app.selected().map(|issue| issue.number),
-        loop_running,
+        workers,
         &app.in_progress_numbers(),
+        &app.in_progress_pr_numbers(),
         app.current_model_label(),
         app.auto_merge(),
         spinner_frame(),
@@ -233,7 +290,7 @@ fn render_output_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     }
 }
 
-fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop_running: bool) {
+fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some(status) = &app.status {
         spans.push(Span::styled(
@@ -242,13 +299,13 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, loop
         ));
         spans.push(Span::raw("  "));
     }
-    let loop_key = if loop_running {
-        "l stop-loop"
+    let ready_key = if app.selected_is_ready() {
+        "s unready"
     } else {
-        "l start-loop"
+        "s ready"
     };
     spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · s ready · x close · {loop_key} · a auto-merge · m models · o output · r refresh · q quit"),
+        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · d details · l add-worker · L stop-all · a auto-merge · m models · o output · p pr-output · t closed · r refresh · q quit"),
         Style::new().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -322,6 +379,366 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
     .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, popup);
+    frame.render_widget(body, popup);
+}
+
+/// Draw the PR-output popup: a centered modal listing the pull requests the loop
+/// is resolving, with the selected PR's live transcript beside it, so the user
+/// can watch a PR being worked even though PRs are absent from the issue list.
+/// Handles several PRs at once via the navigable list (#143). A [`Clear`]
+/// underneath wipes the cells so the list behind it does not show through.
+fn render_pr_output(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" Resolving PRs ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k move · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    // With no PR in flight there is nothing to show, so say so plainly.
+    if app.in_progress_prs().is_empty() {
+        let body = Paragraph::new("No PRs are being resolved.")
+            .block(outer)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(body, popup);
+        return;
+    }
+
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let [list_area, log_area] =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(inner);
+
+    // Collect owned data first so the immutable borrows of `app` end before the
+    // list needs a mutable borrow of its selection state.
+    let items: Vec<ListItem> = app
+        .in_progress_prs()
+        .iter()
+        .map(|pr| ListItem::new(Line::from(format!("#{} {}", pr.number, pr.title))))
+        .collect();
+    let selected_number = app
+        .pr_output_state
+        .selected()
+        .and_then(|i| app.in_progress_prs().get(i))
+        .map(|pr| pr.number);
+    let selected_output = app.selected_pr_output(OUTPUT_TAIL_BYTES);
+
+    render_pr_output_log(frame, log_area, selected_number, selected_output);
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" PRs "))
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, list_area, &mut app.pr_output_state);
+}
+
+/// Draw the transcript pane of the PR-output popup, following the bottom like
+/// `tail -f` so the newest output stays on screen, or a placeholder when the
+/// selected PR has produced no log yet (#143).
+fn render_pr_output_log(
+    frame: &mut Frame,
+    area: Rect,
+    number: Option<u64>,
+    output: Option<(u64, String)>,
+) {
+    let title = match number {
+        Some(n) => format!(" Output · PR #{n} "),
+        None => " Output ".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    match output {
+        Some((_number, text)) => {
+            let inner_height = area.height.saturating_sub(2) as usize;
+            let body: Vec<Line> = logs::last_lines(&text, inner_height)
+                .into_iter()
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            frame.render_widget(Paragraph::new(body).block(block), area);
+        }
+        None => {
+            let msg = match number {
+                Some(n) => format!("No output yet for PR #{n}."),
+                None => "No PR selected.".to_string(),
+            };
+            frame.render_widget(
+                Paragraph::new(msg)
+                    .block(block)
+                    .alignment(Alignment::Center)
+                    .style(Style::new().fg(Color::DarkGray)),
+                area,
+            );
+        }
+    }
+}
+
+/// Format an AI Credits total for display: whole numbers without a decimal
+/// point, otherwise one decimal place. Pure for testing (#145).
+fn format_credits(value: f64) -> String {
+    if value.fract().abs() < 0.05 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+/// Build a closed-issue row for the spend popup: the AI Credits spent (or a dash
+/// when none was recorded) leading the issue number, title, and labels. The cost
+/// leads and is coloured so "how much did this issue cost" is the first thing the
+/// eye lands on (#145).
+fn closed_issue_item(issue: &Issue) -> ListItem<'static> {
+    let cost = match issue.credits_spent() {
+        Some(credits) => Span::styled(
+            format!("{:>9} ", format!("{} cr", format_credits(credits))),
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(format!("{:>9} ", "—"), Style::new().fg(Color::DarkGray)),
+    };
+    let mut spans = vec![
+        cost,
+        Span::styled(
+            format!("#{:<5}", issue.number),
+            Style::new().fg(Color::Yellow),
+        ),
+        Span::raw(" "),
+        Span::raw(issue.title.clone()),
+    ];
+    let labels = issue.label_names();
+    if !labels.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{}]", labels.join(", ")),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// Draw the closed-issues (spend) popup: a centered, scrollable list of closed
+/// issues, each showing the AI Credits the loop spent on it, with the grand
+/// total in the border title so the overall cost is visible at a glance. A
+/// [`Clear`] underneath wipes the cells so the list behind it does not show
+/// through (#145).
+fn render_closed(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let total = match app.closed_total_credits() {
+        Some(credits) => format!("spent {} credits", format_credits(credits)),
+        None => "no recorded spend".to_string(),
+    };
+    let title = format!(
+        " Closed Issues · {} closed · {total} ",
+        app.closed_issues().len()
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k move · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    if app.closed_issues().is_empty() {
+        let body = Paragraph::new("No closed issues.")
+            .block(block)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(body, popup);
+        return;
+    }
+
+    let items: Vec<ListItem> = app.closed_issues().iter().map(closed_issue_item).collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, popup, &mut app.closed_state);
+}
+
+/// Build the details popup's content as logical (pre-wrap) lines, each paired
+/// with the style it renders in: the issue title, a meta line (number, author,
+/// labels), the body, then the comment thread. Pure so the content is
+/// unit-testable without a terminal (#152).
+fn detail_content(issue: &Issue) -> Vec<(String, Style)> {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines: Vec<(String, Style)> = Vec::new();
+
+    lines.push((issue.title.clone(), bold.fg(Color::White)));
+
+    let mut meta = format!("#{}", issue.number);
+    let author = issue.author_login();
+    if !author.is_empty() {
+        meta.push_str(&format!(" · @{author}"));
+    }
+    let labels = issue.label_names();
+    if !labels.is_empty() {
+        meta.push_str(&format!(" · [{}]", labels.join(", ")));
+    }
+    lines.push((meta, dim));
+    lines.push((String::new(), dim));
+
+    if issue.body.trim().is_empty() {
+        lines.push(("(no description)".to_string(), dim));
+    } else {
+        for line in issue.body.lines() {
+            lines.push((line.to_string(), Style::new()));
+        }
+    }
+
+    lines.push((String::new(), dim));
+    lines.push((
+        format!("Comments ({})", issue.comments.len()),
+        bold.fg(Color::Cyan),
+    ));
+
+    if issue.comments.is_empty() {
+        lines.push(("(no comments)".to_string(), dim));
+    } else {
+        for comment in &issue.comments {
+            lines.push((String::new(), dim));
+            lines.push((comment_heading(comment), bold.fg(Color::Green)));
+            for line in comment.body.lines() {
+                lines.push((line.to_string(), Style::new()));
+            }
+        }
+    }
+
+    lines
+}
+
+/// A comment's heading line for the details popup: `@author` plus the date it
+/// was posted when known. Falls back to `unknown` when no author is recorded and
+/// omits the date when `gh` did not return one. Pure for testing (#152).
+fn comment_heading(comment: &crate::github::Comment) -> String {
+    let who = match comment.author_login() {
+        "" => "unknown",
+        login => login,
+    };
+    match comment_date(&comment.created_at) {
+        Some(date) => format!("@{who} · {date}"),
+        None => format!("@{who}"),
+    }
+}
+
+/// The calendar-day portion (`YYYY-MM-DD`) of a comment's ISO-8601 `createdAt`
+/// timestamp, or `None` when it is empty or not a `YYYY-MM-DD`-shaped date. Pure
+/// for testing.
+fn comment_date(created_at: &str) -> Option<String> {
+    let day = created_at.split('T').next().unwrap_or("");
+    let is_iso_day = day.len() == 10
+        && day.chars().enumerate().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            _ => c.is_ascii_digit(),
+        });
+    is_iso_day.then(|| day.to_string())
+}
+
+/// Word-wrap a single logical line to `width` columns, never panicking and
+/// always yielding at least one (possibly empty) line so blank lines survive.
+/// Over-long words are hard-split so they cannot overflow the popup. Pure for
+/// testing (#152).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        if word.chars().count() > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            current = chunk;
+            continue;
+        }
+
+        let sep = usize::from(!current.is_empty());
+        if current.chars().count() + sep + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        } else if sep == 1 {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    lines.push(current);
+    lines
+}
+
+/// Wrap the styled logical lines to `width` columns, producing the ratatui lines
+/// the details popup renders. Each wrapped fragment keeps its logical line's
+/// style. Pure for testing (#152).
+fn wrap_styled(content: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (text, style) in content {
+        for fragment in wrap_text(text, width) {
+            out.push(Line::from(Span::styled(fragment, *style)));
+        }
+    }
+    out
+}
+
+/// Draw the issue-details popup: a centered, scrollable modal showing the
+/// selected issue's title, metadata, body, and full comment thread, so the whole
+/// issue — comments included — is readable without leaving the TUI. Content is
+/// word-wrapped to the popup width and vertically scrollable, and the scroll is
+/// clamped to the last page so it can never run past the end. A [`Clear`]
+/// underneath wipes the cells so the list behind it does not show through (#152).
+fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let (number, content) = match app.details() {
+        Some(issue) => (issue.number, detail_content(issue)),
+        None => (
+            0,
+            vec![(
+                "No issue selected.".to_string(),
+                Style::new().fg(Color::DarkGray),
+            )],
+        ),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Issue #{number} "))
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k scroll · g/G top/bottom · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    let inner = block.inner(popup);
+    let lines = wrap_styled(&content, inner.width as usize);
+
+    // Clamp so the furthest scroll lands the last line at the bottom of the pane.
+    let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+    app.clamp_details_scroll(max_scroll);
+
+    let body = Paragraph::new(lines)
+        .block(block)
+        .scroll((app.details_scroll(), 0));
     frame.render_widget(body, popup);
 }
 
@@ -529,7 +946,7 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("loop: off"));
-        assert!(text.contains("start-loop"));
+        assert!(text.contains("add-worker"));
     }
 
     #[test]
@@ -552,7 +969,7 @@ mod tests {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
-        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -581,6 +998,29 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("a auto-merge"));
+    }
+
+    #[test]
+    fn footer_ready_key_flips_to_unready_when_selected_is_labelled() {
+        // An unlabelled selection offers to mark it ready…
+        let plain =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(plain);
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("s ready"));
+        assert!(!text.contains("s unready"));
+
+        // …while an already-ready selection offers to remove the label (#146).
+        let ready = parse_issues(
+            r#"[{"number":96,"title":"t","labels":[{"name":"ready"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(ready);
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("s unready"));
     }
 
     #[test]
@@ -622,34 +1062,100 @@ mod tests {
     }
 
     #[test]
+    fn pr_summary_lists_numbers_or_none() {
+        assert_eq!(pr_summary(&[]), None);
+        assert_eq!(pr_summary(&[12]).as_deref(), Some("resolving PR #12"));
+        assert_eq!(
+            pr_summary(&[12, 13]).as_deref(),
+            Some("resolving PRs #12, #13")
+        );
+    }
+
+    #[test]
     fn header_shows_spinner_and_working_issue_when_loop_runs() {
-        let text = spans_text(&header_spans(3, Some(96), true, &[96], "auto", false, "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            Some(96),
+            1,
+            &[96],
+            &[],
+            "auto",
+            false,
+            "⠋",
+        ));
         assert!(text.contains("⠋ loop: running"));
+        assert!(text.contains("1 worker"));
         assert!(text.contains("working #96"));
         assert!(text.contains("model: auto"));
         assert!(text.contains("auto-merge: off"));
     }
 
     #[test]
+    fn header_shows_the_worker_count_for_several_workers() {
+        let text = spans_text(&header_spans(
+            5,
+            Some(96),
+            3,
+            &[96, 97, 98],
+            &[],
+            "auto",
+            false,
+            "⠋",
+        ));
+        assert!(text.contains("loop: running"));
+        assert!(text.contains("3 workers"));
+        assert!(text.contains("working #96, #97, #98"));
+    }
+
+    #[test]
+    fn header_shows_pr_work_when_the_loop_resolves_a_pr() {
+        // A PR being resolved is not in the issue list, so the header is the
+        // only place the user learns the loop is busy (#133).
+        let text = spans_text(&header_spans(3, None, 1, &[], &[12], "auto", false, "⠋"));
+        assert!(text.contains("loop: running"));
+        assert!(text.contains("resolving PR #12"));
+        // With PR work in flight the loop is not idle.
+        assert!(!text.contains("waiting for work"));
+    }
+
+    #[test]
+    fn header_shows_both_issue_and_pr_work() {
+        let text = spans_text(&header_spans(3, None, 1, &[96], &[12], "auto", false, "⠋"));
+        assert!(text.contains("working #96"));
+        assert!(text.contains("resolving PR #12"));
+    }
+
+    #[test]
     fn header_says_waiting_when_loop_runs_without_an_issue() {
-        let text = spans_text(&header_spans(3, None, true, &[], "auto", false, "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[], &[], "auto", false, "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("waiting for work"));
     }
 
     #[test]
     fn header_hides_loop_details_when_off() {
-        let text = spans_text(&header_spans(3, Some(96), false, &[96], "auto", false, "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            Some(96),
+            0,
+            &[96],
+            &[12],
+            "auto",
+            false,
+            "⠋",
+        ));
         assert!(text.contains("loop: off"));
         assert!(!text.contains("working"));
+        assert!(!text.contains("worker"));
+        assert!(!text.contains("resolving PR"));
         assert!(!text.contains("⠋"));
     }
 
     #[test]
     fn header_reflects_auto_merge_state() {
-        let on = spans_text(&header_spans(1, None, false, &[], "auto", true, "⠋"));
+        let on = spans_text(&header_spans(1, None, 0, &[], &[], "auto", true, "⠋"));
         assert!(on.contains("auto-merge: on"));
-        let off = spans_text(&header_spans(1, None, false, &[], "auto", false, "⠋"));
+        let off = spans_text(&header_spans(1, None, 0, &[], &[], "auto", false, "⠋"));
         assert!(off.contains("auto-merge: off"));
     }
 
@@ -740,6 +1246,65 @@ mod tests {
     }
 
     #[test]
+    fn footer_advertises_the_pr_output_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("p pr-output"));
+    }
+
+    #[test]
+    fn renders_the_pr_output_popup_with_the_selected_log() {
+        let dir = std::env::temp_dir().join(format!("copilot-ui-proutput-{}", std::process::id()));
+        let logs = dir.join(".copilot-loop").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("pr-12-20260101-000000.log"),
+            "\x1b[32mresolving the conflict\x1b[0m\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+        app.set_in_progress_prs(
+            crate::github::parse_pull_requests(
+                r#"[{"number":12,"title":"resolve conflicts"},{"number":15,"title":"fix checks"}]"#,
+            )
+            .unwrap(),
+        );
+        app.open_pr_output();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Resolving PRs"));
+        // Both in-flight PRs are listed so multiple resolutions are visible.
+        assert!(text.contains("#12"));
+        assert!(text.contains("#15"));
+        // The selected PR's transcript shows, with ANSI colour codes stripped.
+        assert!(text.contains("resolving the conflict"));
+        assert!(!text.contains("[32m"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pr_output_popup_reports_when_no_prs_are_resolving() {
+        let mut app = App::new(Vec::new());
+        app.open_pr_output();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("No PRs are being resolved."));
+    }
+
+    #[test]
     fn renders_the_create_form_overlay() {
         let mut app = App::new(Vec::new());
         app.open_create();
@@ -756,5 +1321,154 @@ mod tests {
         assert!(text.contains("Description"));
         assert!(text.contains("Bug"));
         assert!(text.contains("Ctrl+S create"));
+    }
+
+    #[test]
+    fn format_credits_drops_trailing_zeros() {
+        assert_eq!(format_credits(335.0), "335");
+        assert_eq!(format_credits(25.7), "25.7");
+        assert_eq!(format_credits(150.5), "150.5");
+    }
+
+    #[test]
+    fn footer_advertises_the_closed_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(170, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("t closed"));
+    }
+
+    #[test]
+    fn renders_the_closed_popup_with_spend_per_issue_and_total() {
+        let json = format!(
+            "[{},{}]",
+            r#"{"number":143,"title":"resolve PR view","comments":[{"body":"```\nAI Credits 335 (9m)\n```\n<!-- copilot-loop:usage -->"}]}"#,
+            r#"{"number":128,"title":"animate the line","comments":[]}"#,
+        );
+        let mut app = App::new(Vec::new());
+        app.open_closed_with(parse_issues(&json).unwrap());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Closed Issues"));
+        // Both closed issues are listed.
+        assert!(text.contains("#143"));
+        assert!(text.contains("#128"));
+        // The spend leads each row: a figure where recorded, a dash where not.
+        assert!(text.contains("335 cr"));
+        assert!(text.contains("—"));
+        // The grand total is surfaced in the border title.
+        assert!(text.contains("spent 335 credits"));
+    }
+
+    #[test]
+    fn closed_popup_reports_when_there_are_no_closed_issues() {
+        let mut app = App::new(Vec::new());
+        app.open_closed_with(Vec::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("No closed issues."));
+    }
+
+    #[test]
+    fn footer_advertises_the_details_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("d details"));
+    }
+
+    #[test]
+    fn detail_content_includes_the_body_and_comments() {
+        let issue = crate::github::parse_issue(
+            r#"{"number":152,"title":"see details","body":"line one\nline two",
+                "labels":[{"name":"ready"}],"author":{"login":"octocat"},
+                "comments":[{"author":{"login":"hubot"},"body":"a reply",
+                             "createdAt":"2026-07-18T06:45:11Z"}]}"#,
+        )
+        .unwrap();
+        let text: Vec<String> = detail_content(&issue)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+
+        assert!(text.contains(&"see details".to_string()));
+        assert!(
+            text.iter()
+                .any(|l| l.contains("#152") && l.contains("@octocat"))
+        );
+        assert!(text.contains(&"line one".to_string()));
+        assert!(text.contains(&"line two".to_string()));
+        assert!(text.contains(&"Comments (1)".to_string()));
+        assert!(text.contains(&"@hubot · 2026-07-18".to_string()));
+        assert!(text.contains(&"a reply".to_string()));
+    }
+
+    #[test]
+    fn detail_content_notes_an_empty_body_and_no_comments() {
+        let issue = crate::github::parse_issue(r#"{"number":1,"title":"bare"}"#).unwrap();
+        let text: Vec<String> = detail_content(&issue)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+
+        assert!(text.contains(&"(no description)".to_string()));
+        assert!(text.contains(&"Comments (0)".to_string()));
+        assert!(text.contains(&"(no comments)".to_string()));
+    }
+
+    #[test]
+    fn comment_date_takes_the_calendar_day_only() {
+        assert_eq!(
+            comment_date("2026-07-18T06:45:11Z").as_deref(),
+            Some("2026-07-18")
+        );
+        assert_eq!(comment_date(""), None);
+        assert_eq!(comment_date("not-a-date"), None);
+    }
+
+    #[test]
+    fn wrap_text_wraps_on_word_boundaries_and_keeps_blank_lines() {
+        assert_eq!(wrap_text("hello world foo", 11), vec!["hello world", "foo"]);
+        // A blank logical line survives as one empty rendered line.
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
+        // An over-long word is hard-split so it cannot overflow the popup.
+        assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn renders_the_details_popup_with_body_and_comments() {
+        let issue = crate::github::parse_issue(
+            r#"{"number":152,"title":"see details","body":"the description",
+                "author":{"login":"octocat"},
+                "comments":[{"author":{"login":"hubot"},"body":"a reply",
+                             "createdAt":"2026-07-18T06:45:11Z"}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(Vec::new());
+        app.open_details_with(issue);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Issue #152"));
+        assert!(text.contains("see details"));
+        assert!(text.contains("the description"));
+        assert!(text.contains("Comments (1)"));
+        assert!(text.contains("hubot"));
+        assert!(text.contains("a reply"));
     }
 }

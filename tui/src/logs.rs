@@ -1,9 +1,11 @@
 //! Locating and reading per-issue loop logs for the output side panel.
 //!
 //! `copilot-loop.sh` captures each issue's (and its PR's) Copilot transcript to
-//! `<repo>/.copilot-loop/logs/issue-<n>-<ts>.log` and `pr-<n>-<ts>.log`. This
-//! module finds the newest such log for an issue and reads its tail so the TUI
-//! can show the running loop's output in a side panel (#107).
+//! `<repo>/.copilot-loop/logs/issue-<n>-<ts>.log` and `pr-<n>-<ts>.log`, and
+//! also mirrors the loop's own status narration (branch creation, "running
+//! copilot", PR push, …) into that same file (#126). This module finds the
+//! newest such log for an issue and reads its tail so the TUI can show the
+//! running loop's full output — not just Copilot's — in a side panel (#107).
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
