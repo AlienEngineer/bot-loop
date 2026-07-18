@@ -107,6 +107,11 @@
 #   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
 #   --repo-dir <dir>         Repository to operate in              (default: current git repo)
 #   --model <model>          Model passed to copilot --model       (default: unset/auto)
+#   --copilot-timeout <dur>  Wall-clock limit for each Copilot run (issue resolve,
+#                            PR conflict/checks fix, default-branch sync) so a stuck
+#                            run cannot block the loop. Accepts seconds or an
+#                            s/m/h/d suffix (e.g. 1800, 30m, 2h); "0"/"off" disables
+#                            it                                      (default: 30m)
 #   --commit-model <model>   Model used to write the commit message from the
 #                            staged diff; unset/"off" uses a deterministic
 #                            "Resolve #<n>: <title>" message        (default: off)
@@ -143,9 +148,9 @@
 #   -h, --help               Show help and exit.
 #
 # Environment variables (equivalent to the flags above):
-#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
-#   TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
-#   MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
+#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
+#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
+#   AUTO_MERGE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
@@ -187,6 +192,11 @@ REPO_DIR="${REPO_DIR:-}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
+# Wall-clock limit for each main Copilot run so a stuck run can never block the
+# loop. Read raw here; normalised (to a timeout(1) duration, or empty=disabled)
+# after argument parsing so a flag can still override it. Default 30m; "0"/"off"
+# disables it.
+COPILOT_TIMEOUT="${COPILOT_TIMEOUT:-}"
 # Model used *only* to write the commit message from the staged diff. Kept
 # separate from COPILOT_MODEL so the coding model is never spent on a commit
 # message. Off by default (deterministic message); set a model such as the cheap
@@ -365,6 +375,11 @@ work:
   --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
   --repo-dir <dir>         Repository to operate in               (default: current git repo)
   --model <model>          Model passed to copilot --model        (default: unset/auto)
+  --copilot-timeout <dur>  Wall-clock limit for each Copilot run (issue resolve,
+                           PR conflict/checks fix, default-branch sync) so a stuck
+                           run cannot block the loop. Accepts seconds or an s/m/h/d
+                           suffix (e.g. 1800, 30m, 2h); "0"/"off" disables it
+                                                                    (default: 30m)
   --commit-model <model>   Model used to write the commit message from the
                            staged diff; unset/"off" uses a deterministic
                            "Resolve #<n>: <title>" message         (default: off)
@@ -406,22 +421,27 @@ work:
   -h, --help               Show this help and exit.
 
 Environment variables (equivalent to the flags above):
-  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COMMIT_MODEL,
-  TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES, AUTO_MERGE,
-  MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
+  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
+  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
+  AUTO_MERGE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 EOF
 }
 
 # Run copilot with the given args, always capturing output to $log_file. Unless
-# QUIET is set, the output is also streamed live to stdout via tee. Sets the
-# global COPILOT_RC to copilot's own exit code (not tee's).
+# QUIET is set, the output is also streamed live to stdout via tee. When
+# COPILOT_TIMEOUT is set the run is time-boxed through _run_with_timeout, so a
+# stuck run can never block the loop; on expiry COPILOT_RC is 124 (per timeout(1))
+# and the caller treats it as a failed attempt. Sets the global COPILOT_RC to
+# copilot's own exit code (not tee's).
 run_copilot() {
   local log_file="$1"; shift
+  local -a _timeout_guard=()
+  [ -n "${COPILOT_TIMEOUT:-}" ] && _timeout_guard=(_run_with_timeout "$COPILOT_TIMEOUT")
   if [ "$QUIET" = 1 ]; then
-    copilot "$@" >>"$log_file" 2>&1
+    ${_timeout_guard[@]+"${_timeout_guard[@]}"} copilot "$@" >>"$log_file" 2>&1
     COPILOT_RC=$?
   else
-    copilot "$@" 2>&1 | tee -a "$log_file"
+    ${_timeout_guard[@]+"${_timeout_guard[@]}"} copilot "$@" 2>&1 | tee -a "$log_file"
     COPILOT_RC="${PIPESTATUS[0]}"
   fi
 }
@@ -491,6 +511,53 @@ _run_with_timeout() {
     "$@"
   fi
 }
+
+# --- Copilot run timeout -----------------------------------------------------
+# Pure helpers that normalise the COPILOT_TIMEOUT setting and detect a timed-out
+# run. Extracted between the markers by tests/timeout.test.sh, so keep the marker
+# comments intact.
+# >>> copilot-timeout helpers >>>
+# True (rc 0) when a COPILOT_TIMEOUT spec means "no timeout": an empty value, one
+# of the disable words (off/none/false/no/disable/disabled), or a zero-magnitude
+# duration (0, 0s, 0m, 0h, 0d). Case- and whitespace-insensitive. Anything else (a
+# real duration, or garbage) returns rc 1. Pure: reads only $1.
+copilot_timeout_disabled() {
+  local raw num
+  raw="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$raw" in
+    ''|off|none|false|no|disable|disabled) return 0 ;;
+    *[!0-9smhd]*)                          return 1 ;;
+  esac
+  num="${raw%[smhd]}"
+  case "$num" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$((10#$num))" -eq 0 ] 2>/dev/null && return 0
+  return 1
+}
+
+# Echo a duration usable by timeout(1) for a COPILOT_TIMEOUT spec, or nothing when
+# the spec is not a valid duration. Accepts bare seconds ("1800") or an integer
+# with a single s/m/h/d suffix ("30m", "2h"). Case- and whitespace-insensitive.
+# Pure: reads only $1; callers treat empty output as "unparseable".
+normalize_copilot_timeout() {
+  local raw num
+  raw="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$raw" in
+    ''|*[!0-9smhd]*) return 0 ;;
+  esac
+  num="${raw%[smhd]}"
+  case "$num" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$raw"
+}
+
+# True (rc 0) when a run guarded by COPILOT_TIMEOUT was killed for exceeding it:
+# timeout(1) exits 124 on expiry, so treat that code as a timeout only when a
+# timeout was actually in force ($1, the effective spec, is non-empty). Pure:
+# reads $1 (spec) and $2 (exit code).
+copilot_run_timed_out() {
+  [ -n "${1:-}" ] || return 1
+  [ "${2:-}" = "124" ]
+}
+# <<< copilot-timeout helpers <<<
 
 # Echo a commit message for the staged changes in WORKSPACE_DIR. Tries to have
 # the cheapest model (COMMIT_MODEL) summarise the staged diff, and always falls
@@ -656,6 +723,8 @@ while [ $# -gt 0 ]; do
     --repo-dir=*)      REPO_DIR="${1#*=}" ;;
     --model)           need_arg $# "$1"; COPILOT_MODEL="$2"; shift ;;
     --model=*)         COPILOT_MODEL="${1#*=}" ;;
+    --copilot-timeout)   need_arg $# "$1"; COPILOT_TIMEOUT="$2"; shift ;;
+    --copilot-timeout=*) COPILOT_TIMEOUT="${1#*=}" ;;
     --commit-model)    need_arg $# "$1"; COMMIT_MODEL="$2"; shift ;;
     --commit-model=*)  COMMIT_MODEL="${1#*=}" ;;
     --triage-model)    need_arg $# "$1"; TRIAGE_MODEL="$2"; shift ;;
@@ -699,6 +768,19 @@ ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
 # message.
 COMMIT_MODEL="${COMMIT_MODEL:-}"
 case "$COMMIT_MODEL" in off|none|0) COMMIT_MODEL="" ;; esac
+
+# Wall-clock limit for each main Copilot run (issue resolve, PR conflict fix, PR
+# checks fix, default-branch sync) so a stuck run can never block the loop.
+# Default 30m; "0"/"off" (and other disable spellings) turn it off. An unparseable
+# value falls back to the default so protection is never silently lost. Stored
+# normalised: a timeout(1) duration, or empty when disabled.
+COPILOT_TIMEOUT="${COPILOT_TIMEOUT:-30m}"
+if copilot_timeout_disabled "$COPILOT_TIMEOUT"; then
+  COPILOT_TIMEOUT=""
+else
+  _ct_norm="$(normalize_copilot_timeout "$COPILOT_TIMEOUT")"
+  COPILOT_TIMEOUT="${_ct_norm:-30m}"
+fi
 
 # Triage: a cheap model classifies each issue and a class->model map routes the
 # coding model per difficulty. "off"/"none"/"0" disables triage (current
@@ -1431,6 +1513,14 @@ EOF
   # printed), before any early return, so every run is accounted for.
   _report_usage issue "$num" "$log_file" "$coding_model"
 
+  # A timed-out run (COPILOT_TIMEOUT exceeded, rc 124) is a failed attempt: fail
+  # the issue so the retry / copilot-failed path applies and it is recorded in the
+  # issue log, instead of committing whatever partial work was left behind.
+  if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+    _fail_issue "$num" "$log_file" "copilot timed out after ${COPILOT_TIMEOUT} (rc=$copilot_rc)"
+    return 1
+  fi
+
   # Copilot asked for more information instead of coding: relay the question to
   # the user and wait for their reply (handled, so return success without a PR).
   if [ -s "$question_file" ]; then
@@ -2013,6 +2103,12 @@ EOF
     # Track what this conflict-resolution prompt cost on the PR.
     _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
 
+    # A timed-out run (COPILOT_TIMEOUT exceeded, rc 124) is a failed attempt.
+    if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+      _fail_pr "$num" "$log_file" "copilot timed out after ${COPILOT_TIMEOUT} (rc=$copilot_rc)"
+      return 1
+    fi
+
     # Bail out if Copilot left conflict markers behind in any conflicted file.
     local f unresolved=""
     while IFS= read -r f; do
@@ -2128,6 +2224,12 @@ EOF
 
   # Track what this fix prompt cost on the PR.
   _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
+
+  # A timed-out run (COPILOT_TIMEOUT exceeded, rc 124) is a failed attempt.
+  if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+    _fail_pr_checks "$num" "$log_file" "copilot timed out after ${COPILOT_TIMEOUT} (rc=$copilot_rc)"
+    return 1
+  fi
 
   # No changes means Copilot could not fix the checks. Give up (label so it is not
   # retried forever) instead of pushing an empty commit and re-grabbing next pass.
