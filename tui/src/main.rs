@@ -119,6 +119,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The issue-details popup captures keys while it is open (#152).
+    if app.details_open() {
+        handle_details_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -140,6 +146,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),
         KeyCode::Char('t') => app.open_closed(),
+        KeyCode::Char('d') => app.open_details(),
         _ => {}
     }
 }
@@ -188,6 +195,19 @@ fn handle_closed_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down => app.closed_next(),
         KeyCode::Char('k') | KeyCode::Up => app.closed_previous(),
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('t') => app.close_closed(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the issue-details popup is open: scroll the body and
+/// comment thread, jump to top/bottom, and close on `q`, `Esc`, or `d` (#152).
+fn handle_details_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.details_scroll_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.details_scroll_up(),
+        KeyCode::Char('g') | KeyCode::Home => app.details_scroll_top(),
+        KeyCode::Char('G') | KeyCode::End => app.details_scroll_bottom(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('d') => app.close_details(),
         _ => {}
     }
 }
