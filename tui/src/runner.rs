@@ -10,7 +10,7 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -98,13 +98,110 @@ pub fn repo_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// The lifecycle state of a background worker as last observed, so the bots
+/// popup can show which workers are alive and which can be restarted (#82).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStatus {
+    /// The worker's process is still running.
+    Running,
+    /// The worker exited cleanly (status 0) or was stopped by the user.
+    Stopped,
+    /// The worker exited non-zero or was killed by a signal we did not send.
+    Failed,
+}
+
+impl WorkerStatus {
+    /// Whether a worker in this state can be restarted — anything not running.
+    pub fn is_restartable(self) -> bool {
+        !matches!(self, WorkerStatus::Running)
+    }
+}
+
+/// A read-only snapshot of a worker for the bots popup: enough to show its slot,
+/// state, and model, and to drive a restart by id (#82).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerView {
+    pub id: usize,
+    pub pid: u32,
+    pub status: WorkerStatus,
+    pub model: Option<String>,
+    pub log: PathBuf,
+}
+
+/// A background `copilot-loop.sh` worker and the options it was launched with, so
+/// it can be restarted in place — same slot, same repo dir and forwarded loop
+/// flags (model and auto-merge), archiving rather than overwriting its previous
+/// log (#82).
+struct Worker {
+    /// Stable slot id, reused across restarts so the capture log path is stable.
+    id: usize,
+    script: PathBuf,
+    repo_dir: PathBuf,
+    model: Option<String>,
+    /// Whether the loop was launched with `--auto-merge`, forwarded again on a
+    /// restart so the worker keeps the flags it was started with (#82, #135).
+    auto_merge: bool,
+    log: PathBuf,
+    /// The most recent process id, updated on each (re)start.
+    pid: u32,
+    /// The live process handle while running; `None` once it has exited.
+    child: Option<Child>,
+    /// The exit status once observed, used to tell a clean stop from a failure.
+    exit: Option<ExitStatus>,
+    /// Whether the user asked us to stop it, so a signalled exit reads as
+    /// "stopped" rather than "failed".
+    stopped_by_user: bool,
+}
+
+impl Worker {
+    /// Note the process's exit if it has finished since the last poll, so a
+    /// worker that ended on its own is no longer counted as running.
+    fn poll(&mut self) {
+        if let Some(child) = self.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.exit = Some(status);
+            self.child = None;
+        }
+    }
+
+    /// Whether the process is still running (as of the last [`Worker::poll`]).
+    fn is_running(&self) -> bool {
+        self.child.is_some()
+    }
+
+    /// The worker's state: running, a clean/user stop, or a failure.
+    fn status(&self) -> WorkerStatus {
+        if self.is_running() {
+            return WorkerStatus::Running;
+        }
+        match self.exit {
+            Some(status) if !self.stopped_by_user && !status.success() => WorkerStatus::Failed,
+            _ => WorkerStatus::Stopped,
+        }
+    }
+
+    /// A snapshot of this worker for the UI.
+    fn view(&self) -> WorkerView {
+        WorkerView {
+            id: self.id,
+            pid: self.pid,
+            status: self.status(),
+            model: self.model.clone(),
+            log: self.log.clone(),
+        }
+    }
+}
+
 /// Manages the background `copilot-loop.sh` workers for the TUI session.
 ///
-/// Holds a handle per running worker. Several may run at once; the loop's own
-/// GitHub-lock claiming keeps them on different issues (#134).
+/// Holds one [`Worker`] per slot. Several may run at once; the loop's own
+/// GitHub-lock claiming keeps them on different issues (#134). Unlike the earlier
+/// model, exited workers are kept (not dropped) so a stopped or failed one can be
+/// restarted in place with the same options (#82).
 #[derive(Default)]
 pub struct LoopRunner {
-    workers: Vec<Child>,
+    workers: Vec<Worker>,
 }
 
 impl LoopRunner {
@@ -113,18 +210,17 @@ impl LoopRunner {
         Self::default()
     }
 
-    /// Drop the handles of workers that have exited so counts stay accurate.
-    /// An errored wait means we can no longer track that worker, so it too is
-    /// dropped (treated as stopped).
-    fn reap(&mut self) {
-        self.workers
-            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    /// Refresh every worker's liveness so counts and statuses stay accurate.
+    fn poll_all(&mut self) {
+        for worker in &mut self.workers {
+            worker.poll();
+        }
     }
 
-    /// How many workers are currently running. Reaps exited workers first.
+    /// How many workers are currently running. Refreshes liveness first.
     pub fn running_count(&mut self) -> usize {
-        self.reap();
-        self.workers.len()
+        self.poll_all();
+        self.workers.iter().filter(|w| w.is_running()).count()
     }
 
     /// Whether any background worker is currently running.
@@ -132,16 +228,25 @@ impl LoopRunner {
         self.running_count() > 0
     }
 
-    /// Start another worker against `repo_dir`, capturing output to `log` and
-    /// running on `model` (`None` = auto). When `auto_merge` is set the loop is
-    /// told to merge each PR automatically (`--auto-merge`, #135). Errors when the
-    /// process cannot be spawned. Returns the new process id.
+    /// A snapshot of every tracked worker (running, stopped, or failed), in the
+    /// order they were first started, for the bots popup (#82).
+    pub fn views(&mut self) -> Vec<WorkerView> {
+        self.poll_all();
+        self.workers.iter().map(Worker::view).collect()
+    }
+
+    /// Start a new worker in slot `id` against `repo_dir`, capturing output to
+    /// `log` and running on `model` (`None` = auto). When `auto_merge` is set the
+    /// loop is told to merge each PR automatically (`--auto-merge`, #135). Errors
+    /// when the process cannot be spawned. Returns the new process id.
     ///
-    /// Unlike a single-loop model, this never refuses because one is already
-    /// running: the loop keeps workers on different issues, so more can be added
-    /// (#134).
+    /// The launch options are remembered so the worker can later be restarted in
+    /// place with the same repo dir and forwarded flags (#82). Unlike a
+    /// single-loop model, this never refuses because one is already running: the
+    /// loop keeps workers on different issues, so more can be added (#134).
     pub fn start(
         &mut self,
+        id: usize,
         script: &Path,
         repo_dir: &Path,
         log: &Path,
@@ -150,17 +255,56 @@ impl LoopRunner {
     ) -> Result<u32> {
         let child = spawn_detached(script, &loop_args(repo_dir, model, auto_merge), log)?;
         let pid = child.id();
-        self.workers.push(child);
+        self.workers.push(Worker {
+            id,
+            script: script.to_path_buf(),
+            repo_dir: repo_dir.to_path_buf(),
+            model: model.map(str::to_owned),
+            auto_merge,
+            log: log.to_path_buf(),
+            pid,
+            child: Some(child),
+            exit: None,
+            stopped_by_user: false,
+        });
         Ok(pid)
     }
 
+    /// Restart the stopped or failed worker in slot `id`, re-spawning it with the
+    /// same options it was launched with (repo dir and forwarded loop flags) and
+    /// reusing its slot, so its capture log path is stable and its previous log is
+    /// archived rather than overwritten (#82). Errors when no such slot exists or
+    /// the worker is still running.
+    pub fn restart(&mut self, id: usize) -> Result<u32> {
+        let worker = self
+            .workers
+            .iter_mut()
+            .find(|w| w.id == id)
+            .with_context(|| format!("no bot #{id} to restart"))?;
+        worker.poll();
+        if worker.is_running() {
+            anyhow::bail!("bot #{id} is still running");
+        }
+        let args = loop_args(&worker.repo_dir, worker.model.as_deref(), worker.auto_merge);
+        let child = spawn_detached(&worker.script, &args, &worker.log)?;
+        worker.pid = child.id();
+        worker.child = Some(child);
+        worker.exit = None;
+        worker.stopped_by_user = false;
+        Ok(worker.pid)
+    }
+
     /// Stop every running worker (TERM each process group, escalating to KILL
-    /// after a grace period that matches the bash TUI's `stop_bot`). A no-op when
-    /// nothing is running.
+    /// after a grace period that matches the bash TUI's `stop_bot`). Stopped
+    /// workers are kept (marked "stopped") so they can be restarted in place
+    /// (#82). A no-op when nothing is running.
     pub fn stop_all(&mut self) {
-        for mut child in std::mem::take(&mut self.workers) {
-            terminate(&mut child);
-            let _ = child.wait();
+        for worker in &mut self.workers {
+            if let Some(mut child) = worker.child.take() {
+                terminate(&mut child);
+                worker.exit = child.wait().ok();
+                worker.stopped_by_user = true;
+            }
         }
     }
 }
@@ -174,6 +318,9 @@ fn spawn_detached(program: &Path, args: &[String], log: &Path) -> Result<Child> 
         fs::create_dir_all(dir)
             .with_context(|| format!("failed to create log directory {}", dir.display()))?;
     }
+    // Preserve any previous capture log instead of silently overwriting it, so a
+    // restart keeps the stopped or failed run's output for inspection (#82).
+    archive_existing_log(log);
     let out = File::create(log)
         .with_context(|| format!("failed to create log file {}", log.display()))?;
     let err = out.try_clone().context("failed to clone log file handle")?;
@@ -194,6 +341,25 @@ fn spawn_detached(program: &Path, args: &[String], log: &Path) -> Result<Child> 
 
     cmd.spawn()
         .with_context(|| format!("failed to start {}", program.display()))
+}
+
+/// Move an existing capture `log` aside to the first free `"<log>.<n>"` sibling
+/// (n = 1, 2, …) so a restart preserves the previous run's output rather than
+/// overwriting it, returning the archive path when one was made (#82). Best
+/// effort: a no-op when the log is absent, and it leaves the log in place if
+/// every candidate name is taken or the rename fails.
+fn archive_existing_log(log: &Path) -> Option<PathBuf> {
+    if !log.exists() {
+        return None;
+    }
+    let name = log.file_name()?.to_string_lossy().into_owned();
+    for n in 1..=1000u32 {
+        let archive = log.with_file_name(format!("{name}.{n}"));
+        if !archive.exists() {
+            return fs::rename(log, &archive).ok().map(|()| archive);
+        }
+    }
+    None
 }
 
 /// How long to wait for a TERMed loop to exit before escalating to KILL. Matches
@@ -368,9 +534,15 @@ mod tests {
     /// refuses to exec it until that child execs and the handle closes. A short
     /// retry makes the test deterministic without weakening what it checks.
     #[cfg(unix)]
-    fn start_worker(runner: &mut LoopRunner, script: &Path, dir: &Path, log: &Path) -> u32 {
+    fn start_worker(
+        runner: &mut LoopRunner,
+        id: usize,
+        script: &Path,
+        dir: &Path,
+        log: &Path,
+    ) -> u32 {
         for attempt in 1..=50 {
-            match runner.start(script, dir, log, None, false) {
+            match runner.start(id, script, dir, log, None, false) {
                 Ok(pid) => return pid,
                 Err(err) if attempt < 50 && is_text_file_busy(&err) => {
                     std::thread::sleep(Duration::from_millis(20));
@@ -379,6 +551,24 @@ mod tests {
             }
         }
         unreachable!("the loop returns or panics before exhausting its attempts")
+    }
+
+    /// Poll `runner` until the worker in slot `id` is no longer running, or give
+    /// up after ~5s so a wedged test fails loudly rather than hanging.
+    #[cfg(unix)]
+    fn wait_until_stopped(runner: &mut LoopRunner, id: usize) -> WorkerStatus {
+        for _ in 0..250 {
+            let view = runner
+                .views()
+                .into_iter()
+                .find(|v| v.id == id)
+                .expect("worker is tracked");
+            if view.status != WorkerStatus::Running {
+                return view.status;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("worker #{id} never stopped");
     }
 
     #[cfg(unix)]
@@ -412,18 +602,126 @@ mod tests {
         let log2 = dir.join(format!("copilot-loop-w2-{}.log", std::process::id()));
 
         let mut runner = LoopRunner::new();
-        start_worker(&mut runner, &script, &dir, &log1);
-        start_worker(&mut runner, &script, &dir, &log2);
+        start_worker(&mut runner, 1, &script, &dir, &log1);
+        start_worker(&mut runner, 2, &script, &dir, &log2);
         assert_eq!(runner.running_count(), 2);
         assert!(runner.is_running());
 
         runner.stop_all();
         assert_eq!(runner.running_count(), 0);
         assert!(!runner.is_running());
+        // Stopped workers are kept so they can be restarted in place (#82).
+        let views = runner.views();
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().all(|v| v.status == WorkerStatus::Stopped));
 
         let _ = fs::remove_file(&script);
         let _ = fs::remove_file(&log1);
         let _ = fs::remove_file(&log2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_reuses_the_slot_and_archives_the_previous_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A script that records a line then exits cleanly, so the worker stops on
+        // its own and we can prove a restart re-runs it and keeps the old log.
+        let mut script = std::env::temp_dir();
+        script.push(format!("copilot-loop-restart-{}.sh", std::process::id()));
+        fs::write(&script, "#!/bin/sh\necho run\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = std::env::temp_dir();
+        let log = dir.join(format!("copilot-loop-restart-{}.log", std::process::id()));
+        let archived = dir.join(format!("copilot-loop-restart-{}.log.1", std::process::id()));
+        let _ = fs::remove_file(&log);
+        let _ = fs::remove_file(&archived);
+
+        let mut runner = LoopRunner::new();
+        start_worker(&mut runner, 7, &script, &dir, &log);
+        assert_eq!(wait_until_stopped(&mut runner, 7), WorkerStatus::Stopped);
+
+        // Restart in place: same slot, previous log archived, new log created.
+        for attempt in 1..=50 {
+            match runner.restart(7) {
+                Ok(_) => break,
+                Err(err) if attempt < 50 && is_text_file_busy(&err) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("restart worker: {err:#}"),
+            }
+        }
+        assert!(
+            archived.is_file(),
+            "previous log should be archived, not overwritten"
+        );
+        let views = runner.views();
+        assert_eq!(
+            views.len(),
+            1,
+            "restart reuses the slot rather than adding one"
+        );
+        assert_eq!(views[0].id, 7);
+
+        wait_until_stopped(&mut runner, 7);
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&log);
+        let _ = fs::remove_file(&archived);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nonzero_exit_reads_as_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut script = std::env::temp_dir();
+        script.push(format!("copilot-loop-fail-{}.sh", std::process::id()));
+        fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = std::env::temp_dir();
+        let log = dir.join(format!("copilot-loop-fail-{}.log", std::process::id()));
+
+        let mut runner = LoopRunner::new();
+        start_worker(&mut runner, 1, &script, &dir, &log);
+        assert_eq!(wait_until_stopped(&mut runner, 1), WorkerStatus::Failed);
+
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&log);
+    }
+
+    #[test]
+    fn restart_of_an_unknown_slot_errors() {
+        let mut runner = LoopRunner::new();
+        assert!(runner.restart(99).is_err());
+    }
+
+    #[test]
+    fn archive_existing_log_rotates_through_numbered_siblings() {
+        let mut log = std::env::temp_dir();
+        log.push(format!("copilot-loop-archive-{}.log", std::process::id()));
+        let first = log.with_file_name(format!("{}.1", log.file_name().unwrap().to_string_lossy()));
+        let second =
+            log.with_file_name(format!("{}.2", log.file_name().unwrap().to_string_lossy()));
+        let _ = fs::remove_file(&log);
+        let _ = fs::remove_file(&first);
+        let _ = fs::remove_file(&second);
+
+        // Nothing to archive when the log is absent.
+        assert_eq!(archive_existing_log(&log), None);
+
+        fs::write(&log, "one").unwrap();
+        assert_eq!(archive_existing_log(&log), Some(first.clone()));
+        assert!(!log.exists(), "the log is moved aside, not left in place");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "one");
+
+        fs::write(&log, "two").unwrap();
+        assert_eq!(archive_existing_log(&log), Some(second.clone()));
+        assert_eq!(fs::read_to_string(&second).unwrap(), "two");
+
+        let _ = fs::remove_file(&first);
+        let _ = fs::remove_file(&second);
     }
 
     #[cfg(unix)]
