@@ -277,8 +277,24 @@ fn render_output_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     }
 }
 
+/// The footer's refreshing indicator: an animated spinner and "Refreshing…"
+/// while a background refresh is in flight (#130), or `None` when idle. Pure so
+/// the animated branch is unit-testable without a live fetch.
+fn refreshing_indicator(refreshing: bool, spinner: &str) -> Option<Span<'static>> {
+    refreshing.then(|| {
+        Span::styled(
+            format!("{spinner} Refreshing… "),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    })
+}
+
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut spans = Vec::new();
+    if let Some(indicator) = refreshing_indicator(app.is_refreshing(), spinner_frame()) {
+        spans.push(indicator);
+        spans.push(Span::raw("  "));
+    }
     if let Some(status) = &app.status {
         spans.push(Span::styled(
             format!(" {status} "),
@@ -961,6 +977,43 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("o output"));
+    }
+
+    #[test]
+    fn footer_shows_the_refreshing_indicator_while_refreshing() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.set_refreshing(true);
+        // Wide enough that the whole footer — indicator plus key hints — renders.
+        let mut terminal = Terminal::new(TestBackend::new(220, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Refreshing"));
+        // The key hints still share the footer.
+        assert!(text.contains("r refresh"));
+    }
+
+    #[test]
+    fn footer_hides_the_refreshing_indicator_when_idle() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(220, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(!buffer_text(&terminal).contains("Refreshing"));
+    }
+
+    #[test]
+    fn refreshing_indicator_shows_only_while_refreshing() {
+        assert!(refreshing_indicator(false, "⠋").is_none());
+        let span = refreshing_indicator(true, "⠋").expect("indicator while refreshing");
+        assert!(span.content.contains("Refreshing"));
+        assert!(span.content.contains("⠋"));
     }
 
     #[test]
