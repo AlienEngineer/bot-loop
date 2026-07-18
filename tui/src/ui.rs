@@ -11,6 +11,7 @@ use ratatui::{
 use crate::app::{App, CreateField, OUTPUT_TAIL_BYTES};
 use crate::github::Issue;
 use crate::logs;
+use crate::runner::{WorkerStatus, WorkerView};
 
 /// Draw the whole UI: header, issue list (or placeholder), and footer.
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -49,6 +50,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // The issue-details popup floats on top of everything else when open (#152).
     if app.details_open() {
         render_details(frame, frame.area(), app);
+    }
+    // The bots popup floats on top of everything else when open (#82).
+    if app.bots_open() {
+        render_bots(frame, frame.area(), app);
     }
 }
 
@@ -331,7 +336,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · a auto-merge · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
+            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -776,6 +781,77 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(body, popup);
 }
 
+/// Draw the bots popup: a centered, navigable list of every background worker
+/// the session has started — running, stopped, or failed — so a stopped or
+/// failed one can be restarted in place with the same options it was launched
+/// with (#82). A [`Clear`] underneath wipes the cells so the list behind it does
+/// not show through.
+fn render_bots(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let views: Vec<WorkerView> = app.bots().to_vec();
+    let running = views
+        .iter()
+        .filter(|v| v.status == WorkerStatus::Running)
+        .count();
+    let restartable = views.iter().filter(|v| v.status.is_restartable()).count();
+    let title = format!(
+        " Bots · {} total · {running} running · {restartable} restartable ",
+        views.len()
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k move · r restart · R restart all · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    if views.is_empty() {
+        let body = Paragraph::new("No bots started yet. Press l to start one.")
+            .block(block)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(body, popup);
+        return;
+    }
+
+    let items: Vec<ListItem> = views.iter().map(bot_item).collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, popup, &mut app.bots_state);
+}
+
+/// Build a bots-popup row: the worker's slot, its colour-coded status, its most
+/// recent pid while running (a dash once stopped), and the model it runs on so
+/// "what was this launched with" is visible before a restart (#82).
+fn bot_item(view: &WorkerView) -> ListItem<'static> {
+    let (label, color) = match view.status {
+        WorkerStatus::Running => ("running", Color::Green),
+        WorkerStatus::Stopped => ("stopped", Color::Yellow),
+        WorkerStatus::Failed => ("failed", Color::Red),
+    };
+    let pid = if view.status == WorkerStatus::Running {
+        view.pid.to_string()
+    } else {
+        "—".to_string()
+    };
+    let model = view.model.clone().unwrap_or_else(|| "auto".to_string());
+    ListItem::new(Line::from(vec![
+        Span::styled(format!("#{:<4}", view.id), Style::new().fg(Color::Cyan)),
+        Span::styled(
+            format!("{label:<9}"),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("pid {pid:<8}"), Style::new().fg(Color::DarkGray)),
+        Span::raw(format!("model {model}")),
+    ]))
+}
+
 /// A rectangle of `width` columns and `height` rows centered within `area`,
 /// clamped to fit. `width` is a percentage of `area`'s width.
 fn centered_popup(area: Rect, width_pct: u16, height: u16) -> Rect {
@@ -1050,6 +1126,19 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("o output"));
+    }
+
+    #[test]
+    fn footer_advertises_the_bots_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("b bots"));
     }
 
     #[test]
@@ -1591,5 +1680,57 @@ mod tests {
         assert!(text.contains("Comments (1)"));
         assert!(text.contains("hubot"));
         assert!(text.contains("a reply"));
+    }
+
+    #[test]
+    fn bots_popup_reports_when_no_bots_have_started() {
+        let mut app = App::new(Vec::new());
+        app.open_bots_with(Vec::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Bots"));
+        assert!(text.contains("No bots started yet."));
+    }
+
+    #[test]
+    fn renders_the_bots_popup_with_each_worker_status() {
+        let mut app = App::new(Vec::new());
+        app.open_bots_with(vec![
+            WorkerView {
+                id: 1,
+                pid: 4242,
+                status: WorkerStatus::Running,
+                model: Some("gpt-5.4".to_string()),
+                log: std::path::PathBuf::from("/tmp/loop-1.log"),
+            },
+            WorkerView {
+                id: 2,
+                pid: 4243,
+                status: WorkerStatus::Failed,
+                model: None,
+                log: std::path::PathBuf::from("/tmp/loop-2.log"),
+            },
+        ]);
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        // The popup lists every worker with its slot, status, and model.
+        assert!(text.contains("Bots"));
+        assert!(text.contains("2 total"));
+        assert!(text.contains("1 running"));
+        assert!(text.contains("1 restartable"));
+        assert!(text.contains("#1"));
+        assert!(text.contains("running"));
+        assert!(text.contains("gpt-5.4"));
+        assert!(text.contains("#2"));
+        assert!(text.contains("failed"));
+        assert!(text.contains("pid 4242"));
+        // A stopped/failed worker shows no live pid and defaults to the auto model.
+        assert!(text.contains("model auto"));
     }
 }

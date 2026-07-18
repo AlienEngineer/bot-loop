@@ -7,7 +7,7 @@ use ratatui::widgets::ListState;
 use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
 use crate::models;
-use crate::runner::{self, LoopRunner};
+use crate::runner::{self, LoopRunner, WorkerStatus, WorkerView};
 use crate::worker::{FetchOutcome, IssueFetcher};
 
 /// Default number of issues to request from `gh`.
@@ -140,6 +140,13 @@ pub struct App {
     /// completion is reported on the status line (empty list, or an error) the
     /// way the old blocking `refresh` did — auto-refreshes stay silent (#130).
     manual_refresh_pending: bool,
+    /// Whether the bots popup is open (#82).
+    bots_open: bool,
+    /// Selection within the bots popup's worker list (#82).
+    pub bots_state: ListState,
+    /// The workers shown in the bots popup, refreshed from the runner so their
+    /// live status (running/stopped/failed) tracks each background loop (#82).
+    bots: Vec<WorkerView>,
 }
 
 impl App {
@@ -185,6 +192,9 @@ impl App {
             fetcher: None,
             refreshing: false,
             manual_refresh_pending: false,
+            bots_open: false,
+            bots_state: ListState::default(),
+            bots: Vec::new(),
         }
     }
 
@@ -509,10 +519,14 @@ impl App {
         let was_idle = !self.runner.is_running();
         let log = runner::log_path(&repo, self.next_worker_id);
         let model = self.selected_model().map(str::to_owned);
-        match self
-            .runner
-            .start(&script, &repo, &log, model.as_deref(), self.auto_merge)
-        {
+        match self.runner.start(
+            self.next_worker_id,
+            &script,
+            &repo,
+            &log,
+            model.as_deref(),
+            self.auto_merge,
+        ) {
             Ok(pid) => {
                 self.next_worker_id += 1;
                 if was_idle {
@@ -553,6 +567,150 @@ impl App {
     /// Whether any background worker is currently running.
     pub fn loop_running(&mut self) -> bool {
         self.runner.is_running()
+    }
+
+    /// Refresh the cached worker snapshots from the runner so the bots popup and
+    /// its actions see each worker's live status (running/stopped/failed) (#82).
+    /// Called each tick the popup is open and whenever a bot action runs.
+    pub fn refresh_bots(&mut self) {
+        self.bots = self.runner.views();
+    }
+
+    /// Whether the bots popup is open (#82).
+    pub fn bots_open(&self) -> bool {
+        self.bots_open
+    }
+
+    /// The workers shown in the bots popup, in start order (#82). Read by the
+    /// renderer; kept fresh by [`App::refresh_bots`].
+    pub fn bots(&self) -> &[WorkerView] {
+        &self.bots
+    }
+
+    /// Open the bots popup, refreshing the worker list and selecting the first
+    /// one (or nothing when none have been started) (#82).
+    pub fn open_bots(&mut self) {
+        self.refresh_bots();
+        self.bots_state
+            .select(if self.bots.is_empty() { None } else { Some(0) });
+        self.bots_open = true;
+    }
+
+    /// Close the bots popup (#82).
+    pub fn close_bots(&mut self) {
+        self.bots_open = false;
+    }
+
+    /// Move the bots highlight down by one, clamped to the last worker (#82).
+    pub fn bots_next(&mut self) {
+        if self.bots.is_empty() {
+            return;
+        }
+        let last = self.bots.len() - 1;
+        let next = self.bots_state.selected().map_or(0, |i| (i + 1).min(last));
+        self.bots_state.select(Some(next));
+    }
+
+    /// Move the bots highlight up by one, clamped to the first worker (#82).
+    pub fn bots_previous(&mut self) {
+        if self.bots.is_empty() {
+            return;
+        }
+        let prev = self
+            .bots_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.bots_state.select(Some(prev));
+    }
+
+    /// Keep the bots selection in range after the list changes (#82).
+    fn clamp_bots_selection(&mut self) {
+        if self.bots.is_empty() {
+            self.bots_state.select(None);
+        } else {
+            let max = self.bots.len() - 1;
+            let index = self.bots_state.selected().unwrap_or(0).min(max);
+            self.bots_state.select(Some(index));
+        }
+    }
+
+    /// Restart the selected stopped or failed bot in place, re-spawning it with
+    /// the same options it was launched with (repo dir, forwarded loop flags) and
+    /// archiving its previous log (#82).
+    ///
+    /// A no-op with a status note when nothing is selected or the bot is still
+    /// running, so a running worker is never disturbed.
+    pub fn restart_selected_bot(&mut self) {
+        let Some(view) = self
+            .bots_state
+            .selected()
+            .and_then(|i| self.bots.get(i))
+            .cloned()
+        else {
+            self.status = Some("No bot selected.".to_string());
+            return;
+        };
+
+        if view.status == WorkerStatus::Running {
+            self.status = Some(format!("Bot #{} is already running.", view.id));
+            return;
+        }
+
+        let was_idle = !self.runner.is_running();
+        match self.runner.restart(view.id) {
+            Ok(pid) => {
+                if was_idle {
+                    self.seed_in_progress_baseline();
+                }
+                self.status = Some(format!(
+                    "Restarted bot #{} (pid {pid}). Log: {}",
+                    view.id,
+                    view.log.display()
+                ));
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+        self.refresh_bots();
+        self.clamp_bots_selection();
+    }
+
+    /// Restart every stopped or failed bot in place, re-spawning each with the
+    /// options it was launched with (#82). Reports how many restarted, or that
+    /// there were none. Running bots are left untouched.
+    pub fn restart_all_stopped_bots(&mut self) {
+        let ids: Vec<usize> = self
+            .bots
+            .iter()
+            .filter(|view| view.status.is_restartable())
+            .map(|view| view.id)
+            .collect();
+
+        if ids.is_empty() {
+            self.status = Some("No stopped or failed bots to restart.".to_string());
+            return;
+        }
+
+        let was_idle = !self.runner.is_running();
+        let mut restarted = 0usize;
+        let mut failed = 0usize;
+        for id in ids {
+            match self.runner.restart(id) {
+                Ok(_) => restarted += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        if restarted > 0 && was_idle {
+            self.seed_in_progress_baseline();
+        }
+
+        let plural = if restarted == 1 { "" } else { "s" };
+        self.status = Some(if failed == 0 {
+            format!("Restarted {restarted} bot{plural}.")
+        } else {
+            format!("Restarted {restarted} bot{plural}, {failed} failed.")
+        });
+        self.refresh_bots();
+        self.clamp_bots_selection();
     }
 
     /// Numbers of the issues the loop is currently working, i.e. those carrying
@@ -1115,6 +1273,17 @@ impl App {
     pub fn open_details_with(&mut self, issue: Issue) {
         self.present_details(issue);
     }
+
+    /// Seed the bots popup with worker views and open it (tests only), standing
+    /// in for the runner snapshot in [`open_bots`] so the popup's navigation and
+    /// early-return branches are testable without spawning processes (#82).
+    #[cfg(test)]
+    pub fn open_bots_with(&mut self, bots: Vec<WorkerView>) {
+        self.bots = bots;
+        self.bots_state
+            .select(if self.bots.is_empty() { None } else { Some(0) });
+        self.bots_open = true;
+    }
 }
 
 /// Issue numbers present in `current` but not `known` — the ones the loop has
@@ -1621,6 +1790,73 @@ mod tests {
         app.stop_all_workers();
         // No worker was running, so nothing is stopped and the status says so.
         assert_eq!(app.status.as_deref(), Some("No workers running."));
+    }
+
+    /// A worker view in a given state, for the bots-popup unit tests (#82).
+    fn worker_view(id: usize, status: WorkerStatus) -> WorkerView {
+        WorkerView {
+            id,
+            pid: 1000 + id as u32,
+            status,
+            model: None,
+            log: PathBuf::from(format!("/tmp/loop-{id}.log")),
+        }
+    }
+
+    #[test]
+    fn open_bots_selects_the_first_worker() {
+        let mut app = app_with(0);
+        app.open_bots_with(vec![
+            worker_view(1, WorkerStatus::Stopped),
+            worker_view(2, WorkerStatus::Failed),
+        ]);
+        assert!(app.bots_open());
+        assert_eq!(app.bots_state.selected(), Some(0));
+        assert_eq!(app.bots().len(), 2);
+    }
+
+    #[test]
+    fn bots_navigation_clamps_to_the_ends() {
+        let mut app = app_with(0);
+        app.open_bots_with(vec![
+            worker_view(1, WorkerStatus::Stopped),
+            worker_view(2, WorkerStatus::Stopped),
+        ]);
+        app.bots_previous();
+        assert_eq!(app.bots_state.selected(), Some(0)); // clamps at top
+        app.bots_next();
+        assert_eq!(app.bots_state.selected(), Some(1));
+        app.bots_next();
+        assert_eq!(app.bots_state.selected(), Some(1)); // clamps at bottom
+        app.close_bots();
+        assert!(!app.bots_open());
+    }
+
+    #[test]
+    fn restarting_a_running_bot_leaves_it_untouched() {
+        let mut app = app_with(0);
+        app.open_bots_with(vec![worker_view(1, WorkerStatus::Running)]);
+        app.restart_selected_bot();
+        assert_eq!(app.status.as_deref(), Some("Bot #1 is already running."));
+    }
+
+    #[test]
+    fn restart_all_reports_when_nothing_is_stopped() {
+        let mut app = app_with(0);
+        app.open_bots_with(vec![worker_view(1, WorkerStatus::Running)]);
+        app.restart_all_stopped_bots();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("No stopped or failed bots to restart.")
+        );
+    }
+
+    #[test]
+    fn restarting_with_no_selection_reports_it() {
+        let mut app = app_with(0);
+        app.open_bots_with(Vec::new());
+        app.restart_selected_bot();
+        assert_eq!(app.status.as_deref(), Some("No bot selected."));
     }
 
     #[test]

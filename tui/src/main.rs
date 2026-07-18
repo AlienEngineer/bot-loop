@@ -82,6 +82,11 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         // list tracks the loop without the UI thread ever blocking on `gh`.
         app.poll_fetch_results();
 
+        // Keep the bots popup's worker statuses live while it is open (#82).
+        if app.bots_open() {
+            app.refresh_bots();
+        }
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         // Poll briefly while anything animates — a background refresh's
@@ -159,6 +164,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The bots popup captures keys while it is open (#82).
+    if app.bots_open() {
+        handle_bots_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -194,6 +205,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => app.open_details(),
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
+        KeyCode::Char('b') => app.open_bots(),
         KeyCode::Char('a') => app.toggle_auto_merge(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
@@ -266,6 +278,20 @@ fn handle_details_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Handle keys while the bots popup is open: navigate the workers, restart the
+/// selected stopped/failed one with `r` (or Enter), restart all stopped/failed
+/// with `R`, and close on `q`, `Esc`, or `b` (#82).
+fn handle_bots_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.bots_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.bots_previous(),
+        KeyCode::Char('r') | KeyCode::Enter => app.restart_selected_bot(),
+        KeyCode::Char('R') => app.restart_all_stopped_bots(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('b') => app.close_bots(),
+        _ => {}
+    }
+}
+
 /// Handle a key while the new-issue form is open: type into the focused field,
 /// Tab to switch fields, Ctrl+S to create, Esc to cancel.
 fn handle_create_key(app: &mut App, key: KeyEvent) {
@@ -329,6 +355,18 @@ mod tests {
         press(&mut app, KeyCode::Char('c'));
         assert!(app.is_creating());
         assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn leader_then_b_opens_the_bots_popup_and_closes_the_menu() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.bots_open());
+        assert!(!app.leader_active());
+        // A key inside the popup is captured by it, not the list: b closes it.
+        press(&mut app, KeyCode::Char('b'));
+        assert!(!app.bots_open());
     }
 
     #[test]

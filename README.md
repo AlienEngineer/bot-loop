@@ -160,6 +160,17 @@ author, date, and body) — so an issue can be read without leaving the TUI. The
 content is fetched fresh with `gh issue view`; scroll it with `j`/`k` (`g`/`G`
 jump to top/bottom) and `Esc` (or `d`/`q`) closes it (#152).
 
+Press `space` then `b` to open the bots popup: a list of every worker the session has
+started, each showing its slot, status (`running`, `stopped`, or `failed`), and
+model. Navigate with `j`/`k`; press `r` (or `Enter`) to restart the selected
+stopped or failed worker in place — re-spawned with the same options it was
+launched with (repo dir and forwarded loop flags such as `--model` and
+`--auto-merge`) and reusing its slot, so its previous capture log is archived to
+`.copilot-loop/tui/loop-<n>.log.<k>` rather than overwritten — or `R` to restart
+every stopped or failed worker at once. Running workers are left untouched, and
+`Esc` (or `b`/`q`) closes the popup. This turns a transient failure into a one-key
+restart instead of losing the worker's slot and context (#82).
+
 ```sh
 cd tui
 cargo run
@@ -169,7 +180,8 @@ Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit. Press
 `space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
 the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
-comments, `l` add a background worker, `L` stop all workers, `a` toggle
+comments, `l` add a background worker, `L` stop all workers, `b` bots (restart a
+stopped/failed worker in place, or all with `R`), `a` toggle
 auto-merge, `m` pick the model, `o` show/hide the output panel, `p` show the
 resolving-PRs popup, `t` show closed issues and their cost, `f` refresh, `Esc`
 cancel. In the new-issue
