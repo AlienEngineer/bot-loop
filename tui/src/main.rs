@@ -34,6 +34,14 @@ const ANIMATION_TICK: Duration = Duration::from_millis(80);
 const IDLE_TICK: Duration = Duration::from_millis(250);
 
 fn main() -> Result<()> {
+    // Handle -V/--version before taking over the terminal so `bot-loop --version`
+    // reports the build's version (bumped by the release workflow) and exits
+    // without entering the UI.
+    if wants_version(std::env::args().skip(1)) {
+        println!("bot-loop {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let mut app = App::new(Vec::new());
     match github::fetch_issues(DEFAULT_LIMIT) {
         Ok(issues) => {
@@ -53,6 +61,12 @@ fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
     result
+}
+
+/// Whether the CLI args request the version (`-V`/`--version`). Checked before
+/// the UI starts so `bot-loop --version` prints and exits. Pure for testing.
+fn wants_version<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == "-V" || a == "--version")
 }
 
 /// The main draw/input loop. Polls for key events and redraws each tick, and
@@ -279,13 +293,25 @@ fn handle_create_key(app: &mut App, key: KeyEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_key, wants_loop_refresh};
+    use super::{handle_key, wants_loop_refresh, wants_version};
     use crate::app::App;
     use crate::github::parse_issues;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn press(app: &mut App, code: KeyCode) {
         handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn version_flag_is_recognised() {
+        assert!(wants_version(["--version".to_string()]));
+        assert!(wants_version(["-V".to_string()]));
+        assert!(wants_version([
+            "--repo".to_string(),
+            "--version".to_string()
+        ]));
+        assert!(!wants_version(["-x".to_string()]));
+        assert!(!wants_version(Vec::<String>::new()));
     }
 
     #[test]

@@ -19,6 +19,38 @@ so bots never work on the same issue.
 - `gh` — the GitHub CLI, authenticated (`gh auth login`) for the host **and account** that can access the repo you point it at. If the repo lives on a GitHub Enterprise host, log in to that host too: `gh auth login --hostname your.enterprise.host`.
 - `copilot` — the GitHub Copilot CLI
 
+## Install
+
+### Homebrew (recommended)
+
+Install both commands from the repository's tap:
+
+```sh
+brew tap alienengineer/bot-loop https://github.com/AlienEngineer/bot-loop
+brew install bot-loop
+```
+
+This installs two commands:
+
+- **`bot-loop`** — the terminal UI (the ratatui app in [`tui/`](./tui)): browse
+  issues, create/close them, view details, and start background workers.
+- **`bot-loop-bash`** — the raw autonomous loop
+  ([`copilot-loop.sh`](./copilot-loop.sh)), run from inside the repository you
+  want it to work on.
+
+Homebrew pulls in `git` and `gh`, but the
+[GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`) is not in
+Homebrew — install it separately and make sure it is on your `PATH`. Upgrade with
+`brew upgrade bot-loop`; `brew install --HEAD bot-loop` builds the current `main`
+instead of the latest release. Check the installed version with
+`bot-loop --version` (or `bot-loop-bash --version`).
+
+### From source
+
+Clone the repo and run [`copilot-loop.sh`](./copilot-loop.sh) directly (see
+[Quick start](#quick-start)); build the TUI with `cargo run` from
+[`tui/`](./tui).
+
 ## Quick start
 
 Run the loop from inside the repository you want it to work on:
@@ -309,6 +341,17 @@ gh auth switch                               # switch to an account that can acc
 
 The startup banner also prints the resolved `gh account:  <login> @ <host>`, so
 you can confirm the loop is acting as the expected account on the expected host.
+
+## Releases
+
+Every push to `main` publishes a new release automatically
+([`.github/workflows/release.yml`](./.github/workflows/release.yml)): it bumps the
+patch version (starting at `0.1.0`), writes it into
+[`copilot-loop.sh`](./copilot-loop.sh) and [`tui/Cargo.toml`](./tui/Cargo.toml),
+tags `vX.Y.Z`, publishes a GitHub release, and repoints
+[`Formula/bot-loop.rb`](./Formula/bot-loop.rb) at the new tag's tarball and
+checksum so `brew upgrade bot-loop` picks it up. The two bot commits are tagged
+`[skip ci]` so the workflow never retriggers itself.
 
 ## Running the tests
 
