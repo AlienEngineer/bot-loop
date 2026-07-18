@@ -87,7 +87,9 @@ fn wants_loop_refresh(was_running: bool, running: bool, interval_elapsed: bool) 
     (running && interval_elapsed) || (was_running && !running)
 }
 
-/// Map a key press to an action. Vim-style navigation per #51.
+/// Map a key press to an action. Vim-style navigation (#51); issue actions are
+/// gated behind the `space` leader key so the list stays uncluttered and keys
+/// can be reused inside the menu (#129).
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Ctrl-c always quits.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -130,25 +132,44 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Issue actions live behind the `space` leader key: after it, one key runs
+    // an action and closes the menu (#129).
+    if app.leader_active() {
+        handle_leader_key(app, key);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
         KeyCode::Char('g') | KeyCode::Home => app.first(),
         KeyCode::Char('G') | KeyCode::End => app.last(),
-        KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char(' ') => app.enter_leader(),
+        _ => {}
+    }
+}
+
+/// Handle the key pressed after the `space` leader: run the matching issue
+/// action and close the menu; any unbound key (e.g. `Esc`) just cancels it.
+/// Reusing the leader namespace lets `r` mean *ready* while refresh moves to
+/// `f` (#129).
+fn handle_leader_key(app: &mut App, key: KeyEvent) {
+    match key.code {
         KeyCode::Char('c') => app.open_create(),
-        KeyCode::Char('s') | KeyCode::Enter => app.toggle_ready(),
+        KeyCode::Char('r') => app.toggle_ready(),
         KeyCode::Char('x') => app.request_close(),
+        KeyCode::Char('d') => app.open_details(),
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),
         KeyCode::Char('t') => app.open_closed(),
-        KeyCode::Char('d') => app.open_details(),
+        KeyCode::Char('f') => app.refresh(),
         _ => {}
     }
+    app.exit_leader();
 }
 
 /// Handle keys while the model picker popup is open: navigate, confirm, cancel.
@@ -239,7 +260,77 @@ fn handle_create_key(app: &mut App, key: KeyEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::wants_loop_refresh;
+    use super::{handle_key, wants_loop_refresh};
+    use crate::app::App;
+    use crate::github::parse_issues;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn space_opens_the_leader_menu() {
+        let mut app = App::new(Vec::new());
+        assert!(!app.leader_active());
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.leader_active());
+    }
+
+    #[test]
+    fn leader_then_c_opens_create_and_closes_the_menu() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.is_creating());
+        assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn actions_are_gated_behind_the_leader_key() {
+        // Without pressing space first the action keys do nothing — issue
+        // actions are hidden until the leader opens the menu (#129).
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('c'));
+        assert!(!app.is_creating());
+        assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn leader_r_marks_ready_reusing_the_refresh_key() {
+        // `r` means ready inside the menu (it refreshed before #129); the menu
+        // closes afterwards.
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        assert!(!app.selected_is_ready());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.selected_is_ready());
+        assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn an_unbound_key_cancels_the_leader_menu() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.leader_active());
+        assert!(!app.is_creating());
+    }
+
+    #[test]
+    fn navigation_works_without_the_leader_key() {
+        let issues = parse_issues(
+            r#"[{"number":1,"title":"a"},{"number":2,"title":"b"},{"number":3,"title":"c"}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        assert_eq!(app.state.selected(), Some(0));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.state.selected(), Some(1));
+        assert!(!app.leader_active());
+    }
 
     #[test]
     fn refreshes_periodically_while_running() {

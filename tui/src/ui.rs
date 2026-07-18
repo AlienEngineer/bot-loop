@@ -287,14 +287,31 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         spans.push(Span::raw("  "));
     }
     let ready_key = if app.selected_is_ready() {
-        "s unready"
+        "r unready"
     } else {
-        "s ready"
+        "r ready"
     };
-    spans.push(Span::styled(
-        format!("j/k move · g/G top/bottom · c new · {ready_key} · x close · d details · l add-worker · L stop-all · m models · o output · p pr-output · t closed · r refresh · q quit"),
-        Style::new().fg(Color::DarkGray),
-    ));
+    if app.leader_active() {
+        // The leader menu lists the issue actions unlocked by `space` (#129).
+        spans.push(Span::styled(
+            " ACTIONS ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
+            Style::new().fg(Color::DarkGray),
+        ));
+    } else {
+        // Actions stay hidden until `space` opens the menu; only navigation and
+        // the leader hint show here (#129).
+        spans.push(Span::styled(
+            "j/k move · g/G top/bottom · space actions · q quit",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -933,7 +950,8 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("loop: off"));
-        assert!(text.contains("add-worker"));
+        // Actions (add-worker included) now hide behind the leader key (#129).
+        assert!(text.contains("space actions"));
     }
 
     #[test]
@@ -948,7 +966,47 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("model: auto"));
+        assert!(text.contains("space actions"));
+    }
+
+    #[test]
+    fn base_footer_hides_actions_behind_the_leader_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        // Only the leader hint shows; the issue actions stay hidden (#129).
+        assert!(text.contains("space actions"));
+        assert!(!text.contains("c new"));
+        assert!(!text.contains("m models"));
+        assert!(!text.contains("ACTIONS"));
+    }
+
+    #[test]
+    fn leader_footer_lists_the_issue_actions() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        // The menu shows the actions the issue asked for, plus the rest (#129).
+        assert!(text.contains("ACTIONS"));
+        assert!(text.contains("c new"));
+        assert!(text.contains("r ready"));
         assert!(text.contains("m models"));
+        assert!(text.contains("add-worker"));
+        assert!(text.contains("f refresh"));
+        assert!(text.contains("esc cancel"));
+        // The action menu replaces the base navigation hint.
+        assert!(!text.contains("space actions"));
     }
 
     #[test]
@@ -956,6 +1014,7 @@ mod tests {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -968,6 +1027,7 @@ mod tests {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -981,11 +1041,12 @@ mod tests {
         let plain =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(plain);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("s ready"));
-        assert!(!text.contains("s unready"));
+        assert!(text.contains("r ready"));
+        assert!(!text.contains("r unready"));
 
         // …while an already-ready selection offers to remove the label (#146).
         let ready = parse_issues(
@@ -993,9 +1054,10 @@ mod tests {
         )
         .unwrap();
         let mut app = App::new(ready);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(buffer_text(&terminal).contains("s unready"));
+        assert!(buffer_text(&terminal).contains("r unready"));
     }
 
     #[test]
@@ -1197,6 +1259,7 @@ mod tests {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -1282,6 +1345,7 @@ mod tests {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(170, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -1330,6 +1394,7 @@ mod tests {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
+        app.enter_leader();
         let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();

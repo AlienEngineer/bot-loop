@@ -124,6 +124,9 @@ pub struct App {
     /// Vertical scroll offset (in rendered lines) of the details popup, so long
     /// issues and comment threads can be read top to bottom (#152).
     details_scroll: u16,
+    /// Whether the `space` leader-key action menu is open, i.e. the next key in
+    /// the list selects an issue action rather than navigating (#129).
+    leader: bool,
     /// Background fetcher that runs the `gh` issue/PR queries off the UI thread
     /// so the periodic auto-refresh never freezes input or redraws (#144).
     /// `None` when no worker is attached (unit tests, or before wiring).
@@ -168,6 +171,7 @@ impl App {
             details_open: false,
             details: None,
             details_scroll: 0,
+            leader: false,
             fetcher: None,
         }
     }
@@ -593,6 +597,22 @@ impl App {
     /// Open or close the output side panel (#107).
     pub fn toggle_output(&mut self) {
         self.show_output = !self.show_output;
+    }
+
+    /// Whether the `space` leader-key action menu is open (#129).
+    pub fn leader_active(&self) -> bool {
+        self.leader
+    }
+
+    /// Open the leader-key action menu so the next key selects an issue action
+    /// instead of navigating the list (#129).
+    pub fn enter_leader(&mut self) {
+        self.leader = true;
+    }
+
+    /// Close the leader-key action menu without running an action (#129).
+    pub fn exit_leader(&mut self) {
+        self.leader = false;
     }
 
     /// The selected issue's latest loop log path and its sanitized tail, or
@@ -1518,6 +1538,16 @@ mod tests {
         assert!(app.output_visible());
         app.toggle_output();
         assert!(!app.output_visible());
+    }
+
+    #[test]
+    fn leader_menu_is_closed_by_default_and_toggles() {
+        let mut app = app_with(3);
+        assert!(!app.leader_active());
+        app.enter_leader();
+        assert!(app.leader_active());
+        app.exit_leader();
+        assert!(!app.leader_active());
     }
 
     #[test]
