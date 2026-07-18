@@ -8,6 +8,7 @@ use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
 use crate::models;
 use crate::runner::{self, LoopRunner};
+use crate::worker::{FetchOutcome, IssueFetcher};
 
 /// Default number of issues to request from `gh`.
 pub const DEFAULT_LIMIT: u32 = 200;
@@ -115,6 +116,10 @@ pub struct App {
     closed_issues: Vec<Issue>,
     /// Selection within the closed-issues popup (#145).
     pub closed_state: ListState,
+    /// Background fetcher that runs the `gh` issue/PR queries off the UI thread
+    /// so the periodic auto-refresh never freezes input or redraws (#144).
+    /// `None` when no worker is attached (unit tests, or before wiring).
+    fetcher: Option<IssueFetcher>,
 }
 
 impl App {
@@ -152,6 +157,7 @@ impl App {
             closed_open: false,
             closed_issues: Vec::new(),
             closed_state: ListState::default(),
+            fetcher: None,
         }
     }
 
@@ -203,18 +209,70 @@ impl App {
         }
     }
 
-    /// Silently re-fetch issues so the list (and its in-progress labels) tracks
-    /// the running loop without a manual refresh (#115), announcing when the
-    /// loop *starts* on a new issue so the user gets feedback (#119).
+    /// Attach the background issue fetcher so refreshes run off the UI thread
+    /// (#144). Wired once at startup; unit tests leave it unset and drive the
+    /// apply path directly.
+    pub fn set_fetcher(&mut self, fetcher: IssueFetcher) {
+        self.fetcher = Some(fetcher);
+    }
+
+    /// Request a silent, off-thread re-fetch of issues so the list (and its
+    /// in-progress labels) tracks the running loop without a manual refresh
+    /// (#115), announcing when the loop *starts* on a new issue (#119).
     ///
-    /// Unlike [`refresh`], this leaves the status line untouched on a plain
-    /// refresh and swallows errors: it runs on a timer while the loop works, so
-    /// a transient `gh` hiccup must not clobber the current status or spam the
-    /// footer — a manual `r` still surfaces failures. The one time it does set
-    /// the status is the discrete "loop started #N" event (#119).
+    /// The blocking `gh` calls run on the worker thread, so this returns
+    /// immediately and the UI keeps redrawing and handling input while the
+    /// fetch is in flight (#144). Results land via [`poll_fetch_results`]. When
+    /// no worker is attached it falls back to a synchronous fetch so behaviour
+    /// is preserved.
+    ///
+    /// Unlike [`refresh`], applying the result leaves the status line untouched
+    /// on a plain refresh and swallows errors: it runs on a timer while the loop
+    /// works, so a transient `gh` hiccup must not clobber the current status or
+    /// spam the footer — a manual `r` still surfaces failures. The one time it
+    /// does set the status is the discrete "loop started #N" event (#119).
     pub fn auto_refresh(&mut self) {
+        match self.fetcher.as_ref() {
+            Some(fetcher) => fetcher.request(),
+            None => self.auto_refresh_blocking(),
+        }
+    }
+
+    /// Synchronous fallback for [`auto_refresh`] when no worker is attached.
+    /// Mirrors the pre-#144 inline behaviour: fetch on the UI thread and fold
+    /// the result in.
+    fn auto_refresh_blocking(&mut self) {
         self.refresh_in_progress_prs();
         if let Ok(issues) = github::fetch_issues(self.limit) {
+            self.set_issues(issues);
+            if let Some(message) = self.take_started_feedback() {
+                self.status = Some(message);
+            }
+        }
+    }
+
+    /// Fold any completed background fetches into the app state. Called each UI
+    /// tick so the list and in-progress markers track the loop without the UI
+    /// thread ever blocking on `gh` (#144).
+    pub fn poll_fetch_results(&mut self) {
+        let Some(outcomes) = self.fetcher.as_ref().map(IssueFetcher::drain) else {
+            return;
+        };
+        for outcome in outcomes {
+            self.apply_fetch_outcome(outcome);
+        }
+    }
+
+    /// Apply one completed background fetch, matching the old silent
+    /// `auto_refresh`: update the PR list on success, refresh the issue list,
+    /// and announce any newly started issues/PRs. Errors are swallowed so a
+    /// transient `gh` hiccup never clobbers the status line — a manual `r` still
+    /// surfaces failures (#144).
+    fn apply_fetch_outcome(&mut self, outcome: FetchOutcome) {
+        if let Ok(prs) = outcome.prs {
+            self.in_progress_prs = prs;
+        }
+        if let Ok(issues) = outcome.issues {
             self.set_issues(issues);
             if let Some(message) = self.take_started_feedback() {
                 self.status = Some(message);
@@ -1144,6 +1202,57 @@ mod tests {
             .expect("both should be announced");
         assert!(feedback.contains("Loop started working on #10"));
         assert!(feedback.contains("Loop started resolving PR #12"));
+    }
+
+    #[test]
+    fn apply_fetch_outcome_folds_in_issues_and_prs_and_announces() {
+        // A completed background fetch (#144) updates the list and PR set, and
+        // announces the freshly started issue and PR just like the old inline
+        // auto_refresh did — without touching `gh`.
+        let mut app = App::new(Vec::new());
+        let outcome = FetchOutcome {
+            issues: Ok(parse_issues(
+                r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#,
+            )
+            .unwrap()),
+            prs: Ok(github::parse_pull_requests(r#"[{"number":12,"title":"b"}]"#).unwrap()),
+        };
+
+        app.apply_fetch_outcome(outcome);
+
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.in_progress_pr_numbers(), vec![12]);
+        let status = app.status.as_deref().expect("a start is announced");
+        assert!(status.contains("Loop started working on #10"));
+        assert!(status.contains("Loop started resolving PR #12"));
+    }
+
+    #[test]
+    fn apply_fetch_outcome_swallows_errors_and_keeps_state() {
+        // A transient `gh` failure must not clobber the list or the status line
+        // (#144): both results erroring leaves everything as it was.
+        let json = r#"[{"number":7,"title":"keep"}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        let outcome = FetchOutcome {
+            issues: Err(anyhow::anyhow!("gh issue list failed")),
+            prs: Err(anyhow::anyhow!("gh pr list failed")),
+        };
+
+        app.apply_fetch_outcome(outcome);
+
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].number, 7);
+        assert!(app.status.is_none());
+        assert!(app.in_progress_pr_numbers().is_empty());
+    }
+
+    #[test]
+    fn poll_fetch_results_is_a_noop_without_a_fetcher() {
+        // Unit-test apps attach no worker, so draining is a harmless no-op.
+        let mut app = app_with(2);
+        app.poll_fetch_results();
+        assert_eq!(app.issues.len(), 2);
+        assert!(app.status.is_none());
     }
 
     #[test]
