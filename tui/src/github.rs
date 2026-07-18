@@ -344,6 +344,12 @@ fn create_label_args(label: &str) -> Vec<String> {
 /// `ensure_label` does. Then runs `gh issue edit <number> --add-label <label>`.
 /// Returns an error when `gh` is missing, not authenticated, or the edit fails.
 pub fn add_label(number: u64, label: &str) -> Result<()> {
+    // Tests drive the local apply path directly; never shell out to `gh` so the
+    // suite stays hermetic and can't mutate real issues (#129).
+    if cfg!(test) {
+        return Ok(());
+    }
+
     // Best-effort create; a failure here (usually "already exists") is ignored
     // so a genuine problem surfaces on the edit below instead.
     let _ = Command::new("gh").args(create_label_args(label)).output();
@@ -381,6 +387,12 @@ fn remove_label_args(number: u64, label: &str) -> Vec<String> {
 /// there is no need to ensure the label exists first. Returns an error when
 /// `gh` is missing, not authenticated, or the edit fails.
 pub fn remove_label(number: u64, label: &str) -> Result<()> {
+    // Tests drive the local apply path directly; never shell out to `gh` so the
+    // suite stays hermetic and can't mutate real issues (#129).
+    if cfg!(test) {
+        return Ok(());
+    }
+
     let output = Command::new("gh")
         .args(remove_label_args(number, label))
         .output()

@@ -67,22 +67,24 @@ that spawns, monitors, and stops several loop instances ("bots") side by side.
 A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). The
 first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
-authenticated for the target repo. Press `s` (or `Enter`) to toggle the trigger
+authenticated for the target repo. Issue actions live behind a `space` leader
+key (#129): press `space` to reveal them in the footer, then one key runs the
+action (or `Esc` cancels). Press `space` then `r` to toggle the trigger
 label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
 absent so the loop picks the issue up, or removed when present so a
-mistakenly-queued issue can be pulled back out (#146). Press `c` to create a new issue: fill in a title and description, then
-`Ctrl+S` to submit it (no label is added by default). Press `x` to close the
+mistakenly-queued issue can be pulled back out (#146). Press `space` then `c` to create a new issue: fill in a title and description, then
+`Ctrl+S` to submit it (no label is added by default). Press `space` then `x` to close the
 selected issue: a confirmation popup names it, then `y` closes it on GitHub
-(`n`/`Esc` cancels). Press `l` to start a background `copilot-loop.sh` worker
-that works through the ready issues; press `l` again to add more workers running
+(`n`/`Esc` cancels). Press `space` then `l` to start a background `copilot-loop.sh` worker
+that works through the ready issues; press `space` then `l` again to add more workers running
 in parallel. Each worker claims issues under a GitHub lock (and isolates each in
 its own git worktree), so multiple workers safely pick *different* issues (#134).
-Press `L` (Shift+L) to stop every worker. Workers run detached — each one's
+Press `space` then `L` (Shift+L) to stop every worker. Workers run detached — each one's
 output captured to `.copilot-loop/tui/loop-<n>.log` — and keep going after you
 quit the TUI. The loop script is found at the repo root
-(override with `$COPILOT_LOOP_SCRIPT`). Press `o` to open a side panel on the
+(override with `$COPILOT_LOOP_SCRIPT`). Press `space` then `o` to open a side panel on the
 right that tails the running loop's output for the selected issue (its
-`.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `o` again
+`.copilot-loop/logs/issue-<n>-…log`, following the PR run too); press `space` then `o` again
 to close it. That log holds the loop's own narration — branch creation, "running
 copilot", the PR push — interleaved with Copilot's transcript, so the panel shows
 the whole run just as the bash loop prints it to the terminal, not only Copilot's
@@ -96,31 +98,31 @@ workers claim them, without a manual refresh (#115). The workers also handle pul
 requests (resolving merge conflicts and fixing failing checks); since PRs are not
 in the issue list, the header calls that out with its own spinner and a
 `resolving PR #12` note, and the status line announces each PR a worker starts, so
-it is always clear a worker is busy on a PR (#133). Press `p` to open a popup that
+it is always clear a worker is busy on a PR (#133). Press `space` then `p` to open a popup that
 lists the PRs being resolved and tails the selected one's transcript (its
 `.copilot-loop/logs/pr-<n>-…log`); when several resolve at once, `j`/`k` switch
 between them, and `Esc` (or `p`/`q`) closes it (#143).
 
-Press `m` to open a popup and pick which model the background loop runs on
+Press `space` then `m` to open a popup and pick which model the background loop runs on
 (`j`/`k` to move, `Enter` to select, `Esc` to cancel). The choice is forwarded to
 `copilot-loop.sh` as `--model` for workers started after that; `auto` lets Copilot
 pick. The picker's list defaults to a small built-in set — override it with
 `$COPILOT_MODELS` (a comma- or space-separated list).
 
-Press `a` to toggle auto-merge (#135). When on, the loop is started with
+Press `space` then `a` to toggle auto-merge (#135). When on, the loop is started with
 `--auto-merge` so each PR merges without manual review (GitHub auto-merge when the
 repo allows it, otherwise an immediate merge); the header shows `auto-merge: on`.
 Like the model, the setting takes effect the next time the loop starts, so a
 running loop keeps its behaviour until restarted.
 
-Press `t` to open a popup listing the repository's closed issues alongside how
+Press `space` then `t` to open a popup listing the repository's closed issues alongside how
 much each one cost to resolve. The spend is the sum of the `AI Credits` the loop
 posted on the issue (its `<!-- copilot-loop:usage -->` comments), shown per row
 with the grand total in the popup's title; issues closed by hand — with no
 recorded spend — show a `—`. Navigate with `j`/`k`; `Esc` (or `t`/`q`) closes it
 (#145).
 
-Press `d` to open a popup with the selected issue's full details — its title,
+Press `space` then `d` to open a popup with the selected issue's full details — its title,
 number, author, labels, description, and the whole comment thread (each comment's
 author, date, and body) — so an issue can be read without leaving the TUI. The
 content is fetched fresh with `gh issue view`; scroll it with `j`/`k` (`g`/`G`
@@ -131,12 +133,14 @@ cd tui
 cargo run
 ```
 
-Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `c` create a new issue, `s`/`Enter`
-toggle the ready label (mark ready, or remove it if already ready), `x` close the selected issue (confirm with `y`), `d` view the selected issue's details and comments, `l` start/stop
-the background loop, `a` toggle auto-merge, `m` pick the model, `o`
-show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
-issues and their cost, `r` refresh, `q` (or
-`Esc`) quit. In the new-issue
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit. Press
+`space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
+the ready label (mark ready, or remove it if already ready), `x` close the
+selected issue (confirm with `y`), `d` view the selected issue's details and
+comments, `l` add a background worker, `L` stop all workers, `a` toggle
+auto-merge, `m` pick the model, `o` show/hide the output panel, `p` show the
+resolving-PRs popup, `t` show closed issues and their cost, `f` refresh, `Esc`
+cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
 
