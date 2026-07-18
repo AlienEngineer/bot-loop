@@ -130,6 +130,13 @@ pub struct App {
     /// so the periodic auto-refresh never freezes input or redraws (#144).
     /// `None` when no worker is attached (unit tests, or before wiring).
     fetcher: Option<IssueFetcher>,
+    /// Whether a background fetch is in flight, so the footer can animate a
+    /// "Refreshing…" indicator until the result lands (#130).
+    refreshing: bool,
+    /// Whether the in-flight fetch was triggered by a manual `r` refresh, so its
+    /// completion is reported on the status line (empty list, or an error) the
+    /// way the old blocking `refresh` did — auto-refreshes stay silent (#130).
+    manual_refresh_pending: bool,
 }
 
 impl App {
@@ -172,6 +179,8 @@ impl App {
             details: None,
             details_scroll: 0,
             fetcher: None,
+            refreshing: false,
+            manual_refresh_pending: false,
         }
     }
 
@@ -194,8 +203,29 @@ impl App {
         self.state.select(Some(selected));
     }
 
-    /// Re-fetch issues from GitHub, updating the status line on error.
+    /// Re-fetch issues from GitHub in response to a manual `r` press.
+    ///
+    /// When a worker is attached the fetch runs off the UI thread so the footer
+    /// can animate a "Refreshing…" indicator instead of freezing during the `gh`
+    /// call (#130); [`poll_fetch_results`] applies the result on a later tick and
+    /// reports it like a manual refresh (an empty list, or an error). Without a
+    /// worker (unit tests, pre-wiring) it falls back to a blocking fetch.
     pub fn refresh(&mut self) {
+        match self.fetcher.as_ref() {
+            Some(fetcher) => {
+                fetcher.request();
+                self.manual_refresh_pending = true;
+                self.refreshing = true;
+            }
+            None => self.refresh_blocking(),
+        }
+    }
+
+    /// Blocking manual re-fetch: fetch on the UI thread and fold the result in,
+    /// updating the status line on an empty list or an error. Used as the
+    /// no-worker fallback for [`refresh`] and by the create flow, which needs the
+    /// new row present before it can select it.
+    fn refresh_blocking(&mut self) {
         self.refresh_in_progress_prs();
         match github::fetch_issues(self.limit) {
             Ok(issues) => {
@@ -236,9 +266,9 @@ impl App {
     ///
     /// The blocking `gh` calls run on the worker thread, so this returns
     /// immediately and the UI keeps redrawing and handling input while the
-    /// fetch is in flight (#144). Results land via [`poll_fetch_results`]. When
-    /// no worker is attached it falls back to a synchronous fetch so behaviour
-    /// is preserved.
+    /// fetch is in flight (#144), animating a footer "Refreshing…" indicator
+    /// (#130). Results land via [`poll_fetch_results`]. When no worker is
+    /// attached it falls back to a synchronous fetch so behaviour is preserved.
     ///
     /// Unlike [`refresh`], applying the result leaves the status line untouched
     /// on a plain refresh and swallows errors: it runs on a timer while the loop
@@ -247,7 +277,10 @@ impl App {
     /// does set the status is the discrete "loop started #N" event (#119).
     pub fn auto_refresh(&mut self) {
         match self.fetcher.as_ref() {
-            Some(fetcher) => fetcher.request(),
+            Some(fetcher) => {
+                fetcher.request();
+                self.refreshing = true;
+            }
             None => self.auto_refresh_blocking(),
         }
     }
@@ -267,29 +300,56 @@ impl App {
 
     /// Fold any completed background fetches into the app state. Called each UI
     /// tick so the list and in-progress markers track the loop without the UI
-    /// thread ever blocking on `gh` (#144).
+    /// thread ever blocking on `gh` (#144). Draining at least one outcome clears
+    /// the in-flight flag so the footer's "Refreshing…" indicator stops (#130).
     pub fn poll_fetch_results(&mut self) {
         let Some(outcomes) = self.fetcher.as_ref().map(IssueFetcher::drain) else {
             return;
         };
+        if !outcomes.is_empty() {
+            self.refreshing = false;
+        }
         for outcome in outcomes {
             self.apply_fetch_outcome(outcome);
         }
     }
 
-    /// Apply one completed background fetch, matching the old silent
-    /// `auto_refresh`: update the PR list on success, refresh the issue list,
-    /// and announce any newly started issues/PRs. Errors are swallowed so a
-    /// transient `gh` hiccup never clobbers the status line — a manual `r` still
-    /// surfaces failures (#144).
+    /// Whether a background refresh is currently in flight, so the UI can animate
+    /// its "Refreshing…" indicator (#130).
+    pub fn is_refreshing(&self) -> bool {
+        self.refreshing
+    }
+
+    /// Apply one completed background fetch. A manual refresh (the user pressed
+    /// `r`) reports an empty list and surfaces errors on the status line, the way
+    /// the old blocking `refresh` did (#130); an auto-refresh stays silent except
+    /// for the "loop started #N" announcement (#119). Auto-refresh errors are
+    /// swallowed so a transient `gh` hiccup never clobbers the status line (#144).
     fn apply_fetch_outcome(&mut self, outcome: FetchOutcome) {
+        let manual = std::mem::take(&mut self.manual_refresh_pending);
         if let Ok(prs) = outcome.prs {
             self.in_progress_prs = prs;
         }
-        if let Ok(issues) = outcome.issues {
-            self.set_issues(issues);
-            if let Some(message) = self.take_started_feedback() {
-                self.status = Some(message);
+        match outcome.issues {
+            Ok(issues) => {
+                if manual {
+                    self.status = if issues.is_empty() {
+                        Some("No open issues found.".to_string())
+                    } else {
+                        None
+                    };
+                    self.set_issues(issues);
+                } else {
+                    self.set_issues(issues);
+                    if let Some(message) = self.take_started_feedback() {
+                        self.status = Some(message);
+                    }
+                }
+            }
+            Err(err) => {
+                if manual {
+                    self.status = Some(format!("Error: {err}"));
+                }
             }
         }
     }
@@ -931,9 +991,9 @@ impl App {
 
     /// Submit the new-issue form: create the issue via `gh`, then refresh.
     ///
-    /// Requires a non-empty title. On success the list is refetched so the new
-    /// row appears and is selected, and the form closes; on failure the form
-    /// stays open with the error on the status line.
+    /// Requires a non-empty title. On success the list is refetched with a
+    /// blocking fetch — so the new row exists before we select it — and the form
+    /// closes; on failure the form stays open with the error on the status line.
     pub fn submit_create(&mut self) {
         let title = self.form.title.trim().to_string();
         if title.is_empty() {
@@ -947,7 +1007,7 @@ impl App {
             Ok(number) => {
                 self.mode = Mode::List;
                 self.form = CreateForm::default();
-                self.refresh();
+                self.refresh_blocking();
                 if let Some(pos) = self.issues.iter().position(|i| i.number == number) {
                     self.state.select(Some(pos));
                 }
@@ -1003,6 +1063,22 @@ impl App {
         let previous = self.selected_pr_number();
         self.in_progress_prs = prs;
         self.reselect_pr_output(previous);
+    }
+
+    /// Mark the next applied fetch as a manual refresh (tests only), standing in
+    /// for [`refresh`] having requested the worker, so the manual reporting path
+    /// in [`apply_fetch_outcome`] can be exercised without a live fetch (#130).
+    #[cfg(test)]
+    pub fn begin_manual_refresh(&mut self) {
+        self.manual_refresh_pending = true;
+        self.refreshing = true;
+    }
+
+    /// Force the "refreshing" flag (tests only) so the footer's animated
+    /// indicator can be rendered without wiring a worker or calling `gh` (#130).
+    #[cfg(test)]
+    pub fn set_refreshing(&mut self, refreshing: bool) {
+        self.refreshing = refreshing;
     }
 
     /// Seed the closed-issues popup and open it (tests only), standing in for the
@@ -1379,6 +1455,75 @@ mod tests {
         let mut app = app_with(2);
         app.poll_fetch_results();
         assert_eq!(app.issues.len(), 2);
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn is_refreshing_tracks_the_in_flight_flag() {
+        let mut app = app_with(1);
+        assert!(!app.is_refreshing());
+        app.set_refreshing(true);
+        assert!(app.is_refreshing());
+        app.set_refreshing(false);
+        assert!(!app.is_refreshing());
+    }
+
+    #[test]
+    fn manual_refresh_outcome_reports_an_empty_list() {
+        let mut app = app_with(3);
+        app.begin_manual_refresh();
+        app.apply_fetch_outcome(FetchOutcome {
+            issues: Ok(Vec::new()),
+            prs: Ok(Vec::new()),
+        });
+        assert!(app.issues.is_empty());
+        assert_eq!(app.status.as_deref(), Some("No open issues found."));
+    }
+
+    #[test]
+    fn manual_refresh_outcome_clears_status_on_a_non_empty_list() {
+        let mut app = app_with(1);
+        app.status = Some("stale".to_string());
+        app.begin_manual_refresh();
+        app.apply_fetch_outcome(FetchOutcome {
+            issues: Ok(parse_issues(r#"[{"number":9,"title":"new"}]"#).unwrap()),
+            prs: Ok(Vec::new()),
+        });
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].number, 9);
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn manual_refresh_outcome_surfaces_errors() {
+        let mut app = app_with(2);
+        app.begin_manual_refresh();
+        app.apply_fetch_outcome(FetchOutcome {
+            issues: Err(anyhow::anyhow!("gh exploded")),
+            prs: Ok(Vec::new()),
+        });
+        assert_eq!(app.status.as_deref(), Some("Error: gh exploded"));
+        // The prior list survives a failed refresh.
+        assert_eq!(app.issues.len(), 2);
+    }
+
+    #[test]
+    fn a_manual_refresh_outcome_is_reported_once() {
+        // The manual flag is consumed by the first applied outcome, so a later
+        // silent auto-refresh does not re-report an empty list (#130).
+        let mut app = app_with(1);
+        app.begin_manual_refresh();
+        app.apply_fetch_outcome(FetchOutcome {
+            issues: Ok(Vec::new()),
+            prs: Ok(Vec::new()),
+        });
+        assert_eq!(app.status.as_deref(), Some("No open issues found."));
+
+        app.status = None;
+        app.apply_fetch_outcome(FetchOutcome {
+            issues: Ok(Vec::new()),
+            prs: Ok(Vec::new()),
+        });
         assert!(app.status.is_none());
     }
 
