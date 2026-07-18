@@ -213,6 +213,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--sleep-minutes <n>` | `SLEEP_MINUTES` | Idle sleep when no work (default: 5) |
 | `--repo-dir <dir>` | `REPO_DIR` | Repository to operate in |
 | `--model <model>` | `COPILOT_MODEL` | Model passed to `copilot --model` |
+| `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | Wall-clock limit for each Copilot run so a stuck run cannot block the loop; seconds or an `s`/`m`/`h`/`d` suffix (`30m`), `0`/`off` disables (default: `30m`) |
 | `--commit-model <model>` | `COMMIT_MODEL` | Model that writes the commit message |
 | `--triage-model <model>` | `TRIAGE_MODEL` | Cheap model that classifies each issue |
 | `--triage-map <map>` | `TRIAGE_MAP` | `class=model` pairs mapping difficulty to model |
