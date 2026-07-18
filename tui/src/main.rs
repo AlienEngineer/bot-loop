@@ -24,6 +24,15 @@ use app::{App, DEFAULT_LIMIT};
 /// refresh (#115).
 const LOOP_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long to block for input each tick while something on screen is animating
+/// — a background refresh's "Refreshing…" indicator (#130) or the running loop's
+/// spinner (#115) — kept short so the spinner turns smoothly.
+const ANIMATION_TICK: Duration = Duration::from_millis(80);
+
+/// How long to block for input each tick when the screen is static, kept long to
+/// stay near-idle.
+const IDLE_TICK: Duration = Duration::from_millis(250);
+
 fn main() -> Result<()> {
     let mut app = App::new(Vec::new());
     match github::fetch_issues(DEFAULT_LIMIT) {
@@ -61,7 +70,16 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        if event::poll(Duration::from_millis(250))?
+        // Poll briefly while anything animates — a background refresh's
+        // "Refreshing…" indicator (#130) or the running loop's spinner (#115) —
+        // so the spinner turns smoothly; otherwise wait longer to stay near-idle.
+        let poll_timeout = if app.is_refreshing() || app.loop_running() {
+            ANIMATION_TICK
+        } else {
+            IDLE_TICK
+        };
+
+        if event::poll(poll_timeout)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -162,6 +180,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => app.open_details(),
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
+        KeyCode::Char('a') => app.toggle_auto_merge(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),

@@ -109,6 +109,12 @@ Press `space` then `m` to open a popup and pick which model the background loop 
 pick. The picker's list defaults to a small built-in set — override it with
 `$COPILOT_MODELS` (a comma- or space-separated list).
 
+Press `space` then `a` to toggle auto-merge (#135). When on, the loop is started with
+`--auto-merge` so each PR merges without manual review (GitHub auto-merge when the
+repo allows it, otherwise an immediate merge); the header shows `auto-merge: on`.
+Like the model, the setting takes effect the next time the loop starts, so a
+running loop keeps its behaviour until restarted.
+
 Press `space` then `t` to open a popup listing the repository's closed issues alongside how
 much each one cost to resolve. The spend is the sum of the `AI Credits` the loop
 posted on the issue (its `<!-- copilot-loop:usage -->` comments), shown per row
@@ -131,9 +137,10 @@ Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit. Press
 `space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
 the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
-comments, `l` add a background worker, `L` stop all workers, `m` pick the model,
-`o` show/hide the output panel, `p` show the resolving-PRs popup, `t` show closed
-issues and their cost, `f` refresh, `Esc` cancel. In the new-issue
+comments, `l` add a background worker, `L` stop all workers, `a` toggle
+auto-merge, `m` pick the model, `o` show/hide the output panel, `p` show the
+resolving-PRs popup, `t` show closed issues and their cost, `f` refresh, `Esc`
+cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
 

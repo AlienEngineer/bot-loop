@@ -110,6 +110,9 @@ fn pr_summary(prs: &[u64]) -> Option<String> {
 /// something is happening and on what (#115, #133, #134). Pure so the running
 /// branch — which otherwise needs live child processes — is
 /// unit-testable.
+// Combines the multi-worker header (#134) with the auto-merge indicator (#135),
+// which together push this one span past the arg-count lint.
+#[allow(clippy::too_many_arguments)]
 fn header_spans(
     count: usize,
     viewing: Option<u64>,
@@ -117,6 +120,7 @@ fn header_spans(
     working: &[u64],
     working_prs: &[u64],
     model_label: &str,
+    auto_merge: bool,
     spinner: &str,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -181,6 +185,14 @@ fn header_spans(
         format!("  ·  model: {model_label}"),
         Style::new().fg(Color::Magenta),
     ));
+    spans.push(Span::styled(
+        format!("  ·  auto-merge: {}", if auto_merge { "on" } else { "off" }),
+        Style::new().fg(if auto_merge {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    ));
     spans
 }
 
@@ -192,6 +204,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, work
         &app.in_progress_numbers(),
         &app.in_progress_pr_numbers(),
         app.current_model_label(),
+        app.auto_merge(),
         spinner_frame(),
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -277,8 +290,24 @@ fn render_output_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
     }
 }
 
+/// The footer's refreshing indicator: an animated spinner and "Refreshing…"
+/// while a background refresh is in flight (#130), or `None` when idle. Pure so
+/// the animated branch is unit-testable without a live fetch.
+fn refreshing_indicator(refreshing: bool, spinner: &str) -> Option<Span<'static>> {
+    refreshing.then(|| {
+        Span::styled(
+            format!("{spinner} Refreshing… "),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    })
+}
+
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut spans = Vec::new();
+    if let Some(indicator) = refreshing_indicator(app.is_refreshing(), spinner_frame()) {
+        spans.push(indicator);
+        spans.push(Span::raw("  "));
+    }
     if let Some(status) = &app.status {
         spans.push(Span::styled(
             format!(" {status} "),
@@ -292,7 +321,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         "r ready"
     };
     if app.leader_active() {
-        // The leader menu lists the issue actions unlocked by `space` (#129).
+        // The leader menu lists the issue actions unlocked by `space` (#129),
+        // including auto-merge (#135).
         spans.push(Span::styled(
             " ACTIONS ",
             Style::new()
@@ -301,7 +331,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
+            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · a auto-merge · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -992,7 +1022,7 @@ mod tests {
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1015,11 +1045,49 @@ mod tests {
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("o output"));
+    }
+
+    #[test]
+    fn footer_shows_the_refreshing_indicator_while_refreshing() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.set_refreshing(true);
+        app.enter_leader();
+        // Wide enough that the whole footer — indicator plus key hints — renders.
+        let mut terminal = Terminal::new(TestBackend::new(220, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Refreshing"));
+        // The key hints still share the footer.
+        assert!(text.contains("f refresh"));
+    }
+
+    #[test]
+    fn footer_hides_the_refreshing_indicator_when_idle() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(220, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(!buffer_text(&terminal).contains("Refreshing"));
+    }
+
+    #[test]
+    fn refreshing_indicator_shows_only_while_refreshing() {
+        assert!(refreshing_indicator(false, "⠋").is_none());
+        let span = refreshing_indicator(true, "⠋").expect("indicator while refreshing");
+        assert!(span.content.contains("Refreshing"));
+        assert!(span.content.contains("⠋"));
     }
 
     #[test]
@@ -1033,6 +1101,19 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("x close"));
+    }
+
+    #[test]
+    fn footer_advertises_the_auto_merge_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("a auto-merge"));
     }
 
     #[test]
@@ -1110,11 +1191,21 @@ mod tests {
 
     #[test]
     fn header_shows_spinner_and_working_issue_when_loop_runs() {
-        let text = spans_text(&header_spans(3, Some(96), 1, &[96], &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            Some(96),
+            1,
+            &[96],
+            &[],
+            "auto",
+            false,
+            "⠋",
+        ));
         assert!(text.contains("⠋ loop: running"));
         assert!(text.contains("1 worker"));
         assert!(text.contains("working #96"));
         assert!(text.contains("model: auto"));
+        assert!(text.contains("auto-merge: off"));
     }
 
     #[test]
@@ -1126,6 +1217,7 @@ mod tests {
             &[96, 97, 98],
             &[],
             "auto",
+            false,
             "⠋",
         ));
         assert!(text.contains("loop: running"));
@@ -1137,7 +1229,7 @@ mod tests {
     fn header_shows_pr_work_when_the_loop_resolves_a_pr() {
         // A PR being resolved is not in the issue list, so the header is the
         // only place the user learns the loop is busy (#133).
-        let text = spans_text(&header_spans(3, None, 1, &[], &[12], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[], &[12], "auto", false, "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("resolving PR #12"));
         // With PR work in flight the loop is not idle.
@@ -1146,26 +1238,43 @@ mod tests {
 
     #[test]
     fn header_shows_both_issue_and_pr_work() {
-        let text = spans_text(&header_spans(3, None, 1, &[96], &[12], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[96], &[12], "auto", false, "⠋"));
         assert!(text.contains("working #96"));
         assert!(text.contains("resolving PR #12"));
     }
 
     #[test]
     fn header_says_waiting_when_loop_runs_without_an_issue() {
-        let text = spans_text(&header_spans(3, None, 1, &[], &[], "auto", "⠋"));
+        let text = spans_text(&header_spans(3, None, 1, &[], &[], "auto", false, "⠋"));
         assert!(text.contains("loop: running"));
         assert!(text.contains("waiting for work"));
     }
 
     #[test]
     fn header_hides_loop_details_when_off() {
-        let text = spans_text(&header_spans(3, Some(96), 0, &[96], &[12], "auto", "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            Some(96),
+            0,
+            &[96],
+            &[12],
+            "auto",
+            false,
+            "⠋",
+        ));
         assert!(text.contains("loop: off"));
         assert!(!text.contains("working"));
         assert!(!text.contains("worker"));
         assert!(!text.contains("resolving PR"));
         assert!(!text.contains("⠋"));
+    }
+
+    #[test]
+    fn header_reflects_auto_merge_state() {
+        let on = spans_text(&header_spans(1, None, 0, &[], &[], "auto", true, "⠋"));
+        assert!(on.contains("auto-merge: on"));
+        let off = spans_text(&header_spans(1, None, 0, &[], &[], "auto", false, "⠋"));
+        assert!(off.contains("auto-merge: off"));
     }
 
     #[test]
