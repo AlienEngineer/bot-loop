@@ -10,6 +10,7 @@ mod logs;
 mod models;
 mod reporter;
 mod runner;
+mod settings;
 mod ui;
 mod worker;
 
@@ -46,6 +47,11 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new(Vec::new());
+
+    // Restore the model, auto-merge, quality-assurance, and close-summary choices
+    // the user made last run, and persist any further changes from here on (#195).
+    app.load_persisted_settings();
+
     match github::fetch_issues(DEFAULT_LIMIT) {
         Ok(issues) => {
             if issues.is_empty() {
