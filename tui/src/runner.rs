@@ -3,10 +3,11 @@
 //! Lets the TUI start one or more workers that work through ready issues while
 //! the user keeps browsing, mirroring the bash TUI's detached-bot model: each
 //! worker is an ordinary `copilot-loop.sh` run in its own process group with its
-//! output captured to a log, and it keeps running after the TUI exits (dropping
-//! the child handle never kills it). Running several workers against one repo is
-//! safe because the loop claims issues under a GitHub lock (and isolates each in
-//! its own git worktree), so workers always pick *different* issues (#134).
+//! output captured to a log. The process group lets the TUI signal the whole
+//! worker tree, so closing the TUI stops every worker it started (#209). Running
+//! several workers against one repo is safe because the loop claims issues under
+//! a GitHub lock (and isolates each in its own git worktree), so workers always
+//! pick *different* issues (#134).
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -338,8 +339,8 @@ impl LoopRunner {
 
 /// Spawn `program` detached from the TUI: its own process group (so the whole
 /// tree can be signalled), stdin from `/dev/null`, and stdout/stderr appended to
-/// `log`. Dropping the returned [`Child`] does not kill the process, so the loop
-/// keeps running after the TUI exits.
+/// `log`. The dedicated process group lets [`stop_all`](LoopRunner::stop_all)
+/// signal the worker and everything it spawned when the TUI closes (#209).
 fn spawn_detached(program: &Path, args: &[String], log: &Path) -> Result<Child> {
     if let Some(dir) = log.parent() {
         fs::create_dir_all(dir)

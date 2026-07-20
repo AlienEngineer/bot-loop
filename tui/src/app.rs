@@ -998,8 +998,8 @@ impl App {
     ///
     /// Each call launches a new detached `copilot-loop.sh`. Because the loop
     /// claims issues under a GitHub lock (and isolates each in its own git
-    /// worktree), several workers run safely on *different* issues (#134). A
-    /// worker keeps running after the TUI quits, matching the bash TUI.
+    /// worktree), several workers run safely on *different* issues (#134).
+    /// Quitting the TUI stops every worker it started (#209).
     pub fn start_worker(&mut self) {
         let repo = self.repo_root.clone();
         let Some(script) = runner::resolve_loop_script(&repo) else {
@@ -1056,6 +1056,14 @@ impl App {
             "Stopped {count} worker{}.",
             if count == 1 { "" } else { "s" }
         ));
+    }
+
+    /// Stop every background worker as the TUI closes, so quitting never leaves
+    /// detached `copilot-loop.sh` loops running (#209). Called once on exit;
+    /// unlike [`stop_all_workers`](Self::stop_all_workers) it sets no status
+    /// because the UI is already gone.
+    pub fn shutdown(&mut self) {
+        self.runner.stop_all();
     }
 
     /// How many background workers are currently running (#134).
@@ -2696,6 +2704,43 @@ mod tests {
         app.stop_all_workers();
         // No worker was running, so nothing is stopped and the status says so.
         assert_eq!(app.status.as_deref(), Some("No workers running."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_the_tui_stops_every_running_worker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Stand in for `copilot-loop.sh` with a script that just sleeps, so a
+        // real detached worker process is started for the repo the TUI targets.
+        let dir = std::env::temp_dir().join(format!("copilot-shutdown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join(runner::LOOP_SCRIPT_NAME);
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+
+        // The user starts a worker; writing then exec'ing a script in a
+        // multithreaded test can momentarily fail with ETXTBSY, so retry briefly
+        // until one is actually running.
+        let mut started = false;
+        for _ in 0..50 {
+            app.start_worker();
+            if app.workers_running() >= 1 {
+                started = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(started, "a worker should start; status: {:?}", app.status);
+
+        // Closing the TUI stops it, leaving nothing running behind (#209).
+        app.shutdown();
+        assert_eq!(app.workers_running(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A worker view in a given state, for the bots-popup unit tests (#82).

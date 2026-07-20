@@ -637,6 +637,17 @@ fn render_ready_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
     frame.render_widget(body, popup);
 }
 
+/// The note shown under the quit prompt. Warns that quitting stops the running
+/// workers the TUI started (#209), or that it just closes the UI when none run.
+/// Pure for testing.
+fn quit_note(workers_running: usize) -> &'static str {
+    if workers_running > 0 {
+        "Quitting stops all running workers."
+    } else {
+        "This closes the terminal UI."
+    }
+}
+
 /// Draw the quit confirmation popup: a centered prompt asking whether to exit
 /// the TUI, with a [`Clear`] underneath so the list does not show through
 /// (#167). The red border matches the close prompt, marking it a guarded exit.
@@ -651,13 +662,10 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &mut App) {
         .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
         .style(Style::new().bg(Color::Black));
 
-    // Reassure the operator that quitting the TUI leaves the detached background
-    // loops running; only mention it when a loop is actually up (#167).
-    let note = if app.workers_running() > 0 {
-        "Background loops keep running."
-    } else {
-        "This closes the terminal UI."
-    };
+    // Warn the operator that quitting stops the workers the TUI started, so a
+    // background loop is never left running after close (#209). Only mention it
+    // when a worker is actually up.
+    let note = quit_note(app.workers_running());
 
     let body = Paragraph::new(vec![
         Line::from(""),
@@ -2012,6 +2020,16 @@ mod tests {
         assert!(text.contains("Quit bot-loop?"));
         assert!(text.contains("y quit"));
         assert!(text.contains("cancel"));
+    }
+
+    #[test]
+    fn quit_note_warns_that_quitting_stops_running_workers() {
+        // With workers up, the prompt tells the operator quitting stops them so
+        // the new close-kills-workers behaviour is not a surprise (#209).
+        assert_eq!(quit_note(1), "Quitting stops all running workers.");
+        assert_eq!(quit_note(3), "Quitting stops all running workers.");
+        // With none running there is nothing to stop, so it just notes the close.
+        assert_eq!(quit_note(0), "This closes the terminal UI.");
     }
 
     #[test]
