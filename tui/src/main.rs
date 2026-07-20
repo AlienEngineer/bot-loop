@@ -145,6 +145,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The quit confirmation captures keys while it is open (#167).
+    if app.quit_confirm() {
+        handle_quit_confirm_key(app, key);
+        return;
+    }
+
     // The model picker popup captures keys while it is open.
     if app.model_picker_open() {
         handle_model_picker_key(app, key);
@@ -200,7 +206,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') | KeyCode::Esc => app.request_quit(),
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
         KeyCode::Char('g') | KeyCode::Home => app.first(),
@@ -259,6 +265,22 @@ fn handle_close_confirm_key(app: &mut App, key: KeyEvent) {
         | KeyCode::Char('q')
         | KeyCode::Esc
         | KeyCode::Enter => app.cancel_close(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the quit confirmation is open (#167). Quitting exits the
+/// TUI, so it defaults to safe: only `y` confirms; `n`, `Esc`, `q` and Enter
+/// cancel, and any other key is ignored so the prompt stays put — mirroring the
+/// close-issue confirmation so both destructive prompts behave the same.
+fn handle_quit_confirm_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_quit(),
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('q')
+        | KeyCode::Esc
+        | KeyCode::Enter => app.cancel_quit(),
         _ => {}
     }
 }
@@ -493,5 +515,75 @@ mod tests {
     #[test]
     fn refreshes_when_the_loop_just_started_and_the_interval_elapsed() {
         assert!(wants_loop_refresh(false, true, true));
+    }
+
+    #[test]
+    fn q_asks_for_confirmation_instead_of_quitting_immediately() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_asks_for_confirmation_instead_of_quitting_immediately() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn y_confirms_the_quit_prompt() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!app.quit_confirm());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn n_esc_and_q_cancel_the_quit_prompt() {
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = App::new(Vec::new());
+            press(&mut app, KeyCode::Char('q'));
+            press(&mut app, cancel);
+            assert!(!app.quit_confirm(), "prompt should close on {cancel:?}");
+            assert!(!app.should_quit, "should not quit on {cancel:?}");
+        }
+    }
+
+    #[test]
+    fn an_unbound_key_keeps_the_quit_prompt_open() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_without_a_confirmation() {
+        let mut app = App::new(Vec::new());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.quit_confirm());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn q_inside_another_popup_does_not_open_the_quit_prompt() {
+        // With a popup open, `q` is captured by it (closes the bots popup) and
+        // never reaches the quit path (#167).
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.bots_open());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.bots_open());
+        assert!(!app.quit_confirm());
+        assert!(!app.should_quit);
     }
 }

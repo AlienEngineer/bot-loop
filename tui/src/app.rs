@@ -110,6 +110,9 @@ pub struct App {
     show_output: bool,
     /// The number of the issue awaiting a close confirmation, if any (#118).
     close_confirm: Option<u64>,
+    /// Whether a quit confirmation is open, so a stray `q`/`Esc` asks before it
+    /// exits the TUI (#167).
+    quit_confirm: bool,
     /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
     /// can announce when the loop *starts* a new issue (#119).
     known_in_progress: Vec<u64>,
@@ -213,6 +216,7 @@ impl App {
             repo_root: runner::repo_root(),
             show_output: false,
             close_confirm: None,
+            quit_confirm: false,
             known_in_progress: Vec::new(),
             auto_merge: false,
             quality_assurance: true,
@@ -550,6 +554,28 @@ impl App {
             }
             Err(err) => self.status = Some(format!("Error: {err}")),
         }
+    }
+
+    /// Whether a quit confirmation is open (#167).
+    pub fn quit_confirm(&self) -> bool {
+        self.quit_confirm
+    }
+
+    /// Ask to quit: opens a confirmation prompt so a stray `q`/`Esc` does not
+    /// exit the TUI by accident (#167). Nothing exits until [`confirm_quit`].
+    pub fn request_quit(&mut self) {
+        self.quit_confirm = true;
+    }
+
+    /// Dismiss the quit confirmation without exiting.
+    pub fn cancel_quit(&mut self) {
+        self.quit_confirm = false;
+    }
+
+    /// Confirm the pending quit: signals the main loop to exit (#167).
+    pub fn confirm_quit(&mut self) {
+        self.quit_confirm = false;
+        self.should_quit = true;
     }
 
     /// Kick off the background close summary for a just-closed issue, when the
@@ -2008,6 +2034,34 @@ mod tests {
         // No gh call is made and the list is unchanged.
         assert_eq!(app.issues.len(), 2);
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn request_quit_opens_the_confirmation_without_quitting() {
+        let mut app = app_with(0);
+        assert!(!app.quit_confirm());
+        app.request_quit();
+        assert!(app.quit_confirm());
+        // Nothing exits until the operator confirms (#167).
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn cancel_quit_closes_the_confirmation_and_stays_running() {
+        let mut app = app_with(0);
+        app.request_quit();
+        app.cancel_quit();
+        assert!(!app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn confirm_quit_closes_the_prompt_and_signals_the_loop_to_exit() {
+        let mut app = app_with(0);
+        app.request_quit();
+        app.confirm_quit();
+        assert!(!app.quit_confirm());
+        assert!(app.should_quit);
     }
 
     #[test]
