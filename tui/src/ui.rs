@@ -5,10 +5,11 @@ use ratatui::{
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Bar, BarChart, Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
 use crate::app::{App, CreateField, OUTPUT_TAIL_BYTES};
+use crate::cost::MonthlyCost;
 use crate::github::Issue;
 use crate::logs;
 use crate::runner::{WorkerStatus, WorkerView};
@@ -46,6 +47,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // The closed-issues (spend) popup floats on top when open (#145).
     if app.closed_open() {
         render_closed(frame, frame.area(), app);
+    }
+    // The cost dashboard floats on top of everything else when open (#163).
+    if app.cost_open() {
+        render_cost(frame, frame.area(), app);
     }
     // The issue-details popup floats on top of everything else when open (#152).
     if app.details_open() {
@@ -376,7 +381,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · s summary · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
+            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · s summary · m models · o output · p pr-output · t closed · $ cost · f refresh · esc cancel"),
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -660,6 +665,151 @@ fn render_closed(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, popup, &mut app.closed_state);
+}
+
+/// Bar width and gap to fit `days` bars across `width` cells: a 1-cell gap when
+/// there is room, otherwise none, with the bar widened to fill. Clamped so a bar
+/// is always at least one cell wide. Pure for testing (#163).
+fn bar_dims(width: u16, days: u32) -> (u16, u16) {
+    let days = days.max(1);
+    let w = u32::from(width);
+    let gap = if w >= days * 2 + (days - 1) { 1 } else { 0 };
+    let bar = w.saturating_sub(gap * (days - 1)) / days;
+    (bar.clamp(1, 5) as u16, gap as u16)
+}
+
+/// Build one bar per day from `values`, labelling only day 1 and every fifth day
+/// so the axis stays legible across a full month, and blanking each bar's value
+/// text (the KPI header and titles carry the numbers) so the graph reads as a
+/// shape rather than a wall of figures (#163).
+fn day_bars(values: &[u64]) -> Vec<Bar<'static>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let day = i as u32 + 1;
+            let label = if day == 1 || day.is_multiple_of(5) {
+                day.to_string()
+            } else {
+                String::new()
+            };
+            Bar::default()
+                .value(value)
+                .label(Line::from(label))
+                .text_value(String::new())
+        })
+        .collect()
+}
+
+/// The dashboard's KPI header: total spent this month, how many issues were
+/// worked, the average per issue, and the costliest day — the three figures the
+/// issue asks for, plus the peak for context (#163).
+fn cost_kpis(mc: &MonthlyCost) -> Paragraph<'static> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let green = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let yellow = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+
+    let avg = mc
+        .average_per_issue()
+        .map(format_credits)
+        .unwrap_or_else(|| "—".to_string());
+
+    let line1 = Line::from(vec![
+        Span::styled("This month: ", dim),
+        Span::styled(format!("{} cr", format_credits(mc.total)), green),
+        Span::raw("    "),
+        Span::styled("Issues worked: ", dim),
+        Span::styled(mc.issue_count.to_string(), yellow),
+        Span::raw("    "),
+        Span::styled("Avg / issue: ", dim),
+        Span::styled(format!("{avg} cr"), green),
+    ]);
+
+    let peak = match mc.peak_day() {
+        Some((day, cost)) => format!(
+            "{} {day} ({} cr)",
+            mc.month.short_name(),
+            format_credits(cost)
+        ),
+        None => "—".to_string(),
+    };
+    let line2 = Line::from(vec![
+        Span::styled("Peak day: ", dim),
+        Span::styled(peak, Style::new().fg(Color::Cyan)),
+    ]);
+
+    Paragraph::new(vec![line1, line2])
+}
+
+/// Draw the cost dashboard (#163): a KPI header (this month's total, issues
+/// worked, average per issue) above two by-day bar charts — spend per day and
+/// issues worked per day — over the current month, so "how much are we spending
+/// over time" is answered at a glance. A [`Clear`] underneath wipes the list
+/// behind it.
+fn render_cost(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(90, 85, area);
+    frame.render_widget(Clear, popup);
+
+    let mc = app.monthly_cost();
+    let title = format!(
+        " Cost dashboard · {} {} ",
+        mc.month.short_name(),
+        mc.month.year
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" Esc close ").centered())
+        .border_style(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [kpi_area, charts_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(cost_kpis(&mc), kpi_area);
+
+    if !mc.has_spend() {
+        let empty = Paragraph::new("No spend recorded this month.")
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(empty, charts_area);
+        return;
+    }
+
+    let [cost_area, issues_area] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(charts_area);
+
+    let cost_values: Vec<u64> = mc.cost_per_day.iter().map(|c| c.round() as u64).collect();
+    let (bar_width, bar_gap) = bar_dims(cost_area.width, mc.days);
+    let cost_chart = BarChart::new(day_bars(&cost_values))
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .title("Cost / day (cr)"),
+        )
+        .bar_width(bar_width)
+        .bar_gap(bar_gap)
+        .bar_style(Style::new().fg(Color::Green))
+        .label_style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(cost_chart, cost_area);
+
+    let issue_values: Vec<u64> = mc.issues_per_day.iter().map(|&n| u64::from(n)).collect();
+    let max_issues = issue_values.iter().copied().max().unwrap_or(0);
+    let (bar_width, bar_gap) = bar_dims(issues_area.width, mc.days);
+    let issue_chart = BarChart::new(day_bars(&issue_values))
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .title(format!("Issues / day · max {max_issues}")),
+        )
+        .bar_width(bar_width)
+        .bar_gap(bar_gap)
+        .bar_style(Style::new().fg(Color::Cyan))
+        .label_style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(issue_chart, issues_area);
 }
 
 /// Build the details popup's content as logical (pre-wrap) lines, each paired
@@ -1813,6 +1963,72 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("No closed issues."));
+    }
+
+    #[test]
+    fn bar_dims_fit_within_the_available_width() {
+        // Wide enough for a gap between two-cell bars.
+        let (bar, gap) = bar_dims(120, 31);
+        assert!(bar >= 1 && gap <= 1);
+        assert!(u32::from(bar) * 31 + u32::from(gap) * 30 <= 120);
+        // Too narrow for gaps: bars still at least one cell, no gap.
+        let (bar, gap) = bar_dims(20, 31);
+        assert_eq!((bar, gap), (1, 0));
+        // Zero days never divides by zero; a bar is always at least one cell.
+        assert!(bar_dims(10, 0).0 >= 1);
+    }
+
+    #[test]
+    fn cost_dashboard_shows_kpis_and_both_charts() {
+        // Date the usage in the current month so it lands in the dashboard's view.
+        let m = crate::cost::current_month();
+        let date = format!("{:04}-{:02}-02T10:00:00Z", m.year, m.month);
+        let body = "```\nAI Credits 120 (1s)\n```\n<!-- copilot-loop:usage -->";
+        let json = format!(
+            r#"[{{"number":1,"title":"t","comments":[{{"body":{},"createdAt":"{date}"}}]}}]"#,
+            serde_json::to_string(body).unwrap()
+        );
+        let mut app = App::new(Vec::new());
+        app.open_cost_with(parse_issues(&json).unwrap());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Cost dashboard"));
+        assert!(text.contains("This month"));
+        assert!(text.contains("Issues worked"));
+        assert!(text.contains("Avg / issue"));
+        assert!(text.contains("Cost / day"));
+        assert!(text.contains("Issues / day"));
+        // The peak day surfaces the day's spend.
+        assert!(text.contains("Peak day"));
+    }
+
+    #[test]
+    fn cost_dashboard_reports_an_empty_month() {
+        let mut app = App::new(Vec::new());
+        app.open_cost_with(Vec::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Cost dashboard"));
+        assert!(text.contains("No spend recorded this month."));
+    }
+
+    #[test]
+    fn footer_advertises_the_cost_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("$ cost"));
     }
 
     #[test]

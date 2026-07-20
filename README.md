@@ -174,6 +174,14 @@ with the grand total in the popup's title; issues closed by hand — with no
 recorded spend — show a `—`. Navigate with `j`/`k`; `Esc` (or `t`/`q`) closes it
 (#145).
 
+Press `space` then `$` to open the cost dashboard: a monitor of spend over time (#163).
+It pulls every issue (open and closed) with its `AI Credits` usage comments and,
+for the current month, shows three things at the top — the total spent this
+month, how many issues were worked, and the average cost per issue — plus the
+costliest day. Below that are two by-day bar charts spanning the whole month
+(day-of-month on X): spend per day, and the number of issues worked per day, so
+you can see the shape of the spend at a glance. `Esc` (or `$`/`q`) closes it.
+
 Press `space` then `d` to open a popup with the selected issue's full details — its title,
 number, author, labels, description, and the whole comment thread (each comment's
 author, date, and body) — so an issue can be read without leaving the TUI. The
@@ -204,7 +212,8 @@ comments, `l` add a background worker, `L` stop all workers, `b` bots (restart a
 stopped/failed worker in place, or all with `R`), `a` toggle
 auto-merge, `q` toggle quality assurance, `s` toggle the closing summary, `m` pick
 the model, `o` show/hide the output panel, `p` show the resolving-PRs popup, `t`
-show closed issues and their cost, `f` refresh, `Esc` cancel. In the new-issue
+show closed issues and their cost, `$` open the cost dashboard, `f` refresh, `Esc`
+cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
 
@@ -350,6 +359,11 @@ Tokens     ↑ 40.2k (40.2k written) • ↓ 221 (217 reasoning)
 
 It is best-effort: when the log holds no usage stats nothing is posted, and it
 never fails or blocks a run.
+
+The TUI reads these usage comments back: `space` then `t` totals the spend per
+closed issue, and `space` then `$` opens a cost dashboard that graphs the current
+month's spend and issues-worked by day, with the month's total and average cost
+per issue (#163).
 
 ## Troubleshooting
 

@@ -36,6 +36,13 @@ impl Comment {
     pub fn author_login(&self) -> &str {
         self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
     }
+
+    /// The AI Credits this comment records, or `None` when it is not a
+    /// copilot-loop usage comment. Lets the cost dashboard bucket spend by the
+    /// comment's date rather than only totalling per issue (#163).
+    pub fn usage_credits(&self) -> Option<f64> {
+        parse_comment_credits(&self.body)
+    }
 }
 
 /// A single GitHub issue, mapped from `gh issue list --json ...`.
@@ -95,6 +102,17 @@ impl Issue {
             }
         }
         found.then_some(total)
+    }
+
+    /// Each usage comment's timestamp (its `createdAt`) paired with the AI
+    /// Credits it records, so the cost dashboard can bucket spend by day (#163).
+    /// Comments that are not copilot-loop usage comments are skipped.
+    pub fn usage_events(&self) -> impl Iterator<Item = (&str, f64)> + '_ {
+        self.comments.iter().filter_map(|comment| {
+            comment
+                .usage_credits()
+                .map(|credits| (comment.created_at.as_str(), credits))
+        })
     }
 }
 
@@ -225,12 +243,19 @@ pub fn fetch_issues(limit: u32) -> Result<Vec<Issue>> {
 /// parses the JSON. Returns an error when `gh` is missing, not authenticated, or
 /// the command otherwise fails.
 pub fn fetch_closed_issues(limit: u32) -> Result<Vec<Issue>> {
+    fetch_issues_with_comments("closed", limit)
+}
+
+/// Fetch issues in the given state (`open`/`closed`) with their comments, so the
+/// loop's per-run cost can be totalled and bucketed by date. Shared by the
+/// closed-issues spend view (#145) and the cost dashboard (#163).
+fn fetch_issues_with_comments(state: &str, limit: u32) -> Result<Vec<Issue>> {
     let output = Command::new("gh")
         .args([
             "issue",
             "list",
             "--state",
-            "closed",
+            state,
             "--limit",
             &limit.to_string(),
             "--json",
@@ -248,6 +273,22 @@ pub fn fetch_closed_issues(limit: u32) -> Result<Vec<Issue>> {
     }
 
     parse_issues(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Fetch every issue that could carry loop spend — both open and closed — with
+/// their comments, so the cost dashboard can total and graph what was spent
+/// (#163). An open issue can hold spend too (a run in flight, or one whose PR is
+/// still open), so both states are pulled and merged, de-duplicated by number in
+/// case an issue moved state between the two queries.
+pub fn fetch_cost_issues(limit: u32) -> Result<Vec<Issue>> {
+    let mut issues = fetch_issues_with_comments("open", limit)?;
+    let mut seen: std::collections::HashSet<u64> = issues.iter().map(|i| i.number).collect();
+    for issue in fetch_issues_with_comments("closed", limit)? {
+        if seen.insert(issue.number) {
+            issues.push(issue);
+        }
+    }
+    Ok(issues)
 }
 
 /// Fetch a single issue's full details — its body and comments — for the details
@@ -956,5 +997,27 @@ mod tests {
         // No comments field at all (the open-list shape).
         let bare = r#"[{"number":1,"title":"t"}]"#;
         assert_eq!(parse_issues(bare).unwrap()[0].credits_spent(), None);
+    }
+
+    #[test]
+    fn usage_events_pair_each_usage_comment_date_with_its_credits() {
+        let json = format!(
+            r#"[{{"number":1,"title":"t","comments":[
+                {{"body":{first},"createdAt":"2026-07-01T10:00:00Z"}},
+                {{"body":"just a human comment","createdAt":"2026-07-02T10:00:00Z"}},
+                {{"body":{second},"createdAt":"2026-07-03T10:00:00Z"}}
+            ]}}]"#,
+            first = serde_json::to_string(&usage_comment("100")).unwrap(),
+            second = serde_json::to_string(&usage_comment("50.5")).unwrap(),
+        );
+        let issue = &parse_issues(&json).unwrap()[0];
+        let events: Vec<(&str, f64)> = issue.usage_events().collect();
+        assert_eq!(
+            events,
+            vec![
+                ("2026-07-01T10:00:00Z", 100.0),
+                ("2026-07-03T10:00:00Z", 50.5),
+            ]
+        );
     }
 }
