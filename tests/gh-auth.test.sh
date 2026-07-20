@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317,SC2329  # mock/stub helpers are invoked indirectly by the eval'd code under test
 #
 # Unit tests for the gh-auth preflight helper in copilot-loop.sh.
 # _gh_authenticated_for_origin scopes `gh auth status` to the origin host so a
