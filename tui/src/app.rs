@@ -1181,6 +1181,37 @@ impl App {
         self.clamp_bots_selection();
     }
 
+    /// Stop the selected running bot, TERMing its process group (escalating to
+    /// KILL) so the user can end one background worker from the popup without
+    /// touching the others (#210). The stopped bot is kept so it can be restarted
+    /// in place.
+    ///
+    /// A no-op with a status note when nothing is selected or the bot is not
+    /// running, so an already-stopped or failed worker is left as it is.
+    pub fn stop_selected_bot(&mut self) {
+        let Some(view) = self
+            .bots_state
+            .selected()
+            .and_then(|i| self.bots.get(i))
+            .cloned()
+        else {
+            self.set_status("No bot selected.".to_string());
+            return;
+        };
+
+        if view.status != WorkerStatus::Running {
+            self.set_status(format!("Bot #{} is not running.", view.id));
+            return;
+        }
+
+        match self.runner.stop(view.id) {
+            Ok(()) => self.set_status(format!("Stopped bot #{}.", view.id)),
+            Err(err) => self.set_status(format!("Error: {err}")),
+        }
+        self.refresh_bots();
+        self.clamp_bots_selection();
+    }
+
     /// Restart every stopped or failed bot in place, re-spawning each with the
     /// options it was launched with (#82). Reports how many restarted, or that
     /// there were none. Running bots are left untouched.
@@ -2808,6 +2839,64 @@ mod tests {
         app.open_bots_with(Vec::new());
         app.restart_selected_bot();
         assert_eq!(app.status.as_deref(), Some("No bot selected."));
+    }
+
+    #[test]
+    fn stopping_a_non_running_bot_reports_it() {
+        let mut app = app_with(0);
+        app.open_bots_with(vec![worker_view(1, WorkerStatus::Stopped)]);
+        app.stop_selected_bot();
+        // An already-stopped or failed bot has nothing to stop.
+        assert_eq!(app.status.as_deref(), Some("Bot #1 is not running."));
+    }
+
+    #[test]
+    fn stopping_with_no_selection_reports_it() {
+        let mut app = app_with(0);
+        app.open_bots_with(Vec::new());
+        app.stop_selected_bot();
+        assert_eq!(app.status.as_deref(), Some("No bot selected."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_the_selected_bot_from_the_popup_ends_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Stand in for `copilot-loop.sh` with a script that just sleeps, so a real
+        // detached worker is started that the user can then stop from the popup.
+        let dir = std::env::temp_dir().join(format!("copilot-stopbot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join(runner::LOOP_SCRIPT_NAME);
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+
+        // Writing then exec'ing a script in a multithreaded test can momentarily
+        // fail with ETXTBSY, so retry briefly until one is actually running.
+        let mut started = false;
+        for _ in 0..50 {
+            app.start_worker();
+            if app.workers_running() >= 1 {
+                started = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(started, "a worker should start; status: {:?}", app.status);
+
+        // The user opens the bots popup and stops the selected (running) worker.
+        app.open_bots();
+        app.stop_selected_bot();
+        assert_eq!(app.status.as_deref(), Some("Stopped bot #1."));
+        assert_eq!(app.workers_running(), 0);
+        // The stopped bot is kept in the popup so it can be restarted in place.
+        assert_eq!(app.bots().len(), 1);
+        assert_eq!(app.bots()[0].status, WorkerStatus::Stopped);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

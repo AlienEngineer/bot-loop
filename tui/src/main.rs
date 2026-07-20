@@ -400,13 +400,15 @@ fn handle_details_key(app: &mut App, key: KeyEvent) {
 
 /// Handle keys while the bots popup is open: navigate the workers, restart the
 /// selected stopped/failed one with `r` (or Enter), restart all stopped/failed
-/// with `R`, and close on `q`, `Esc`, or `b` (#82).
+/// with `R`, stop the selected running one with `s` (#210), and close on `q`,
+/// `Esc`, or `b` (#82).
 fn handle_bots_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => app.bots_next(),
         KeyCode::Char('k') | KeyCode::Up => app.bots_previous(),
         KeyCode::Char('r') | KeyCode::Enter => app.restart_selected_bot(),
         KeyCode::Char('R') => app.restart_all_stopped_bots(),
+        KeyCode::Char('s') => app.stop_selected_bot(),
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('b') => app.close_bots(),
         _ => {}
     }
@@ -548,6 +550,25 @@ mod tests {
         // A key inside the popup is captured by it, not the list: b closes it.
         press(&mut app, KeyCode::Char('b'));
         assert!(!app.bots_open());
+    }
+
+    #[test]
+    fn s_in_the_bots_popup_stops_the_selected_bot() {
+        use crate::runner::{WorkerStatus, WorkerView};
+        use std::path::PathBuf;
+
+        let mut app = App::new(Vec::new());
+        app.open_bots_with(vec![WorkerView {
+            id: 1,
+            pid: 4242,
+            status: WorkerStatus::Stopped,
+            model: None,
+            log: PathBuf::from("/tmp/loop-1.log"),
+        }]);
+        // s routes to the stop action; the popup stays open and reports the outcome.
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.bots_open());
+        assert!(app.messages().iter().any(|m| m == "Bot #1 is not running."));
     }
 
     #[test]
