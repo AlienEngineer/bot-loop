@@ -220,6 +220,14 @@ pub struct App {
     messages_open: bool,
     /// Selection within the messages popup's list (#182).
     pub messages_state: ListState,
+    /// Whether the label editor popup is open, i.e. the user is adding or
+    /// removing a label on the selected issue (#204).
+    label_editor_open: bool,
+    /// The number of the issue whose labels are being edited, if the label
+    /// editor popup is open (#204).
+    label_editor_issue: Option<u64>,
+    /// The label name the user is typing in the label editor (#204).
+    label_editor_text: String,
     /// Where changed settings are persisted, or `None` when persistence is off
     /// (unit tests, or before wiring). Set by [`App::load_persisted_settings`] so
     /// the model, auto-merge, quality-assurance, and close-summary choices are
@@ -290,6 +298,9 @@ impl App {
             messages: Vec::new(),
             messages_open: false,
             messages_state: ListState::default(),
+            label_editor_open: false,
+            label_editor_issue: None,
+            label_editor_text: String::new(),
             settings_path: None,
         }
     }
@@ -712,6 +723,108 @@ impl App {
             return;
         };
         self.mark_ready(number);
+    }
+
+    /// Whether the label editor popup is open (#204).
+    pub fn label_editor_open(&self) -> bool {
+        self.label_editor_open
+    }
+
+    /// The number of the issue whose labels are being edited, if the popup is
+    /// open (#204).
+    pub fn label_editor_issue(&self) -> Option<u64> {
+        self.label_editor_issue
+    }
+
+    /// The label name typed into the editor so far (#204).
+    pub fn label_editor_text(&self) -> &str {
+        &self.label_editor_text
+    }
+
+    /// The current label names of the issue being edited, so the popup can show
+    /// what is already set — and thus what typing an existing name would remove
+    /// (#204). Empty when the popup is closed or the issue has gone.
+    pub fn label_editor_labels(&self) -> Vec<&str> {
+        let Some(number) = self.label_editor_issue else {
+            return Vec::new();
+        };
+        self.issues
+            .iter()
+            .find(|i| i.number == number)
+            .map(Issue::label_names)
+            .unwrap_or_default()
+    }
+
+    /// Open the label editor for the selected issue so an arbitrary label can be
+    /// added or removed from the TUI (#204). A no-op with a note when nothing is
+    /// selected.
+    pub fn open_label_editor(&mut self) {
+        let Some(issue) = self.selected() else {
+            self.set_status("Select an issue to edit its labels.".to_string());
+            return;
+        };
+        self.label_editor_issue = Some(issue.number);
+        self.label_editor_text = String::new();
+        self.label_editor_open = true;
+    }
+
+    /// Close the label editor, discarding the typed name (#204).
+    pub fn close_label_editor(&mut self) {
+        self.label_editor_open = false;
+        self.label_editor_issue = None;
+        self.label_editor_text = String::new();
+    }
+
+    /// Type a character into the label name (#204).
+    pub fn label_editor_input(&mut self, c: char) {
+        self.label_editor_text.push(c);
+    }
+
+    /// Delete the last character of the label name (#204).
+    pub fn label_editor_backspace(&mut self) {
+        self.label_editor_text.pop();
+    }
+
+    /// Apply the typed label to the edited issue: add it when the issue lacks it,
+    /// remove it when it already carries it (#204).
+    ///
+    /// The change is reflected locally so the row updates without a refetch,
+    /// reported on the status line, and the field is cleared while the popup
+    /// stays open so several labels can be set in a row. An empty (or
+    /// whitespace-only) name is refused with a note. Errors keep the field so the
+    /// name is not lost.
+    pub fn submit_label_editor(&mut self) {
+        let name = self.label_editor_text.trim().to_string();
+        if name.is_empty() {
+            self.set_status("Type a label name.".to_string());
+            return;
+        }
+        let Some(number) = self.label_editor_issue else {
+            return;
+        };
+        let Some(index) = self.issues.iter().position(|i| i.number == number) else {
+            return;
+        };
+
+        if self.issues[index].has_label(&name) {
+            match github::remove_label(number, &name) {
+                Ok(()) => {
+                    self.issues[index].labels.retain(|l| l.name != name);
+                    self.label_editor_text = String::new();
+                    self.set_status(format!("#{number} removed '{name}'."));
+                }
+                Err(err) => self.set_status(format!("Error: {err}")),
+            }
+        } else {
+            match github::add_label(number, &name) {
+                Ok(()) => {
+                    self.issues[index].labels.push(Label { name: name.clone() });
+                    self.label_editor_text = String::new();
+                    self.set_status(format!("#{number} added '{name}'."));
+                }
+                Err(err) => self.set_status(format!("Error: {err}")),
+            }
+        }
     }
 
     /// The number of the issue awaiting a close confirmation, if any (#118).
@@ -3305,6 +3418,101 @@ mod tests {
         assert_eq!(app.reply_scroll(), 1);
         app.clamp_reply_scroll(0);
         assert_eq!(app.reply_scroll(), 0);
+    }
+
+    #[test]
+    fn open_label_editor_targets_the_selected_issue_with_a_blank_field() {
+        let json = r#"[{"number":7,"title":"t","labels":[{"name":"bug"}]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.open_label_editor();
+        assert!(app.label_editor_open());
+        assert_eq!(app.label_editor_issue(), Some(7));
+        assert!(app.label_editor_text().is_empty());
+        // The issue's current labels are surfaced so the user sees what to remove.
+        assert_eq!(app.label_editor_labels(), vec!["bug"]);
+    }
+
+    #[test]
+    fn open_label_editor_without_a_selection_is_a_no_op() {
+        let mut app = app_with(0);
+        app.open_label_editor();
+        assert!(!app.label_editor_open());
+        assert!(app.status.as_deref().unwrap().contains("Select an issue"));
+    }
+
+    #[test]
+    fn label_editor_input_and_backspace_edit_the_name() {
+        let json = r#"[{"number":7,"title":"t","labels":[]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.open_label_editor();
+        app.label_editor_input('b');
+        app.label_editor_input('u');
+        app.label_editor_input('g');
+        assert_eq!(app.label_editor_text(), "bug");
+        app.label_editor_backspace();
+        assert_eq!(app.label_editor_text(), "bu");
+    }
+
+    #[test]
+    fn submit_label_editor_adds_then_removes_the_label() {
+        let json = r#"[{"number":7,"title":"t","labels":[]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.open_label_editor();
+        for c in "enhancement".chars() {
+            app.label_editor_input(c);
+        }
+        // The first submit adds the label (reflected on the issue) and clears the
+        // field while keeping the popup open for more edits.
+        app.submit_label_editor();
+        assert!(app.issues[0].has_label("enhancement"));
+        assert!(app.label_editor_open());
+        assert!(app.label_editor_text().is_empty());
+        assert_eq!(app.status.as_deref(), Some("#7 added 'enhancement'."));
+
+        // Typing the same name again and submitting removes it (toggle).
+        for c in "enhancement".chars() {
+            app.label_editor_input(c);
+        }
+        app.submit_label_editor();
+        assert!(!app.issues[0].has_label("enhancement"));
+        assert_eq!(app.status.as_deref(), Some("#7 removed 'enhancement'."));
+    }
+
+    #[test]
+    fn submit_label_editor_trims_surrounding_whitespace() {
+        let json = r#"[{"number":7,"title":"t","labels":[]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.open_label_editor();
+        for c in "  bug  ".chars() {
+            app.label_editor_input(c);
+        }
+        app.submit_label_editor();
+        assert!(app.issues[0].has_label("bug"));
+        assert_eq!(app.status.as_deref(), Some("#7 added 'bug'."));
+    }
+
+    #[test]
+    fn submit_label_editor_ignores_a_blank_name() {
+        let json = r#"[{"number":7,"title":"t","labels":[]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.open_label_editor();
+        app.submit_label_editor();
+        assert!(app.issues[0].labels.is_empty());
+        assert_eq!(app.status.as_deref(), Some("Type a label name."));
+        // The popup stays open so the user can still type a name.
+        assert!(app.label_editor_open());
+    }
+
+    #[test]
+    fn close_label_editor_discards_the_typed_name() {
+        let json = r#"[{"number":7,"title":"t","labels":[]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.open_label_editor();
+        app.label_editor_input('x');
+        app.close_label_editor();
+        assert!(!app.label_editor_open());
+        assert!(app.label_editor_issue().is_none());
+        assert!(app.label_editor_text().is_empty());
     }
 
     #[test]
