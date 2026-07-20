@@ -383,6 +383,20 @@ _gh_host_from_url() {
 }
 # <<< gh-host helpers <<<
 
+# >>> gh-auth helpers >>>
+# True iff `gh` has a usable login for the host that owns $1 (an origin remote
+# URL). Scoping is the whole point: unscoped `gh auth status` inspects *every*
+# logged-in host and exits non-zero when ANY of them has a broken/expired token,
+# so a stale login on an unrelated host (a second enterprise account, say) must
+# not decide whether THIS repo's account is authenticated. Defaults to github.com
+# when the URL carries no parseable host.
+_gh_authenticated_for_origin() {
+  local host
+  host="$(_gh_host_from_url "${1-}")"
+  gh auth status --hostname "${host:-github.com}" >/dev/null 2>&1
+}
+# <<< gh-auth helpers <<<
+
 # >>> terminal-title helpers >>>
 # Emit the OSC escape that sets a terminal's window/tab title to $1. Pure (writes
 # only the sequence to stdout), so it can be unit tested.
@@ -932,14 +946,21 @@ done
 
 cd "$REPO_DIR" || die "cannot cd into REPO_DIR: $REPO_DIR"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository: $REPO_DIR"
-git remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote configured"
-gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
+_pf_origin_url="$(git remote get-url origin 2>/dev/null)"
+[ -n "$_pf_origin_url" ] || die "no 'origin' remote configured"
+# Scope the "is gh authenticated?" gate to this repo's origin host. Unscoped
+# `gh auth status` fails when ANY logged-in host has a broken/expired token, so a
+# stale login on an unrelated host would make an otherwise-authenticated machine
+# look logged out and keep demanding `gh auth login`. (The gh repo view check
+# below then confirms the account can actually see the repo.)
+if ! _gh_authenticated_for_origin "$_pf_origin_url"; then
+  _pf_host="$(_gh_host_from_url "$_pf_origin_url")"
+  die "gh is not authenticated for ${_pf_host:-github.com} (run: gh auth login --hostname ${_pf_host:-github.com})"
+fi
 
-# `gh auth status` only proves *some* account is logged in. This machine may be
-# logged in to several hosts at once (a personal github.com account plus one or
-# more enterprise hosts); the account that resolves for THIS repo's host can
-# still lack access, or the repo's host may not be logged in at all — e.g. an
-# origin on an enterprise host, or an SSH host alias gh cannot map to a login.
+# A passing auth check only proves the origin host has a logged-in account; it
+# does not prove that account can see THIS repo. The resolved account can still
+# lack access, or the origin may be an SSH host alias gh cannot map to a login.
 # When that happens `gh repo view` fails, yet the loop used to carry on: REPO_SLUG
 # became "unknown" and every `gh issue list` silently returned nothing, so the
 # loop just slept forever and looked "broken". Fail fast instead, naming the
