@@ -185,6 +185,21 @@ pub struct App {
     /// Issues (open and closed) fetched with their comments so the dashboard can
     /// total and graph the loop's spend by day. Loaded when the popup opens (#163).
     cost_issues: Vec<Issue>,
+    /// Whether the reply popup is open, i.e. the user is answering a Copilot
+    /// question from the TUI (#165).
+    reply_open: bool,
+    /// The number of the issue being replied to, if the reply popup is open
+    /// (#165).
+    reply_issue: Option<u64>,
+    /// The Copilot question shown in the reply popup — the latest `needs-info`
+    /// comment's text — or `None` when the issue carries no readable question
+    /// (#165).
+    reply_question: Option<String>,
+    /// The reply the user is typing in the reply popup (#165).
+    reply_text: String,
+    /// Vertical scroll offset (in rendered lines) of the reply popup's question
+    /// pane, so a long question can be read top to bottom while typing (#165).
+    reply_scroll: u16,
 }
 
 impl App {
@@ -240,6 +255,11 @@ impl App {
             reporting: 0,
             cost_open: false,
             cost_issues: Vec::new(),
+            reply_open: false,
+            reply_issue: None,
+            reply_question: None,
+            reply_text: String::new(),
+            reply_scroll: 0,
         }
     }
 
@@ -1326,6 +1346,145 @@ impl App {
         }
     }
 
+    /// Whether the reply popup is open (#165).
+    pub fn reply_open(&self) -> bool {
+        self.reply_open
+    }
+
+    /// The number of the issue being replied to, if the reply popup is open
+    /// (#165).
+    pub fn reply_issue(&self) -> Option<u64> {
+        self.reply_issue
+    }
+
+    /// The Copilot question shown in the reply popup, or `None` when the issue
+    /// carries no readable question (#165).
+    pub fn reply_question(&self) -> Option<&str> {
+        self.reply_question.as_deref()
+    }
+
+    /// The reply the user has typed so far (#165).
+    pub fn reply_text(&self) -> &str {
+        &self.reply_text
+    }
+
+    /// The reply popup's question-pane scroll offset, in rendered lines (#165).
+    pub fn reply_scroll(&self) -> u16 {
+        self.reply_scroll
+    }
+
+    /// Present a fetched issue in the reply popup: store its number and question,
+    /// clear the draft, reset the scroll, and mark the popup open. Shared by
+    /// [`open_reply`] and the test seam so both present it the same way (#165).
+    fn present_reply(&mut self, number: u64, question: Option<String>) {
+        self.reply_issue = Some(number);
+        self.reply_question = question;
+        self.reply_text = String::new();
+        self.reply_scroll = 0;
+        self.reply_open = true;
+    }
+
+    /// Open the reply popup for the selected issue so its Copilot question can be
+    /// answered from the TUI (#165).
+    ///
+    /// Only meaningful when Copilot is waiting on the user, so it is gated on the
+    /// `needs-info` label and otherwise just notes there is nothing to answer.
+    /// The issue's comments are fetched (the open list omits them) to surface the
+    /// question; the fetch is synchronous, matching the other `gh`-backed actions
+    /// (e.g. [`open_details`]). On a fetch error the popup stays closed with the
+    /// error on the status line.
+    pub fn open_reply(&mut self) {
+        let Some(issue) = self.selected() else {
+            return;
+        };
+        if !issue.needs_info() {
+            let number = issue.number;
+            self.status = Some(format!(
+                "#{number} has no pending Copilot question to answer."
+            ));
+            return;
+        }
+        let number = issue.number;
+        match github::fetch_issue_details(number) {
+            Ok(full) => {
+                self.status = None;
+                self.present_reply(number, full.latest_question());
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// Close the reply popup, discarding any draft reply (#165).
+    pub fn close_reply(&mut self) {
+        self.reply_open = false;
+        self.reply_issue = None;
+        self.reply_question = None;
+        self.reply_text = String::new();
+        self.reply_scroll = 0;
+    }
+
+    /// Type a character into the reply draft (#165).
+    pub fn reply_input(&mut self, c: char) {
+        self.reply_text.push(c);
+    }
+
+    /// Delete the last character of the reply draft (#165).
+    pub fn reply_backspace(&mut self) {
+        self.reply_text.pop();
+    }
+
+    /// Insert a newline into the reply draft so a reply can span lines (#165).
+    pub fn reply_newline(&mut self) {
+        self.reply_text.push('\n');
+    }
+
+    /// Scroll the reply popup's question pane down by one line; clamped on render
+    /// so it never runs past the last line (#165).
+    pub fn reply_scroll_down(&mut self) {
+        self.reply_scroll = self.reply_scroll.saturating_add(1);
+    }
+
+    /// Scroll the reply popup's question pane up by one line, stopping at the top
+    /// (#165).
+    pub fn reply_scroll_up(&mut self) {
+        self.reply_scroll = self.reply_scroll.saturating_sub(1);
+    }
+
+    /// Clamp the reply popup's question scroll to `max`, called from render once
+    /// the wrapped question height and its viewport are known (#165).
+    pub fn clamp_reply_scroll(&mut self, max: u16) {
+        if self.reply_scroll > max {
+            self.reply_scroll = max;
+        }
+    }
+
+    /// Post the typed reply as an issue comment so the loop resumes the issue
+    /// (#165).
+    ///
+    /// Requires a non-empty reply. On success the popup closes and the status
+    /// line notes the reply landed; a running loop then picks the issue up on its
+    /// next pass (it resumes a `needs-info` issue once the latest comment is not
+    /// its own), so no label is touched here. On failure the popup stays open with
+    /// the error on the status line so the draft is not lost.
+    pub fn submit_reply(&mut self) {
+        let Some(number) = self.reply_issue else {
+            return;
+        };
+        if self.reply_text.trim().is_empty() {
+            self.status = Some("Reply must not be empty.".to_string());
+            return;
+        }
+        match github::comment_issue(number, &self.reply_text) {
+            Ok(()) => {
+                self.close_reply();
+                self.status = Some(format!(
+                    "Replied to #{number}. A running loop will resume it."
+                ));
+            }
+            Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
     /// Whether the new-issue form is currently open.
     pub fn is_creating(&self) -> bool {
         self.mode == Mode::Create
@@ -1491,6 +1650,15 @@ impl App {
     #[cfg(test)]
     pub fn open_details_with(&mut self, issue: Issue) {
         self.present_details(issue);
+    }
+
+    /// Seed the reply popup from an issue and open it (tests only), standing in
+    /// for the `gh issue view` fetch in [`open_reply`] so the popup's input and
+    /// submit paths are testable without calling `gh` (#165).
+    #[cfg(test)]
+    pub fn open_reply_with(&mut self, issue: Issue) {
+        let question = issue.latest_question();
+        self.present_reply(issue.number, question);
     }
 
     /// Seed the bots popup with worker views and open it (tests only), standing
@@ -2638,5 +2806,108 @@ mod tests {
         // A larger max leaves an already-in-range offset untouched.
         app.clamp_details_scroll(10);
         assert_eq!(app.details_scroll(), 4);
+    }
+
+    /// A single issue carrying the needs-info label and a Copilot question
+    /// comment, standing in for a `gh issue view` fetch of a blocked issue (#165).
+    fn needs_info_issue(number: u64, question: &str) -> Issue {
+        let marker = github::QUESTION_MARKER;
+        let body = format!(
+            "**copilot-loop needs more information to continue:**\n\n{question}\n\n{marker}"
+        );
+        let comment = serde_json::to_string(&body).unwrap();
+        let json = format!(
+            r#"{{"number":{number},"title":"t{number}","labels":[{{"name":"needs-info"}}],"comments":[{{"author":{{"login":"hubot"}},"body":{comment}}}]}}"#
+        );
+        github::parse_issue(&json).unwrap()
+    }
+
+    #[test]
+    fn open_reply_with_shows_the_question_and_a_blank_draft() {
+        let mut app = app_with(2);
+        app.reply_scroll = 7; // ensure the scroll resets on open
+        app.open_reply_with(needs_info_issue(10, "Which database should I use?"));
+        assert!(app.reply_open());
+        assert_eq!(app.reply_issue(), Some(10));
+        assert!(
+            app.reply_question()
+                .unwrap()
+                .contains("Which database should I use?")
+        );
+        assert!(app.reply_text().is_empty());
+        assert_eq!(app.reply_scroll(), 0);
+    }
+
+    #[test]
+    fn open_reply_is_gated_on_the_needs_info_label() {
+        // The selected issue carries no needs-info label, so opening the reply
+        // popup is refused (and no `gh` call is made) with an explanatory status.
+        let mut app = app_with(1);
+        app.open_reply();
+        assert!(!app.reply_open());
+        assert!(app.status.as_deref().unwrap().contains("no pending"));
+    }
+
+    #[test]
+    fn reply_input_backspace_and_newline_edit_the_draft() {
+        let mut app = app_with(1);
+        app.open_reply_with(needs_info_issue(10, "q"));
+        app.reply_input('h');
+        app.reply_input('i');
+        assert_eq!(app.reply_text(), "hi");
+        app.reply_backspace();
+        assert_eq!(app.reply_text(), "h");
+        app.reply_newline();
+        assert_eq!(app.reply_text(), "h\n");
+    }
+
+    #[test]
+    fn submit_reply_requires_a_non_empty_draft() {
+        let mut app = app_with(1);
+        app.open_reply_with(needs_info_issue(10, "q"));
+        app.submit_reply();
+        // An empty draft is refused and the popup stays open to keep the draft.
+        assert!(app.reply_open());
+        assert_eq!(app.status.as_deref(), Some("Reply must not be empty."));
+    }
+
+    #[test]
+    fn submit_reply_posts_and_closes_the_popup() {
+        let mut app = app_with(1);
+        app.open_reply_with(needs_info_issue(10, "q"));
+        app.reply_input('o');
+        app.reply_input('k');
+        // Under cfg!(test) `comment_issue` never shells out, so submit succeeds.
+        app.submit_reply();
+        assert!(!app.reply_open());
+        assert!(app.reply_issue().is_none());
+        assert!(app.status.as_deref().unwrap().contains("Replied to #10"));
+    }
+
+    #[test]
+    fn close_reply_discards_the_draft() {
+        let mut app = app_with(1);
+        app.open_reply_with(needs_info_issue(10, "q"));
+        app.reply_input('x');
+        app.close_reply();
+        assert!(!app.reply_open());
+        assert!(app.reply_issue().is_none());
+        assert!(app.reply_text().is_empty());
+        assert_eq!(app.reply_scroll(), 0);
+    }
+
+    #[test]
+    fn reply_scroll_moves_and_clamps() {
+        let mut app = app_with(1);
+        app.open_reply_with(needs_info_issue(10, "q"));
+        app.reply_scroll_up(); // already at the top
+        assert_eq!(app.reply_scroll(), 0);
+        app.reply_scroll_down();
+        app.reply_scroll_down();
+        assert_eq!(app.reply_scroll(), 2);
+        app.reply_scroll_up();
+        assert_eq!(app.reply_scroll(), 1);
+        app.clamp_reply_scroll(0);
+        assert_eq!(app.reply_scroll(), 0);
     }
 }

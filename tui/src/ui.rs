@@ -60,6 +60,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.bots_open() {
         render_bots(frame, frame.area(), app);
     }
+    // The reply popup floats on top of everything else when open (#165).
+    if app.reply_open() {
+        render_reply(frame, frame.area(), app);
+    }
 }
 
 /// Braille spinner frames used to signal the loop is alive (#115).
@@ -381,7 +385,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · s summary · m models · o output · p pr-output · t closed · $ cost · f refresh · esc cancel"),
+            format!("  c new · {ready_key} · x close · d details · i reply · l add-worker · L stop-all · b bots · a auto-merge · q qa · s summary · m models · o output · p pr-output · t closed · $ cost · f refresh · esc cancel"),
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -986,6 +990,72 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(body, popup);
 }
 
+/// The styled lines shown in the reply popup's question pane: the Copilot
+/// question split into logical lines, or a dim placeholder when none was found
+/// (the issue is `needs-info` but no marked comment was fetched). Pure for
+/// testing (#165).
+fn reply_question_content(question: Option<&str>) -> Vec<(String, Style)> {
+    match question {
+        Some(q) if !q.trim().is_empty() => {
+            q.lines().map(|l| (l.to_string(), Style::new())).collect()
+        }
+        _ => vec![(
+            "(no question text found — reply anyway to resume the issue)".to_string(),
+            Style::new().fg(Color::DarkGray),
+        )],
+    }
+}
+
+/// Draw the reply popup: a centered modal showing the Copilot question and a
+/// text field for the user's answer, so a `needs-info` issue can be answered
+/// without leaving the TUI (#165). Ctrl+S posts the reply as an issue comment,
+/// which the running loop then picks up. The question pane word-wraps and
+/// scrolls (clamped to its last page); the reply field wraps and shows a cursor.
+/// A [`Clear`] underneath wipes the cells so the list behind it does not show
+/// through.
+fn render_reply(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let number = app.reply_issue().unwrap_or(0);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Reply · #{number} "))
+        .title_alignment(Alignment::Center)
+        .title_bottom(
+            Line::from(" type reply · ↑/↓ scroll · Enter newline · Ctrl+S send · Esc cancel ")
+                .centered(),
+        )
+        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let [question_area, reply_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(7)]).areas(inner);
+
+    let q_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Copilot asks ")
+        .border_style(Style::new().fg(Color::Magenta));
+    let q_inner = q_block.inner(question_area);
+    let content = reply_question_content(app.reply_question());
+    let lines = wrap_styled(&content, q_inner.width as usize);
+    // Clamp so the furthest scroll lands the last line at the bottom of the pane.
+    let max_scroll = (lines.len() as u16).saturating_sub(q_inner.height);
+    app.clamp_reply_scroll(max_scroll);
+    let question = Paragraph::new(lines)
+        .block(q_block)
+        .scroll((app.reply_scroll(), 0));
+    frame.render_widget(question, question_area);
+
+    // The reply field is always the focused surface here, so it shows a cursor.
+    frame.render_widget(
+        field_widget("Your reply", app.reply_text(), true),
+        reply_area,
+    );
+}
+
 /// Draw the bots popup: a centered, navigable list of every background worker
 /// the session has started — running, stopped, or failed — so a stopped or
 /// failed one can be restarted in place with the same options it was launched
@@ -1151,27 +1221,45 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 /// The two-column gutter shown before an issue's number: a turning spinner
-/// while the loop actively works it, a static dot for an in-progress label
-/// with no running loop, or blanks so every row's number stays aligned (#115).
-fn progress_marker(in_progress: bool, loop_running: bool, spinner: &str) -> Span<'static> {
-    if !in_progress {
-        return Span::raw("  ");
+/// while the loop actively works it, a static dot for an in-progress label with
+/// no running loop, a `?` when Copilot is waiting on the user (needs-info) so a
+/// pending question is easy to spot (#165), or blanks so every row's number
+/// stays aligned (#115).
+fn progress_marker(
+    in_progress: bool,
+    needs_info: bool,
+    loop_running: bool,
+    spinner: &str,
+) -> Span<'static> {
+    if in_progress {
+        return if loop_running {
+            Span::styled(
+                format!("{spinner} "),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("● ", Style::new().fg(Color::DarkGray))
+        };
     }
-    if loop_running {
-        Span::styled(
-            format!("{spinner} "),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled("● ", Style::new().fg(Color::DarkGray))
+    if needs_info {
+        return Span::styled(
+            "? ",
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        );
     }
+    Span::raw("  ")
 }
 
 /// Format a single issue as a list row: an in-progress marker, number, title,
 /// and labels.
 fn issue_item(issue: &Issue, loop_running: bool, spinner: &str) -> ListItem<'static> {
     let mut spans = vec![
-        progress_marker(issue.is_in_progress(), loop_running, spinner),
+        progress_marker(
+            issue.is_in_progress(),
+            issue.needs_info(),
+            loop_running,
+            spinner,
+        ),
         Span::styled(
             format!("#{:<5}", issue.number),
             Style::new().fg(Color::Yellow),
@@ -1303,7 +1391,7 @@ mod tests {
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(220, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1312,6 +1400,7 @@ mod tests {
         assert!(text.contains("ACTIONS"));
         assert!(text.contains("c new"));
         assert!(text.contains("r ready"));
+        assert!(text.contains("i reply"));
         assert!(text.contains("m models"));
         assert!(text.contains("add-worker"));
         assert!(text.contains("s summary"));
@@ -1746,9 +1835,23 @@ mod tests {
 
     #[test]
     fn progress_marker_reflects_state() {
-        assert_eq!(spans_text(&[progress_marker(false, true, "⠋")]), "  ");
-        assert_eq!(spans_text(&[progress_marker(true, true, "⠋")]), "⠋ ");
-        assert_eq!(spans_text(&[progress_marker(true, false, "⠋")]), "● ");
+        // in_progress, needs_info, loop_running.
+        assert_eq!(
+            spans_text(&[progress_marker(false, false, true, "⠋")]),
+            "  "
+        );
+        assert_eq!(spans_text(&[progress_marker(true, false, true, "⠋")]), "⠋ ");
+        assert_eq!(
+            spans_text(&[progress_marker(true, false, false, "⠋")]),
+            "● "
+        );
+        // A needs-info issue (never in-progress) shows the question marker (#165).
+        assert_eq!(
+            spans_text(&[progress_marker(false, true, false, "⠋")]),
+            "? "
+        );
+        // in-progress wins over needs-info when both somehow hold.
+        assert_eq!(spans_text(&[progress_marker(true, true, false, "⠋")]), "● ");
     }
 
     #[test]
@@ -1836,7 +1939,7 @@ mod tests {
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(170, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1922,7 +2025,7 @@ mod tests {
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(170, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -2124,6 +2227,59 @@ mod tests {
         assert!(text.contains("Comments (1)"));
         assert!(text.contains("hubot"));
         assert!(text.contains("a reply"));
+    }
+
+    #[test]
+    fn footer_advertises_the_reply_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("i reply"));
+    }
+
+    #[test]
+    fn reply_question_content_shows_the_question_or_a_placeholder() {
+        let q = reply_question_content(Some("line one\nline two"));
+        let text: Vec<String> = q.into_iter().map(|(l, _)| l).collect();
+        assert_eq!(text, vec!["line one".to_string(), "line two".to_string()]);
+        // No question falls back to a single placeholder line.
+        let none = reply_question_content(None);
+        assert_eq!(none.len(), 1);
+        assert!(none[0].0.contains("no question text"));
+    }
+
+    #[test]
+    fn renders_the_reply_popup_with_the_question_and_draft() {
+        let issue = crate::github::parse_issue(
+            r#"{"number":165,"title":"reply","labels":[{"name":"needs-info"}],
+                "comments":[{"author":{"login":"hubot"},
+                             "body":"Which database should I use? <!-- copilot-loop:needs-info -->"}]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(Vec::new());
+        app.open_reply_with(issue);
+        app.reply_input('u');
+        app.reply_input('s');
+        app.reply_input('e');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Reply"));
+        assert!(text.contains("#165"));
+        assert!(text.contains("Copilot asks"));
+        assert!(text.contains("Which database"));
+        assert!(text.contains("Your reply"));
+        // The typed draft shows in the reply field.
+        assert!(text.contains("use"));
+        // The send/cancel hint is offered on the border.
+        assert!(text.contains("Ctrl+S send"));
     }
 
     #[test]

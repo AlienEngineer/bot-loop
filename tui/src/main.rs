@@ -187,6 +187,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The reply popup captures keys while it is open so typing goes to the draft
+    // rather than the list (#165).
+    if app.reply_open() {
+        handle_reply_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -220,6 +227,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.toggle_ready(),
         KeyCode::Char('x') => app.request_close(),
         KeyCode::Char('d') => app.open_details(),
+        KeyCode::Char('i') => app.open_reply(),
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('b') => app.open_bots(),
@@ -317,6 +325,33 @@ fn handle_bots_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') | KeyCode::Enter => app.restart_selected_bot(),
         KeyCode::Char('R') => app.restart_all_stopped_bots(),
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('b') => app.close_bots(),
+        _ => {}
+    }
+}
+
+/// Handle a key while the reply popup is open: type the reply, scroll the
+/// question pane with the arrow keys (typing consumes the printable keys, so
+/// arrows do the scrolling), Ctrl+S to send, Esc to cancel (#165).
+fn handle_reply_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        app.submit_reply();
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => app.close_reply(),
+        KeyCode::Up => app.reply_scroll_up(),
+        KeyCode::Down => app.reply_scroll_down(),
+        KeyCode::Backspace => app.reply_backspace(),
+        KeyCode::Enter => app.reply_newline(),
+        // Ignore control/alt combos so shortcuts don't leak into the text.
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.reply_input(c)
+        }
         _ => {}
     }
 }
@@ -493,5 +528,35 @@ mod tests {
     #[test]
     fn refreshes_when_the_loop_just_started_and_the_interval_elapsed() {
         assert!(wants_loop_refresh(false, true, true));
+    }
+
+    #[test]
+    fn leader_then_i_without_a_question_is_gated() {
+        // `space i` opens the reply popup, but only for a needs-info issue; a
+        // plain issue is refused (no `gh` call) and the menu still closes (#165).
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('i'));
+        assert!(!app.reply_open());
+        assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn reply_popup_captures_typing_and_esc_closes_it() {
+        // With the popup open, printable keys type into the draft rather than
+        // navigating the list, and Esc closes it (#165).
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[{"name":"needs-info"}]}]"#)
+                .unwrap();
+        let mut app = App::new(issues);
+        let issue = app.selected().cloned().unwrap();
+        app.open_reply_with(issue);
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.reply_text(), "hi");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.reply_open());
     }
 }

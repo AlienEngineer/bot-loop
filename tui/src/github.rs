@@ -89,6 +89,24 @@ impl Issue {
         self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
     }
 
+    /// Whether Copilot is waiting for the user to answer a question: the issue
+    /// carries the [`NEEDS_INFO_LABEL`] the loop adds when Copilot asks for more
+    /// information instead of coding (#165).
+    pub fn needs_info(&self) -> bool {
+        self.has_label(NEEDS_INFO_LABEL)
+    }
+
+    /// The most recent Copilot question posted on this issue, i.e. the body of
+    /// the latest comment carrying the loop's [`QUESTION_MARKER`], stripped of
+    /// that hidden marker. `None` when no such comment exists — e.g. the issue
+    /// was fetched without its comments, or Copilot has not asked anything (#165).
+    pub fn latest_question(&self) -> Option<String> {
+        self.comments
+            .iter()
+            .rev()
+            .find_map(|c| question_from_comment(&c.body))
+    }
+
     /// Total AI Credits the loop spent on this issue, summed across every
     /// copilot-loop usage comment in its thread, or `None` when the issue
     /// carries no usage comment (e.g. closed by hand or never worked) (#145).
@@ -143,7 +161,17 @@ fn parse_comment_credits(body: &str) -> Option<f64> {
     None
 }
 
-/// A pull request the loop is working, mapped from `gh pr list --json ...`.
+/// Extract the Copilot question from a comment body, or `None` when the comment
+/// is not a copilot-loop question (it lacks [`QUESTION_MARKER`]). The hidden
+/// marker is stripped and the result trimmed, so what remains is the human-facing
+/// question the loop posted with `_ask_issue`. Pure for testing (#165).
+fn question_from_comment(body: &str) -> Option<String> {
+    if !body.contains(QUESTION_MARKER) {
+        return None;
+    }
+    let cleaned = body.replace(QUESTION_MARKER, "");
+    Some(cleaned.trim().to_string())
+}
 ///
 /// Only the fields the TUI needs to name the PR are modelled; the loop keys a
 /// PR as "being worked" off the same [`IN_PROGRESS_LABEL`] it adds to issues, so
@@ -181,6 +209,17 @@ pub const USAGE_MARKER: &str = "<!-- copilot-loop:usage -->";
 /// mirroring `INPROGRESS_LABEL` in `copilot-loop.sh`. The TUI keys its
 /// "which issue is the loop working" display off this label (#115).
 pub const IN_PROGRESS_LABEL: &str = "in-progress";
+
+/// The label the loop adds when Copilot asks the user a question instead of
+/// coding, mirroring `NEEDS_INFO_LABEL` in `copilot-loop.sh`. The TUI keys its
+/// "this issue has a pending question" marker and its reply popup off this
+/// label (#165).
+pub const NEEDS_INFO_LABEL: &str = "needs-info";
+
+/// Hidden marker `copilot-loop.sh` tags every Copilot question comment with (its
+/// `QUESTION_MARKER`), so the TUI can pick the loop's question out of an issue's
+/// thread to show in the reply popup (#165).
+pub const QUESTION_MARKER: &str = "<!-- copilot-loop:needs-info -->";
 
 /// Resolve the trigger label from an optional env value, mirroring the loop's
 /// `TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"`. Empty falls back to the default.
@@ -543,7 +582,8 @@ pub const SUMMARY_CONTEXT_BYTES: u64 = 16 * 1024;
 /// PATH, mirroring the loop's `_run_with_timeout`.
 const SUMMARY_TIMEOUT_SECS: u64 = 120;
 
-/// Build the `gh issue comment` arguments. Pure for testing.
+/// Build the `gh issue comment` arguments for posting a reply. Pure for testing
+/// (#165).
 fn comment_issue_args(number: u64, body: &str) -> Vec<String> {
     vec![
         "issue".to_string(),
@@ -554,13 +594,22 @@ fn comment_issue_args(number: u64, body: &str) -> Vec<String> {
     ]
 }
 
-/// Post a comment on an issue using the `gh` CLI.
+/// Post a comment on an issue using the `gh` CLI, used both to report a summary
+/// on close (#161) and to reply to a Copilot question from the TUI (#165).
 ///
-/// Runs `gh issue comment <number> --body <body>`. Returns an error when `gh` is
-/// missing, not authenticated, or the command fails.
+/// Runs `gh issue comment <number> --body <body>`. The loop resumes a
+/// `needs-info` issue once its latest comment comes from someone other than the
+/// account the loop runs as, so a reply posted here (as the TUI user) is what
+/// unblocks the issue — no label change is needed, the loop owns that. Errors
+/// when the body is empty, `gh` is missing or unauthenticated, or the command
+/// fails.
 pub fn comment_issue(number: u64, body: &str) -> Result<()> {
-    // Tests drive the pure arg builder directly; never shell out so the suite
-    // stays hermetic and cannot comment on real issues.
+    if body.trim().is_empty() {
+        anyhow::bail!("reply must not be empty");
+    }
+
+    // Tests drive the local apply path directly; never shell out to `gh` so the
+    // suite stays hermetic and can't post to real issues (mirrors `add_label`).
     if cfg!(test) {
         return Ok(());
     }
@@ -1019,5 +1068,82 @@ mod tests {
                 ("2026-07-03T10:00:00Z", 50.5),
             ]
         );
+    }
+
+    /// A Copilot question comment as `copilot-loop.sh`'s `_ask_issue` posts it:
+    /// a heading, the question, then the hidden marker (#165).
+    fn question_comment(question: &str) -> String {
+        format!(
+            "**copilot-loop needs more information to continue:**\n\n{question}\n\n{QUESTION_MARKER}"
+        )
+    }
+
+    #[test]
+    fn question_from_comment_strips_the_marker() {
+        let body = question_comment("Which database should I use?");
+        let q = question_from_comment(&body).expect("a marked comment is a question");
+        assert!(q.contains("Which database should I use?"));
+        assert!(!q.contains(QUESTION_MARKER));
+    }
+
+    #[test]
+    fn question_from_comment_ignores_unmarked_comments() {
+        // A plain human comment carries no marker, so it is not a question.
+        assert_eq!(question_from_comment("just a note"), None);
+        // The usage comment marker is a different marker, also not a question.
+        assert_eq!(
+            question_from_comment("AI Credits 1 <!-- copilot-loop:usage -->"),
+            None
+        );
+    }
+
+    #[test]
+    fn latest_question_finds_the_most_recent_marked_comment() {
+        let first = serde_json::to_string(&question_comment("first question")).unwrap();
+        let human = serde_json::to_string("thanks, but wait").unwrap();
+        let second = serde_json::to_string(&question_comment("second question")).unwrap();
+        let json = format!(
+            r#"[{{"number":1,"title":"t","comments":[
+                {{"body":{first}}},
+                {{"body":{human}}},
+                {{"body":{second}}}
+            ]}}]"#
+        );
+        let issue = &parse_issues(&json).unwrap()[0];
+        let q = issue.latest_question().expect("a question is present");
+        assert!(q.contains("second question"));
+        assert!(!q.contains("first question"));
+    }
+
+    #[test]
+    fn latest_question_is_none_without_a_marked_comment() {
+        let json = r#"[{"number":1,"title":"t","comments":[{"body":"hi"}]}]"#;
+        assert_eq!(parse_issues(json).unwrap()[0].latest_question(), None);
+        // No comments at all (the open-list shape) has no question either.
+        let bare = r#"[{"number":1,"title":"t"}]"#;
+        assert_eq!(parse_issues(bare).unwrap()[0].latest_question(), None);
+    }
+
+    #[test]
+    fn needs_info_tracks_the_label() {
+        let with = r#"[{"number":1,"title":"t","labels":[{"name":"needs-info"}]}]"#;
+        assert!(parse_issues(with).unwrap()[0].needs_info());
+        let without = r#"[{"number":1,"title":"t","labels":[{"name":"ready"}]}]"#;
+        assert!(!parse_issues(without).unwrap()[0].needs_info());
+    }
+
+    #[test]
+    fn comment_issue_args_are_well_formed() {
+        assert_eq!(
+            comment_issue_args(165, "my reply"),
+            vec!["issue", "comment", "165", "--body", "my reply"]
+        );
+    }
+
+    #[test]
+    fn comment_issue_rejects_an_empty_body() {
+        assert!(comment_issue(1, "   ").is_err());
+        // A non-empty body is accepted; under cfg!(test) it never shells out.
+        assert!(comment_issue(1, "ok").is_ok());
     }
 }
