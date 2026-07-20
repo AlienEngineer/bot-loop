@@ -18,6 +18,10 @@ pub const DEFAULT_LIMIT: u32 = 200;
 /// How much of a loop log to read for the output panel (its tail).
 pub const OUTPUT_TAIL_BYTES: u64 = 64 * 1024;
 
+/// How many feedback messages the messages popup retains, so a long session's
+/// history stays bounded while still keeping plenty of recent context (#182).
+pub const MAX_MESSAGES: usize = 200;
+
 /// Environment variable seeding whether closing an issue posts a summary comment
 /// (#161). Default on; `off`/`0`/`false`/`no` (case-insensitive) start it off.
 pub const SUMMARY_ON_CLOSE_ENV: &str = "SUMMARY_ON_CLOSE";
@@ -203,6 +207,14 @@ pub struct App {
     /// Vertical scroll offset (in rendered lines) of the reply popup's question
     /// pane, so a long question can be read top to bottom while typing (#165).
     reply_scroll: u16,
+    /// The latest feedback messages, oldest first, capped at [`MAX_MESSAGES`], so
+    /// the messages popup can show a log of what the TUI reported rather than only
+    /// the single line currently on screen (#182).
+    messages: Vec<String>,
+    /// Whether the messages popup is open (#182).
+    messages_open: bool,
+    /// Selection within the messages popup's list (#182).
+    pub messages_state: ListState,
 }
 
 impl App {
@@ -264,6 +276,97 @@ impl App {
             reply_question: None,
             reply_text: String::new(),
             reply_scroll: 0,
+            messages: Vec::new(),
+            messages_open: false,
+            messages_state: ListState::default(),
+        }
+    }
+
+    /// Set the transient feedback message shown on the message line and record it
+    /// in the messages history so the popup can show a log of past feedback (#182).
+    ///
+    /// Routing every status update through here keeps the history complete: any
+    /// message the user sees on the message line is also captured for the popup.
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.record_message(message.clone());
+        self.status = Some(message);
+    }
+
+    /// Append a message to the bounded history, oldest first, dropping the oldest
+    /// entries once [`MAX_MESSAGES`] is reached so a long session never grows the
+    /// log without bound (#182).
+    fn record_message(&mut self, message: String) {
+        self.messages.push(message);
+        if self.messages.len() > MAX_MESSAGES {
+            let overflow = self.messages.len() - MAX_MESSAGES;
+            self.messages.drain(0..overflow);
+        }
+    }
+
+    /// The recorded feedback messages, oldest first (#182). The popup renders them
+    /// newest first so the latest is at the top.
+    pub fn messages(&self) -> &[String] {
+        &self.messages
+    }
+
+    /// Whether the messages popup is open (#182).
+    pub fn messages_open(&self) -> bool {
+        self.messages_open
+    }
+
+    /// Open the messages popup, selecting the newest message — index 0 of the
+    /// newest-first list — or nothing when the log is empty (#182).
+    pub fn open_messages(&mut self) {
+        self.messages_state.select(if self.messages.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        self.messages_open = true;
+    }
+
+    /// Close the messages popup (#182).
+    pub fn close_messages(&mut self) {
+        self.messages_open = false;
+    }
+
+    /// Move the messages highlight down by one, clamped to the last row (#182).
+    pub fn messages_next(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let last = self.messages.len() - 1;
+        let next = self
+            .messages_state
+            .selected()
+            .map_or(0, |i| (i + 1).min(last));
+        self.messages_state.select(Some(next));
+    }
+
+    /// Move the messages highlight up by one, clamped to the first row (#182).
+    pub fn messages_previous(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let prev = self
+            .messages_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.messages_state.select(Some(prev));
+    }
+
+    /// Jump the messages highlight to the newest message (#182).
+    pub fn messages_first(&mut self) {
+        if !self.messages.is_empty() {
+            self.messages_state.select(Some(0));
+        }
+    }
+
+    /// Jump the messages highlight to the oldest message (#182).
+    pub fn messages_last(&mut self) {
+        if !self.messages.is_empty() {
+            self.messages_state.select(Some(self.messages.len() - 1));
         }
     }
 
@@ -312,14 +415,14 @@ impl App {
         self.refresh_in_progress_prs();
         match github::fetch_issues(self.limit) {
             Ok(issues) => {
-                self.status = if issues.is_empty() {
-                    Some("No open issues found.".to_string())
+                if issues.is_empty() {
+                    self.set_status("No open issues found.");
                 } else {
-                    None
-                };
+                    self.status = None;
+                }
                 self.set_issues(issues);
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -376,7 +479,7 @@ impl App {
         if let Ok(issues) = github::fetch_issues(self.limit) {
             self.set_issues(issues);
             if let Some(message) = self.take_started_feedback() {
-                self.status = Some(message);
+                self.set_status(message);
             }
         }
     }
@@ -416,22 +519,22 @@ impl App {
         match outcome.issues {
             Ok(issues) => {
                 if manual {
-                    self.status = if issues.is_empty() {
-                        Some("No open issues found.".to_string())
+                    if issues.is_empty() {
+                        self.set_status("No open issues found.");
                     } else {
-                        None
-                    };
+                        self.status = None;
+                    }
                     self.set_issues(issues);
                 } else {
                     self.set_issues(issues);
                     if let Some(message) = self.take_started_feedback() {
-                        self.status = Some(message);
+                        self.set_status(message);
                     }
                 }
             }
             Err(err) => {
                 if manual {
-                    self.status = Some(format!("Error: {err}"));
+                    self.set_status(format!("Error: {err}"));
                 }
             }
         }
@@ -491,9 +594,9 @@ impl App {
             match github::remove_label(number, &label) {
                 Ok(()) => {
                     self.issues[index].labels.retain(|l| l.name != label);
-                    self.status = Some(format!("#{number} unmarked '{label}'."));
+                    self.set_status(format!("#{number} unmarked '{label}'."));
                 }
-                Err(err) => self.status = Some(format!("Error: {err}")),
+                Err(err) => self.set_status(format!("Error: {err}")),
             }
         } else {
             match github::add_label(number, &label) {
@@ -501,9 +604,9 @@ impl App {
                     self.issues[index].labels.push(Label {
                         name: label.clone(),
                     });
-                    self.status = Some(format!("#{number} marked '{label}'."));
+                    self.set_status(format!("#{number} marked '{label}'."));
                 }
-                Err(err) => self.status = Some(format!("Error: {err}")),
+                Err(err) => self.set_status(format!("Error: {err}")),
             }
         }
     }
@@ -533,7 +636,7 @@ impl App {
     /// Dismiss the close confirmation without closing anything.
     pub fn cancel_close(&mut self) {
         if let Some(number) = self.close_confirm.take() {
-            self.status = Some(format!("Close of #{number} cancelled."));
+            self.set_status(format!("Close of #{number} cancelled."));
         }
     }
 
@@ -569,10 +672,10 @@ impl App {
                         self.state.select(Some(selected));
                     }
                 }
-                self.status = Some(format!("Closed issue #{number}."));
+                self.set_status(format!("Closed issue #{number}."));
                 self.report_close(number, &title);
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -616,7 +719,7 @@ impl App {
 
         let context = self.session_context(number);
         if context.trim().is_empty() {
-            self.status = Some(format!(
+            self.set_status(format!(
                 "Closed issue #{number}. No session log to summarize."
             ));
             return;
@@ -629,7 +732,7 @@ impl App {
             context,
         });
         self.reporting += 1;
-        self.status = Some(format!("Closed issue #{number}. Summarizing…"));
+        self.set_status(format!("Closed issue #{number}. Summarizing…"));
     }
 
     /// The sanitized tail of the newest loop log for `number`, capped for the
@@ -653,7 +756,7 @@ impl App {
     pub fn toggle_report_on_close(&mut self) {
         self.report_on_close = !self.report_on_close;
         let state = if self.report_on_close { "on" } else { "off" };
-        self.status = Some(format!("Close summary {state}."));
+        self.set_status(format!("Close summary {state}."));
     }
 
     /// Attach the background close reporter so summaries run off the UI thread
@@ -677,7 +780,7 @@ impl App {
         };
         for outcome in outcomes {
             self.reporting = self.reporting.saturating_sub(1);
-            self.status = Some(report_status_message(&outcome));
+            self.set_status(report_status_message(&outcome));
         }
     }
 
@@ -690,7 +793,7 @@ impl App {
     pub fn start_worker(&mut self) {
         let repo = self.repo_root.clone();
         let Some(script) = runner::resolve_loop_script(&repo) else {
-            self.status = Some(format!(
+            self.set_status(format!(
                 "Cannot find {} — set {} to its path.",
                 runner::LOOP_SCRIPT_NAME,
                 runner::LOOP_SCRIPT_ENV
@@ -718,7 +821,7 @@ impl App {
                     self.seed_in_progress_baseline();
                 }
                 let count = self.runner.running_count();
-                self.status = Some(format!(
+                self.set_status(format!(
                     "Worker started (pid {pid}, model {}, auto-merge {}, QA {}). {count} running. Log: {}",
                     self.current_model_label(),
                     if self.auto_merge { "on" } else { "off" },
@@ -726,7 +829,7 @@ impl App {
                     log.display()
                 ));
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -735,11 +838,11 @@ impl App {
     pub fn stop_all_workers(&mut self) {
         let count = self.runner.running_count();
         if count == 0 {
-            self.status = Some("No workers running.".to_string());
+            self.set_status("No workers running.".to_string());
             return;
         }
         self.runner.stop_all();
-        self.status = Some(format!(
+        self.set_status(format!(
             "Stopped {count} worker{}.",
             if count == 1 { "" } else { "s" }
         ));
@@ -833,12 +936,12 @@ impl App {
             .and_then(|i| self.bots.get(i))
             .cloned()
         else {
-            self.status = Some("No bot selected.".to_string());
+            self.set_status("No bot selected.".to_string());
             return;
         };
 
         if view.status == WorkerStatus::Running {
-            self.status = Some(format!("Bot #{} is already running.", view.id));
+            self.set_status(format!("Bot #{} is already running.", view.id));
             return;
         }
 
@@ -848,13 +951,13 @@ impl App {
                 if was_idle {
                     self.seed_in_progress_baseline();
                 }
-                self.status = Some(format!(
+                self.set_status(format!(
                     "Restarted bot #{} (pid {pid}). Log: {}",
                     view.id,
                     view.log.display()
                 ));
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
         self.refresh_bots();
         self.clamp_bots_selection();
@@ -872,7 +975,7 @@ impl App {
             .collect();
 
         if ids.is_empty() {
-            self.status = Some("No stopped or failed bots to restart.".to_string());
+            self.set_status("No stopped or failed bots to restart.".to_string());
             return;
         }
 
@@ -890,7 +993,7 @@ impl App {
         }
 
         let plural = if restarted == 1 { "" } else { "s" };
-        self.status = Some(if failed == 0 {
+        self.set_status(if failed == 0 {
             format!("Restarted {restarted} bot{plural}.")
         } else {
             format!("Restarted {restarted} bot{plural}, {failed} failed.")
@@ -954,11 +1057,12 @@ impl App {
     pub fn toggle_auto_merge(&mut self) {
         self.auto_merge = !self.auto_merge;
         let state = if self.auto_merge { "on" } else { "off" };
-        self.status = Some(if self.runner.is_running() {
+        let message = if self.runner.is_running() {
             format!("Auto-merge {state} (applies when the loop restarts).")
         } else {
             format!("Auto-merge {state}.")
-        });
+        };
+        self.set_status(message);
     }
 
     /// Whether the loop will be started with quality-assurance tests on (#162).
@@ -974,17 +1078,18 @@ impl App {
     pub fn toggle_quality_assurance(&mut self) {
         self.quality_assurance = !self.quality_assurance;
         let state = if self.quality_assurance { "on" } else { "off" };
-        self.status = Some(if self.runner.is_running() {
+        let message = if self.runner.is_running() {
             format!("Quality assurance {state} (applies when the loop restarts).")
         } else {
             format!("Quality assurance {state}.")
-        });
+        };
+        self.set_status(message);
     }
 
     /// Open the model picker, highlighting the currently selected model.
     pub fn open_model_picker(&mut self) {
         if self.models.is_empty() {
-            self.status = Some("No models available.".to_string());
+            self.set_status("No models available.".to_string());
             return;
         }
         let current = self.current_model_label();
@@ -1043,11 +1148,12 @@ impl App {
         self.model_picker_open = false;
 
         let label = self.current_model_label().to_string();
-        self.status = Some(if self.runner.is_running() {
+        let message = if self.runner.is_running() {
             format!("Model set to {label} (applies to workers started next).")
         } else {
             format!("Model set to {label}.")
-        });
+        };
+        self.set_status(message);
     }
 
     /// Whether the output side panel is open.
@@ -1214,15 +1320,15 @@ impl App {
         match github::fetch_closed_issues(self.limit) {
             Ok(issues) => {
                 self.closed_issues = issues;
-                self.status = if self.closed_issues.is_empty() {
-                    Some("No closed issues found.".to_string())
+                if self.closed_issues.is_empty() {
+                    self.set_status("No closed issues found.");
                 } else {
-                    None
-                };
+                    self.status = None;
+                }
             }
             Err(err) => {
                 self.closed_issues = Vec::new();
-                self.status = Some(format!("Error: {err}"));
+                self.set_status(format!("Error: {err}"));
             }
         }
         self.present_closed();
@@ -1277,7 +1383,7 @@ impl App {
             }
             Err(err) => {
                 self.cost_issues = Vec::new();
-                self.status = Some(format!("Error: {err}"));
+                self.set_status(format!("Error: {err}"));
             }
         }
         self.cost_open = true;
@@ -1340,7 +1446,7 @@ impl App {
                 self.status = None;
                 self.present_details(issue);
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -1435,7 +1541,7 @@ impl App {
         };
         if !issue.needs_info() {
             let number = issue.number;
-            self.status = Some(format!(
+            self.set_status(format!(
                 "#{number} has no pending Copilot question to answer."
             ));
             return;
@@ -1446,7 +1552,7 @@ impl App {
                 self.status = None;
                 self.present_reply(number, full.latest_question());
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -1507,17 +1613,17 @@ impl App {
             return;
         };
         if self.reply_text.trim().is_empty() {
-            self.status = Some("Reply must not be empty.".to_string());
+            self.set_status("Reply must not be empty.".to_string());
             return;
         }
         match github::comment_issue(number, &self.reply_text) {
             Ok(()) => {
                 self.close_reply();
-                self.status = Some(format!(
+                self.set_status(format!(
                     "Replied to #{number}. A running loop will resume it."
                 ));
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -1537,7 +1643,7 @@ impl App {
     pub fn cancel_create(&mut self) {
         self.mode = Mode::List;
         self.form = CreateForm::default();
-        self.status = Some("Issue creation cancelled.".to_string());
+        self.set_status("Issue creation cancelled.".to_string());
     }
 
     /// Type a character into the focused form field.
@@ -1573,7 +1679,7 @@ impl App {
         let title = self.form.title.trim().to_string();
         if title.is_empty() {
             self.form.field = CreateField::Title;
-            self.status = Some("Title is required to create an issue.".to_string());
+            self.set_status("Title is required to create an issue.".to_string());
             return;
         }
         let body = self.form.description.clone();
@@ -1586,9 +1692,9 @@ impl App {
                 if let Some(pos) = self.issues.iter().position(|i| i.number == number) {
                     self.state.select(Some(pos));
                 }
-                self.status = Some(format!("Created issue #{number}."));
+                self.set_status(format!("Created issue #{number}."));
             }
-            Err(err) => self.status = Some(format!("Error: {err}")),
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -2996,5 +3102,81 @@ mod tests {
         assert_eq!(app.reply_scroll(), 1);
         app.clamp_reply_scroll(0);
         assert_eq!(app.reply_scroll(), 0);
+    }
+
+    #[test]
+    fn set_status_records_the_message_in_the_history() {
+        // Every status shown on the message line is captured for the popup (#182).
+        let mut app = app_with(0);
+        assert!(app.messages().is_empty());
+        app.set_status("First.");
+        app.set_status("Second.");
+        assert_eq!(app.status.as_deref(), Some("Second."));
+        assert_eq!(
+            app.messages(),
+            ["First.".to_string(), "Second.".to_string()]
+        );
+    }
+
+    #[test]
+    fn clearing_the_status_keeps_the_recorded_history() {
+        // Clearing the on-screen message must not wipe the popup's log (#182).
+        let mut app = app_with(0);
+        app.set_status("Kept.");
+        app.status = None;
+        assert!(app.status.is_none());
+        assert_eq!(app.messages(), ["Kept.".to_string()]);
+    }
+
+    #[test]
+    fn message_history_is_bounded_to_the_latest_entries() {
+        // A long session drops the oldest messages so the log stays bounded (#182).
+        let mut app = app_with(0);
+        for i in 0..(MAX_MESSAGES + 5) {
+            app.set_status(format!("m{i}"));
+        }
+        assert_eq!(app.messages().len(), MAX_MESSAGES);
+        // The oldest five were dropped; the newest is retained.
+        assert_eq!(app.messages().first().map(String::as_str), Some("m5"));
+        assert_eq!(
+            app.messages().last().map(String::as_str),
+            Some(format!("m{}", MAX_MESSAGES + 4)).as_deref()
+        );
+    }
+
+    #[test]
+    fn open_messages_selects_the_newest_or_nothing_when_empty() {
+        let mut app = app_with(0);
+        app.open_messages();
+        assert!(app.messages_open());
+        // Empty log selects nothing.
+        assert_eq!(app.messages_state.selected(), None);
+        app.close_messages();
+        assert!(!app.messages_open());
+
+        app.set_status("only");
+        app.open_messages();
+        // Index 0 is the newest message in the newest-first list.
+        assert_eq!(app.messages_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn messages_navigation_clamps_to_the_ends() {
+        let mut app = app_with(0);
+        app.set_status("a");
+        app.set_status("b");
+        app.set_status("c");
+        app.open_messages();
+        assert_eq!(app.messages_state.selected(), Some(0));
+        app.messages_previous(); // already at the top
+        assert_eq!(app.messages_state.selected(), Some(0));
+        app.messages_next();
+        app.messages_next();
+        app.messages_next(); // clamps at the last of three rows
+        assert_eq!(app.messages_state.selected(), Some(2));
+        app.messages_first();
+        assert_eq!(app.messages_state.selected(), Some(0));
+        app.messages_last();
+        assert_eq!(app.messages_state.selected(), Some(2));
     }
 }

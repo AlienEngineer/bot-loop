@@ -49,11 +49,11 @@ fn main() -> Result<()> {
     match github::fetch_issues(DEFAULT_LIMIT) {
         Ok(issues) => {
             if issues.is_empty() {
-                app.status = Some("No open issues found.".to_string());
+                app.set_status("No open issues found.");
             }
             app.set_issues(issues);
         }
-        Err(err) => app.status = Some(format!("Error: {err}")),
+        Err(err) => app.set_status(format!("Error: {err}")),
     }
 
     // Run the `gh` issue/PR queries on a worker thread so the periodic
@@ -212,6 +212,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The messages popup captures keys while it is open (#182).
+    if app.messages_open() {
+        handle_messages_key(app, key);
+        return;
+    }
+
     if app.is_creating() {
         handle_create_key(app, key);
         return;
@@ -249,6 +255,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('b') => app.open_bots(),
+        KeyCode::Char('M') => app.open_messages(),
         KeyCode::Char('a') => app.toggle_auto_merge(),
         KeyCode::Char('q') => app.toggle_quality_assurance(),
         KeyCode::Char('s') => app.toggle_report_on_close(),
@@ -363,6 +370,20 @@ fn handle_bots_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Handle a key while the messages popup is open: scroll the log with j/k (or
+/// the arrows), jump to the newest/oldest with g/G, and close on `q`, `Esc`, or
+/// `M` (#182).
+fn handle_messages_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.messages_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.messages_previous(),
+        KeyCode::Char('g') | KeyCode::Home => app.messages_first(),
+        KeyCode::Char('G') | KeyCode::End => app.messages_last(),
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('M') => app.close_messages(),
+        _ => {}
+    }
+}
+
 /// Handle a key while the reply popup is open: type the reply, scroll the
 /// question pane with the arrow keys (typing consumes the printable keys, so
 /// arrows do the scrolling), Ctrl+S to send, Esc to cancel (#165).
@@ -465,6 +486,18 @@ mod tests {
         // A key inside the popup is captured by it, not the list: b closes it.
         press(&mut app, KeyCode::Char('b'));
         assert!(!app.bots_open());
+    }
+
+    #[test]
+    fn leader_then_shift_m_opens_and_closes_the_messages_popup() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('M'));
+        assert!(app.messages_open());
+        assert!(!app.leader_active());
+        // A key inside the popup is captured by it, not the list: M closes it.
+        press(&mut app, KeyCode::Char('M'));
+        assert!(!app.messages_open());
     }
 
     #[test]

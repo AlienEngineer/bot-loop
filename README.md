@@ -170,6 +170,12 @@ every stopped or failed worker at once. Running workers are left untouched, and
 `Esc` (or `b`/`q`) closes the popup. This turns a transient failure into a one-key
 restart instead of losing the worker's slot and context (#82).
 
+Feedback messages appear on their own line just above the keybinds, so a status
+never crowds the bindings. Press `space` then `M` to open the messages popup: a
+scrollable log of the latest messages the TUI reported, newest first, so a status
+that scrolled past on the message line can be read back. Navigate with `j`/`k`
+(`g`/`G` jump to the newest/oldest), and `Esc` (or `M`/`q`) closes it (#182).
+
 ```sh
 cd tui
 cargo run
@@ -183,7 +189,8 @@ the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
 comments, `i` reply to a Copilot question (`needs-info` issues), `l` add a
 background worker, `L` stop all workers, `b` bots (restart a
-stopped/failed worker in place, or all with `R`), `a` toggle
+stopped/failed worker in place, or all with `R`), `M` show the messages popup (a
+log of the latest feedback), `a` toggle
 auto-merge, `q` toggle quality assurance, `s` toggle the closing summary, `m` pick
 the model, `o` show/hide the output panel, `p` show the resolving-PRs popup, `t`
 show closed issues and their cost, `$` open the cost dashboard, `f` refresh, `Esc`
