@@ -204,7 +204,9 @@ cd tui
 cargo run
 ```
 
-Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit. Press
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit — which asks
+for confirmation first (`y` quits, `n`/`Esc` cancels) so a stray key does not drop
+you out of the TUI (#167). Press
 `space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
 the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and

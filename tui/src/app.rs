@@ -110,6 +110,9 @@ pub struct App {
     show_output: bool,
     /// The number of the issue awaiting a close confirmation, if any (#118).
     close_confirm: Option<u64>,
+    /// Whether a quit confirmation is open, so a stray `q`/`Esc` asks before it
+    /// exits the TUI (#167).
+    quit_confirm: bool,
     /// In-progress issue numbers seen at the last refresh, so `auto_refresh`
     /// can announce when the loop *starts* a new issue (#119).
     known_in_progress: Vec<u64>,
@@ -213,6 +216,7 @@ impl App {
             repo_root: runner::repo_root(),
             show_output: false,
             close_confirm: None,
+            quit_confirm: false,
             known_in_progress: Vec::new(),
             auto_merge: false,
             quality_assurance: true,
@@ -552,6 +556,28 @@ impl App {
         }
     }
 
+    /// Whether a quit confirmation is open (#167).
+    pub fn quit_confirm(&self) -> bool {
+        self.quit_confirm
+    }
+
+    /// Ask to quit: opens a confirmation prompt so a stray `q`/`Esc` does not
+    /// exit the TUI by accident (#167). Nothing exits until [`confirm_quit`].
+    pub fn request_quit(&mut self) {
+        self.quit_confirm = true;
+    }
+
+    /// Dismiss the quit confirmation without exiting.
+    pub fn cancel_quit(&mut self) {
+        self.quit_confirm = false;
+    }
+
+    /// Confirm the pending quit: signals the main loop to exit (#167).
+    pub fn confirm_quit(&mut self) {
+        self.quit_confirm = false;
+        self.should_quit = true;
+    }
+
     /// Kick off the background close summary for a just-closed issue, when the
     /// feature is on (#161).
     ///
@@ -867,6 +893,16 @@ impl App {
     /// in-progress label), in list order (#133).
     pub fn in_progress_pr_numbers(&self) -> Vec<u64> {
         self.in_progress_prs.iter().map(|pr| pr.number).collect()
+    }
+
+    /// Whether any issue or PR currently carries the in-progress label, i.e. the
+    /// loop is actively working something — whether the TUI started the worker or
+    /// an external loop did. Drives the header and per-line spinners, the smooth
+    /// animation tick, and the on-a-timer refresh so watching an external loop
+    /// still shows motion and which issue is running, even with no local worker
+    /// (#157).
+    pub fn has_active_work(&self) -> bool {
+        !self.in_progress_numbers().is_empty() || !self.in_progress_pr_numbers().is_empty()
     }
 
     /// Whether the model picker popup is currently open.
@@ -1797,6 +1833,29 @@ mod tests {
     }
 
     #[test]
+    fn has_active_work_tracks_in_progress_issues_and_prs() {
+        // Nothing in progress: no active work, so the header/line spinners and
+        // the fast animation tick stay off (#157).
+        let mut app = App::new(parse_issues(r#"[{"number":10,"title":"a","labels":[]}]"#).unwrap());
+        assert!(!app.has_active_work());
+
+        // An issue carrying the in-progress label (set by any loop, local or
+        // external) counts as active work.
+        app.set_issues(
+            parse_issues(r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#)
+                .unwrap(),
+        );
+        assert!(app.has_active_work());
+
+        // A PR being resolved counts too, even with no in-progress issue.
+        let mut pr_only = App::new(Vec::new());
+        pr_only.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"}]"#).unwrap(),
+        );
+        assert!(pr_only.has_active_work());
+    }
+
+    #[test]
     fn take_started_feedback_announces_pr_starts() {
         // A PR the loop begins resolving is announced once, mirroring issues
         // (#133). PRs are seeded via the test setter standing in for `gh`.
@@ -2008,6 +2067,34 @@ mod tests {
         // No gh call is made and the list is unchanged.
         assert_eq!(app.issues.len(), 2);
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn request_quit_opens_the_confirmation_without_quitting() {
+        let mut app = app_with(0);
+        assert!(!app.quit_confirm());
+        app.request_quit();
+        assert!(app.quit_confirm());
+        // Nothing exits until the operator confirms (#167).
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn cancel_quit_closes_the_confirmation_and_stays_running() {
+        let mut app = app_with(0);
+        app.request_quit();
+        app.cancel_quit();
+        assert!(!app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn confirm_quit_closes_the_prompt_and_signals_the_loop_to_exit() {
+        let mut app = app_with(0);
+        app.request_quit();
+        app.confirm_quit();
+        assert!(!app.quit_confirm());
+        assert!(app.should_quit);
     }
 
     #[test]

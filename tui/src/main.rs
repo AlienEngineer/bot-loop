@@ -21,14 +21,15 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 
 use app::{App, DEFAULT_LIMIT};
 
-/// How often to silently re-fetch issues while the background loop runs, so the
-/// list's in-progress markers track what the loop is doing without a manual
-/// refresh (#115).
+/// How often to silently re-fetch issues while work is in flight, so the list's
+/// in-progress markers track what the loop is doing — a local worker or an
+/// external loop being watched — without a manual refresh (#115, #157).
 const LOOP_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long to block for input each tick while something on screen is animating
-/// — a background refresh's "Refreshing…" indicator (#130) or the running loop's
-/// spinner (#115) — kept short so the spinner turns smoothly.
+/// — a background refresh's "Refreshing…" indicator (#130), the running loop's
+/// spinner (#115), or an external loop's in-progress work (#157) — kept short so
+/// the spinner turns smoothly.
 const ANIMATION_TICK: Duration = Duration::from_millis(80);
 
 /// How long to block for input each tick when the screen is static, kept long to
@@ -76,13 +77,14 @@ fn wants_version<I: IntoIterator<Item = String>>(args: I) -> bool {
 }
 
 /// The main draw/input loop. Polls for key events and redraws each tick, and
-/// silently refreshes the issue list on a timer while the loop runs so its
-/// progress (which issue is in-progress) stays visible (#115), then once more
-/// the tick the loop finishes so the final state (closed issues, dropped
-/// in-progress labels) shows without a manual refresh (#121).
+/// silently refreshes the issue list on a timer while work is in flight — a
+/// local worker or an external loop being watched — so its progress (which issue
+/// is in-progress) stays visible (#115, #157), then once more the tick work
+/// finishes so the final state (closed issues, dropped in-progress labels) shows
+/// without a manual refresh (#121).
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_refresh = Instant::now();
-    let mut loop_was_running = false;
+    let mut work_was_active = false;
     while !app.should_quit {
         // Fold in any issue/PR data the worker thread finished fetching, so the
         // list tracks the loop without the UI thread ever blocking on `gh`.
@@ -100,10 +102,15 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         terminal.draw(|frame| ui::render(frame, app))?;
 
         // Poll briefly while anything animates — a background refresh's
-        // "Refreshing…" indicator (#130), a close summary in flight (#161), or
-        // the running loop's spinner (#115) — so the spinner turns smoothly;
-        // otherwise wait longer to stay near-idle.
-        let poll_timeout = if app.is_refreshing() || app.is_reporting() || app.loop_running() {
+        // "Refreshing…" indicator (#130), a close summary in flight (#161), the
+        // running loop's spinner (#115), or any in-progress issue/PR an external
+        // loop is working (#157) — so the spinner turns smoothly; otherwise wait
+        // longer to stay near-idle.
+        let poll_timeout = if app.is_refreshing()
+            || app.is_reporting()
+            || app.loop_running()
+            || app.has_active_work()
+        {
             ANIMATION_TICK
         } else {
             IDLE_TICK
@@ -116,21 +123,26 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             handle_key(app, key);
         }
 
-        let loop_running = app.loop_running();
+        // Silently re-fetch on a timer while work is in flight — local workers
+        // the TUI started or an external loop's in-progress issues/PRs — so the
+        // list and its markers track it, and once more the tick work finishes so
+        // the final state shows without a manual refresh (#115, #121, #157).
+        let work_active = app.loop_running() || app.has_active_work();
         let interval_elapsed = last_refresh.elapsed() >= LOOP_REFRESH_INTERVAL;
-        if wants_loop_refresh(loop_was_running, loop_running, interval_elapsed) {
+        if wants_loop_refresh(work_was_active, work_active, interval_elapsed) {
             app.auto_refresh();
             last_refresh = Instant::now();
         }
-        loop_was_running = loop_running;
+        work_was_active = work_active;
     }
     Ok(())
 }
 
-/// Whether to silently re-fetch the issue list this tick: periodically while the
-/// loop runs so its in-progress markers track it (#115), and once the tick the
-/// loop finishes so the final state shows without a manual refresh (#121). The
-/// finishing refresh fires even before the interval elapses. Pure for testing.
+/// Whether to silently re-fetch the issue list this tick: periodically while
+/// work is active — a local worker or an external loop's in-progress issues/PRs
+/// — so its markers track it (#115, #157), and once the tick work finishes so
+/// the final state shows without a manual refresh (#121). The finishing refresh
+/// fires even before the interval elapses. Pure for testing.
 fn wants_loop_refresh(was_running: bool, running: bool, interval_elapsed: bool) -> bool {
     (running && interval_elapsed) || (was_running && !running)
 }
@@ -142,6 +154,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Ctrl-c always quits.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
+        return;
+    }
+
+    // The quit confirmation captures keys while it is open (#167).
+    if app.quit_confirm() {
+        handle_quit_confirm_key(app, key);
         return;
     }
 
@@ -200,7 +218,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') | KeyCode::Esc => app.request_quit(),
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
         KeyCode::Char('g') | KeyCode::Home => app.first(),
@@ -259,6 +277,22 @@ fn handle_close_confirm_key(app: &mut App, key: KeyEvent) {
         | KeyCode::Char('q')
         | KeyCode::Esc
         | KeyCode::Enter => app.cancel_close(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the quit confirmation is open (#167). Quitting exits the
+/// TUI, so it defaults to safe: only `y` confirms; `n`, `Esc`, `q` and Enter
+/// cancel, and any other key is ignored so the prompt stays put — mirroring the
+/// close-issue confirmation so both destructive prompts behave the same.
+fn handle_quit_confirm_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_quit(),
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('q')
+        | KeyCode::Esc
+        | KeyCode::Enter => app.cancel_quit(),
         _ => {}
     }
 }
@@ -493,5 +527,75 @@ mod tests {
     #[test]
     fn refreshes_when_the_loop_just_started_and_the_interval_elapsed() {
         assert!(wants_loop_refresh(false, true, true));
+    }
+
+    #[test]
+    fn q_asks_for_confirmation_instead_of_quitting_immediately() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_asks_for_confirmation_instead_of_quitting_immediately() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn y_confirms_the_quit_prompt() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(!app.quit_confirm());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn n_esc_and_q_cancel_the_quit_prompt() {
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = App::new(Vec::new());
+            press(&mut app, KeyCode::Char('q'));
+            press(&mut app, cancel);
+            assert!(!app.quit_confirm(), "prompt should close on {cancel:?}");
+            assert!(!app.should_quit, "should not quit on {cancel:?}");
+        }
+    }
+
+    #[test]
+    fn an_unbound_key_keeps_the_quit_prompt_open() {
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.quit_confirm());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_without_a_confirmation() {
+        let mut app = App::new(Vec::new());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.quit_confirm());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn q_inside_another_popup_does_not_open_the_quit_prompt() {
+        // With a popup open, `q` is captured by it (closes the bots popup) and
+        // never reaches the quit path (#167).
+        let mut app = App::new(Vec::new());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.bots_open());
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.bots_open());
+        assert!(!app.quit_confirm());
+        assert!(!app.should_quit);
     }
 }

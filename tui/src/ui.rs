@@ -17,7 +17,6 @@ use crate::runner::{WorkerStatus, WorkerView};
 /// Draw the whole UI: header, issue list (or placeholder), and footer.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let workers = app.workers_running();
-    let loop_running = workers > 0;
     let [header_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -26,7 +25,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     render_header(frame, header_area, app, workers);
-    render_body(frame, body_area, app, loop_running);
+    render_body(frame, body_area, app);
     render_footer(frame, footer_area, app);
 
     // The model picker floats above everything else when open.
@@ -64,6 +63,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // the bindings are discoverable after tapping `space` (#160).
     if app.leader_active() {
         render_leader_popup(frame, frame.area(), app);
+    }
+    // The quit confirmation floats above everything else so a stray `q`/`Esc`
+    // asks before it exits the TUI (#167).
+    if app.quit_confirm() {
+        render_quit_confirm(frame, frame.area(), app);
     }
 }
 
@@ -119,12 +123,15 @@ fn pr_summary(prs: &[u64]) -> Option<String> {
 }
 
 /// Build the header line spans: issue count, the viewed issue, the loop state,
-/// and the model. When workers run a turning spinner, how many workers are
-/// running, and the work they are doing — the issues *and* any PRs being
-/// resolved, or "waiting for work" when idle — are shown so it is clear
-/// something is happening and on what (#115, #133, #134). Pure so the running
-/// branch — which otherwise needs live child processes — is
-/// unit-testable.
+/// and the model. Whenever work is in flight — local workers the TUI started, or
+/// issues/PRs an external loop is working (carrying the in-progress label) — a
+/// turning spinner, "loop: running", and the work being done (the issues *and*
+/// any PRs), or "waiting for work" when a local worker is idle, are shown so it
+/// is clear something is happening and on what. The worker count is shown only
+/// when the TUI started workers itself; when it is merely watching an external
+/// loop the count is omitted. "loop: off" shows only when nothing is running
+/// (#115, #133, #134, #157). Pure so the running branch — which otherwise needs
+/// live child processes — is unit-testable.
 // Combines the multi-worker header (#134) with the auto-merge (#135) and
 // quality-assurance (#162) indicators, which together push this one span past the
 // arg-count lint.
@@ -160,18 +167,21 @@ fn header_spans(
             Style::new().fg(Color::DarkGray),
         ));
     }
-    if workers > 0 {
+    let has_work = !working.is_empty() || !working_prs.is_empty();
+    if workers > 0 || has_work {
         spans.push(Span::styled(
             format!("  ·  {spinner} loop: running"),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(
-            format!(
-                "  ·  {workers} worker{}",
-                if workers == 1 { "" } else { "s" }
-            ),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
+        if workers > 0 {
+            spans.push(Span::styled(
+                format!(
+                    "  ·  {workers} worker{}",
+                    if workers == 1 { "" } else { "s" }
+                ),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        }
         let mut idle = true;
         if let Some(summary) = working_summary(working) {
             spans.push(Span::styled(
@@ -187,7 +197,10 @@ fn header_spans(
             ));
             idle = false;
         }
-        if idle {
+        // Only a local worker can sit idle waiting; when merely watching an
+        // external loop, the in-progress labels are the only signal, so an empty
+        // set means there is simply nothing to show, not an idle worker.
+        if idle && workers > 0 {
             spans.push(Span::styled(
                 "  ·  waiting for work",
                 Style::new().fg(Color::DarkGray),
@@ -251,19 +264,19 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, work
 
 /// Draw the body: the issue list, plus the output side panel when it is open
 /// and an issue is selected (#107).
-fn render_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, loop_running: bool) {
+fn render_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     if app.output_visible() && app.selected().is_some() {
         let [list_area, panel_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(area);
-        render_list(frame, list_area, app, loop_running);
+        render_list(frame, list_area, app);
         render_output_panel(frame, panel_area, app);
     } else {
-        render_list(frame, area, app, loop_running);
+        render_list(frame, area, app);
     }
 }
 
-fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, loop_running: bool) {
+fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let block = Block::default().borders(Borders::ALL).title(" Issues ");
 
     if app.issues.is_empty() {
@@ -283,7 +296,7 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App, lo
     let items: Vec<ListItem> = app
         .issues
         .iter()
-        .map(|issue| issue_item(issue, loop_running, spinner))
+        .map(|issue| issue_item(issue, spinner))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -547,6 +560,45 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
         Line::from(summary_line),
     ])
     .block(block)
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(body, popup);
+}
+
+/// Draw the quit confirmation popup: a centered prompt asking whether to exit
+/// the TUI, with a [`Clear`] underneath so the list does not show through
+/// (#167). The red border matches the close prompt, marking it a guarded exit.
+fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_popup(area, 50, 7);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Quit bot-loop? ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" y quit · n/Esc cancel ").centered())
+        .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    // Reassure the operator that quitting the TUI leaves the detached background
+    // loops running; only mention it when a loop is actually up (#167).
+    let note = if app.workers_running() > 0 {
+        "Background loops keep running."
+    } else {
+        "This closes the terminal UI."
+    };
+
+    let body = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Exit the TUI?",
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(note, Style::new().fg(Color::DarkGray))),
+    ])
+    .block(block)
+    .alignment(Alignment::Center)
     .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, popup);
@@ -1234,28 +1286,27 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     .split(vertical[1])[1]
 }
 
-/// The two-column gutter shown before an issue's number: a turning spinner
-/// while the loop actively works it, a static dot for an in-progress label
-/// with no running loop, or blanks so every row's number stays aligned (#115).
-fn progress_marker(in_progress: bool, loop_running: bool, spinner: &str) -> Span<'static> {
-    if !in_progress {
-        return Span::raw("  ");
-    }
-    if loop_running {
+/// The two-column gutter shown before an issue's number: a turning spinner while
+/// the issue is being worked (carries the in-progress label — whether by a local
+/// worker or an external loop), or blanks so every row's number stays aligned.
+/// Animating on the label alone means watching an external loop still shows
+/// motion on each line being worked (#115, #157).
+fn progress_marker(in_progress: bool, spinner: &str) -> Span<'static> {
+    if in_progress {
         Span::styled(
             format!("{spinner} "),
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled("● ", Style::new().fg(Color::DarkGray))
+        Span::raw("  ")
     }
 }
 
 /// Format a single issue as a list row: an in-progress marker, number, title,
 /// and labels.
-fn issue_item(issue: &Issue, loop_running: bool, spinner: &str) -> ListItem<'static> {
+fn issue_item(issue: &Issue, spinner: &str) -> ListItem<'static> {
     let mut spans = vec![
-        progress_marker(issue.is_in_progress(), loop_running, spinner),
+        progress_marker(issue.is_in_progress(), spinner),
         Span::styled(
             format!("#{:<5}", issue.number),
             Style::new().fg(Color::Yellow),
@@ -1618,6 +1669,20 @@ mod tests {
         assert!(buffer_text(&terminal).contains("No summary will be posted"));
     }
 
+    #[test]
+    fn renders_the_quit_confirmation_popup_when_open() {
+        let mut app = App::new(Vec::new());
+        app.request_quit();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Quit bot-loop?"));
+        assert!(text.contains("y quit"));
+        assert!(text.contains("cancel"));
+    }
+
     fn spans_text(spans: &[Span]) -> String {
         spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -1748,7 +1813,10 @@ mod tests {
     }
 
     #[test]
-    fn header_hides_loop_details_when_off() {
+    fn header_shows_external_work_without_a_local_worker() {
+        // No local workers, but issues/PRs carry the in-progress label because an
+        // external loop is working them — the header still animates and names the
+        // work so it is clear something is running, without a worker count (#157).
         let text = spans_text(&header_spans(
             3,
             Some(96),
@@ -1761,8 +1829,30 @@ mod tests {
             true,
             "⠋",
         ));
+        assert!(text.contains("⠋ loop: running"));
+        assert!(text.contains("working #96"));
+        assert!(text.contains("resolving PR #12"));
+        // Watching an external loop, the TUI started no workers of its own.
+        assert!(!text.contains("worker"));
+        assert!(!text.contains("waiting for work"));
+    }
+
+    #[test]
+    fn header_shows_loop_off_when_nothing_is_running() {
+        let text = spans_text(&header_spans(
+            3,
+            Some(96),
+            0,
+            &[],
+            &[],
+            "auto",
+            false,
+            true,
+            true,
+            "⠋",
+        ));
         assert!(text.contains("loop: off"));
-        assert!(!text.contains("working"));
+        assert!(!text.contains("loop: running"));
         assert!(!text.contains("worker"));
         assert!(!text.contains("resolving PR"));
         assert!(!text.contains("⠋"));
@@ -1860,9 +1950,10 @@ mod tests {
 
     #[test]
     fn progress_marker_reflects_state() {
-        assert_eq!(spans_text(&[progress_marker(false, true, "⠋")]), "  ");
-        assert_eq!(spans_text(&[progress_marker(true, true, "⠋")]), "⠋ ");
-        assert_eq!(spans_text(&[progress_marker(true, false, "⠋")]), "● ");
+        // Not in progress: blank gutter, kept two columns wide for alignment.
+        assert_eq!(spans_text(&[progress_marker(false, "⠋")]), "  ");
+        // In progress: a turning spinner, whoever is doing the work (#157).
+        assert_eq!(spans_text(&[progress_marker(true, "⠋")]), "⠋ ");
     }
 
     #[test]
@@ -1876,8 +1967,12 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
-        // The loop is off, so an in-progress issue shows the static dot marker.
-        assert!(buffer_text(&terminal).contains("●"));
+        // An in-progress issue animates with a turning spinner even when the TUI
+        // started no local worker, so watching an external loop shows motion on
+        // the line being worked (#157) — never the old static dot.
+        let text = buffer_text(&terminal);
+        assert!(SPINNER_FRAMES.iter().any(|frame| text.contains(frame)));
+        assert!(!text.contains("●"));
     }
 
     #[test]
