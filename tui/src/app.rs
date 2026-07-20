@@ -1,5 +1,6 @@
 //! Application state and list navigation for the issue TUI.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
@@ -180,6 +181,10 @@ pub struct App {
     /// The workers shown in the bots popup, refreshed from the runner so their
     /// live status (running/stopped/failed) tracks each background loop (#82).
     bots: Vec<WorkerView>,
+    /// Issue number -> the pid of the running worker (bot) currently working it,
+    /// read from the loop's per-worker state files, so the issues table can show
+    /// which bot is on each issue (#214). Refreshed each tick.
+    worker_issue_pids: HashMap<u64, u32>,
     /// Whether closing an issue posts an auto-generated summary comment on it
     /// (#161). Default on; toggled with `space s`, seeded from `SUMMARY_ON_CLOSE`.
     report_on_close: bool,
@@ -284,6 +289,7 @@ impl App {
             bots_open: false,
             bots_state: ListState::default(),
             bots: Vec::new(),
+            worker_issue_pids: HashMap::new(),
             report_on_close: default_report_on_close(std::env::var(SUMMARY_ON_CLOSE_ENV).ok()),
             summary_model: models::summary_model(),
             reporter: None,
@@ -1081,6 +1087,37 @@ impl App {
     /// Called each tick the popup is open and whenever a bot action runs.
     pub fn refresh_bots(&mut self) {
         self.bots = self.runner.views();
+    }
+
+    /// Refresh the map of issue number -> the pid of the running worker (bot)
+    /// working it, so the issues table can label each in-progress row with the
+    /// bot on it (#214). Reads the loop's per-worker state files, trusting only
+    /// pids of workers this TUI sees as running so a crashed worker's stale file
+    /// never mislabels an issue. Cheap enough to run every tick: a non-blocking
+    /// liveness poll plus a few small file reads.
+    pub fn refresh_worker_issue_pids(&mut self) {
+        let running: Vec<u32> = self
+            .runner
+            .views()
+            .into_iter()
+            .filter(|v| v.status == WorkerStatus::Running)
+            .map(|v| v.pid)
+            .collect();
+        self.worker_issue_pids =
+            runner::worker_issue_map(&runner::worker_state_dir(&self.repo_root), &running);
+    }
+
+    /// The pid of the running worker (bot) currently working `number`, or `None`
+    /// when no tracked worker is on it, for the issues table (#214).
+    pub fn issue_worker_pid(&self, number: u64) -> Option<u32> {
+        self.worker_issue_pids.get(&number).copied()
+    }
+
+    /// Seed the issue -> worker pid map directly, so a render test can exercise
+    /// the issue row's bot-pid label without spawning real workers (#214).
+    #[cfg(test)]
+    pub fn set_worker_issue_pids(&mut self, map: HashMap<u64, u32>) {
+        self.worker_issue_pids = map;
     }
 
     /// Whether the bots popup is open (#82).

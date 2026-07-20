@@ -183,6 +183,7 @@
 #   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
 #   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
 #   QUIET, USE_WORKTREES,
+#   VERBOSE,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
@@ -282,12 +283,22 @@ ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
 QUIET="${QUIET:-}"
+# Emit extra, loop-level narration (each pass's phases: sync, sweep, PR scans,
+# queue scan, claim, sleep) via vlog(), so the output shows what the loop itself
+# is doing and not only Copilot's transcript (#214). Off by default to keep the
+# log quiet; set VERBOSE=1 or pass --verbose/-v to turn it on.
+VERBOSE="${VERBOSE:-}"
 # When non-empty, log() also appends its line to this per-run log file, so the
 # loop's own narration (branch creation, "running copilot", PR push, ...) lands
 # in the same issue-<n>/pr-<n> log as Copilot's transcript. The TUI's per-issue
 # output panel reads that file, so it then shows the full run — matching what the
 # bash loop prints to the terminal instead of "just the copilot output" (#126).
 CURRENT_RUN_LOG=""
+# Why the loop is exiting, set by die() and the signal traps so the EXIT trap's
+# "shutting down" line can explain the cause instead of leaving the operator
+# guessing (#214). Empty means an unexplained exit (e.g. an unbound-variable
+# error under `set -u`), which cleanup() flags with the exit code.
+SHUTDOWN_REASON=""
 # Set SELF_UPDATE=0 to stop the loop pulling and restarting itself when this
 # script changes upstream. Left unset it is auto-enabled whenever the script is
 # a tracked file inside the repo it operates on.
@@ -384,7 +395,19 @@ log() {
   fi
 }
 
+# Verbose narration: like log(), but only emits when VERBOSE=1, and tags the line
+# so the extra loop-level detail is easy to spot (and filter). Lets the operator
+# opt into "more detail" about what the loop itself is doing without changing the
+# default output (#214).
+vlog() {
+  [ "${VERBOSE:-0}" = 1 ] || return 0
+  log "· $*"
+}
+
 die() {
+  # Record why the loop is exiting so the EXIT trap explains the shutdown
+  # instead of printing a bare "shutting down" (#214).
+  SHUTDOWN_REASON="fatal: $*"
   log "FATAL: $*"
   exit 1
 }
@@ -510,6 +533,10 @@ work:
                            only to the per-run log files (the original
                            behaviour). By default the loop streams Copilot's
                            output live to stdout as well as the log files.
+  -v, --verbose            Emit extra loop-level narration (each pass's phases:
+                           sync, sweep, PR scans, queue scan, claim, sleep) so
+                           the output shows what the loop itself is doing, not
+                           only Copilot's transcript. Default: off.
   --worktrees              Give every issue its own git worktree (never touch
                            the shared checkout). This is the default, so each
                            task always works in a different folder.
@@ -542,6 +569,7 @@ Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
   QUIET, USE_WORKTREES,
+  VERBOSE,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 EOF
 }
@@ -1070,6 +1098,7 @@ while [ $# -gt 0 ]; do
     --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
     --issues-dir=*)    ISSUES_DIR="${1#*=}" ;;
     --quiet)           QUIET=1 ;;
+    --verbose|-v)      VERBOSE=1 ;;
     --worktrees)       USE_WORKTREES=1 ;;
     --no-worktrees)    USE_WORKTREES=0 ;;
     --auto-merge)      AUTO_MERGE=1 ;;
@@ -1103,6 +1132,7 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
 PLAN_LABEL="${PLAN_LABEL:-plan}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 QUIET="${QUIET:-0}"
+VERBOSE="${VERBOSE:-0}"
 ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
 # Commit messages use a deterministic "Resolve #<n>: <title>" by default so the
 # loop spends Copilot only on implementing issues, not on writing commit
@@ -1194,6 +1224,27 @@ case "$MERGEABILITY_WAIT_SECONDS" in ''|*[!0-9]*) MERGEABILITY_WAIT_SECONDS=3 ;;
 
 WORK_DIR="$REPO_DIR/.copilot-loop"
 LOG_DIR="$WORK_DIR/logs"
+# Per-worker state the TUI reads to show which bot (its process id) is working
+# which issue in its issues table (#214). One file per loop process,
+# workers/worker-<pid>.issue, holds the issue number this process is currently
+# working, or is absent between issues. The pid matches what the TUI records for
+# the worker it spawned (this script's $$), so it can label the issue row.
+WORKER_STATE_DIR="$WORK_DIR/workers"
+
+# Record the issue this worker is currently working ($1 = issue number), so the
+# TUI can show this process's pid against that issue (#214). Best-effort: a write
+# failure never affects the run.
+set_worker_issue() {
+  local num="$1"
+  mkdir -p "$WORKER_STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "$num" >"$WORKER_STATE_DIR/worker-$$.issue" 2>/dev/null || true
+}
+
+# Drop this worker's issue assignment (between issues and on shutdown), so the
+# TUI stops attributing an issue to this pid (#214). Best-effort.
+clear_worker_issue() {
+  rm -f "${WORKER_STATE_DIR:-}/worker-$$.issue" 2>/dev/null || true
+}
 
 # --- Preflight ---------------------------------------------------------------
 for bin in git gh copilot; do
@@ -1279,11 +1330,21 @@ release_github_lock() {
 }
 
 cleanup() {
+  # Capture the exit status first: any command below (release_github_lock, the
+  # worker-state removal) would otherwise overwrite $? before we can report it.
+  local rc=$?
   release_github_lock
-  log "shutting down"
+  clear_worker_issue
+  if [ -n "${SHUTDOWN_REASON:-}" ]; then
+    log "shutting down: ${SHUTDOWN_REASON} (exit $rc)"
+  elif [ "$rc" -eq 0 ]; then
+    log "shutting down: loop exited normally (exit 0)"
+  else
+    log "shutting down: unexpected exit $rc — see the error above (often a failed git/gh command or a bug); re-run with --verbose for more detail"
+  fi
 }
 trap cleanup EXIT
-trap 'log "interrupted"; exit 130' INT TERM
+trap 'SHUTDOWN_REASON="interrupted by a signal (Ctrl-C or stop)"; log "interrupted"; exit 130' INT TERM
 
 ORIGIN_URL="$(git remote get-url origin 2>/dev/null)"
 # Host that owns this repo, used to pin repo-independent `gh` calls (below) to
@@ -1409,6 +1470,11 @@ if [ "$QUIET" = 1 ]; then
   log "copilot output: log files only (--quiet); stdout hidden"
 else
   log "copilot output: streamed to stdout and log files (pass --quiet to hide)"
+fi
+if [ "$VERBOSE" = 1 ]; then
+  log "verbosity: on (--verbose) — narrating each loop phase"
+else
+  log "verbosity: normal — pass --verbose for per-phase loop detail"
 fi
 if [ "$AUTO_MERGE" = 1 ]; then
   log "auto-merge: on (method=$MERGE_METHOD) — PRs merge without review"
@@ -1907,6 +1973,10 @@ process_issue() {
   # panel shows the branch creation and the rest of the loop's narration, not
   # just Copilot's transcript (#126). Cleared at the top of the main loop.
   CURRENT_RUN_LOG="$log_file"
+
+  # Publish which issue this worker (pid) is on so the TUI can show its pid on
+  # that issue's row (#214). Cleared at the top of the main loop.
+  set_worker_issue "$num"
 
   log "issue #$num on $REPO_SLUG: $title"
 
@@ -2605,6 +2675,10 @@ plan_issue() {
   branch="${BRANCH_PREFIX}${num}-${slug}"
   log_file="$LOG_DIR/issue-${num}-plan-$(date '+%Y%m%d-%H%M%S').log"
   CURRENT_RUN_LOG="$log_file"
+
+  # Publish which issue this worker (pid) is on so the TUI can show its pid on
+  # that issue's row while it drafts the plan (#214).
+  set_worker_issue "$num"
 
   log "issue #$num on $REPO_SLUG: planning: $title"
 
@@ -3529,19 +3603,31 @@ while true; do
   # (#126). process_issue / resolve_pr_* re-arm it once they know their log file.
   CURRENT_RUN_LOG=""
 
+  # Between issues this worker is not on any issue, so drop its TUI assignment;
+  # process_issue / plan_issue re-set it once they claim one (#214).
+  clear_worker_issue
+
+  # Narrate the start of each pass when running verbose, so the log shows the
+  # loop is alive and cycling even when there is nothing to do (#214).
+  vlog "loop: starting pass (checking for work)"
+
   # Keep the loop current before starting any new work: pull the default branch
   # and re-exec if this script changed upstream.
+  vlog "loop: checking for a script self-update"
   self_update
 
   # Sync the local default branch with the remote so new work starts from the
   # latest baseline; a diverged merge conflict is handed to Copilot to resolve.
+  vlog "loop: syncing local $DEFAULT_BRANCH with origin"
   sync_default_branch
 
+  vlog "loop: turning issues/ markdown files into GitHub issues"
   process_issue_files
 
   # Reclaim disk and keep git tidy: sweep branches and worktrees whose PR has
   # merged (local and, when enabled, remote). Safe — only the loop's own merged
   # branches are removed, never the default branch or un-pushed work.
+  vlog "loop: sweeping merged branches and worktrees"
   sweep_merged_branches
 
   # Before starting any new task, make sure no open PR is left with merge
@@ -3550,6 +3636,7 @@ while true; do
   # First let GitHub finish computing PR mergeability so this check sees accurate
   # state instead of skipping a still-UNKNOWN PR (which would let the loop start a
   # ready issue with a conflict still open).
+  vlog "loop: scanning open PRs for merge conflicts"
   ensure_pr_mergeability_known
   conflicted_pr="$(claim_next_conflicted_pr || true)"
   if [ -n "$conflicted_pr" ]; then
@@ -3562,6 +3649,7 @@ while true; do
   # Claim one atomically (under the lock, so instances never fix the same PR) and
   # hand its failing checks to Copilot, then re-check on the next pass. Conflicts
   # are handled first above, so a conflicting PR is never grabbed here.
+  vlog "loop: scanning open PRs for failing checks"
   failing_pr="$(claim_next_failing_pr || true)"
   if [ -n "$failing_pr" ]; then
     log "PR #$failing_pr has failing checks, fixing before starting new tasks"
@@ -3572,10 +3660,12 @@ while true; do
   # Keep the "pending" label in sync with each open issue's dependency state
   # before picking work, so an issue waiting on another ("Wait for: #N") is
   # visibly marked and one whose blockers have closed is unmarked.
+  vlog "loop: reconciling '$PENDING_LABEL' labels against dependencies"
   reconcile_pending_labels
 
   # Prefer resuming an issue where the user has answered a pending question.
   # Atomically select and claim to prevent race conditions with other instances.
+  vlog "loop: checking for answered '$NEEDS_INFO_LABEL' issues to resume"
   next_issue="$(claim_next_reply_issue || true)"
   if [ -n "$next_issue" ]; then
     log "issue #$next_issue: user replied, resuming"
@@ -3601,6 +3691,7 @@ while true; do
 
   # Pick the oldest ready issue and claim it atomically.
   # This prevents multiple instances from selecting the same issue.
+  vlog "loop: claiming the oldest '$TRIGGER_LABEL' issue"
   next_issue="$(claim_next_ready_issue || true)"
 
   if [ -z "$next_issue" ]; then
@@ -3612,6 +3703,7 @@ while true; do
     if ! interruptible_sleep "$((SLEEP_MINUTES * 60))"; then
       log "'f' pressed; waking to look for work"
     fi
+    vlog "loop: woke from sleep; starting the next pass"
     continue
   fi
 

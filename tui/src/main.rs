@@ -104,6 +104,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         // summary (or a failure) surfaces without blocking on the model (#161).
         app.poll_report_results();
 
+        // Keep the issue table's bot-pid labels current: which running worker is
+        // on which issue, read from the loop's per-worker state files (#214).
+        app.refresh_worker_issue_pids();
+
         // Keep the bots popup's worker statuses live while it is open (#82).
         if app.bots_open() {
             app.refresh_bots();
