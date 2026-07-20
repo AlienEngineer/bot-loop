@@ -472,7 +472,7 @@ work:
                            read-only pass writes a short AGENTS.md and opens it as
                            a PR before issues run. Runs once so it defaults to a
                            capable mid model; "off" disables it
-                                                              (default: claude-sonnet)
+                                                          (default: claude-sonnet-4.5)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
   --quiet                  Do not stream Copilot's output to stdout; write it
                            only to the per-run log files (the original
@@ -927,7 +927,7 @@ fi
 # per repo and every later run benefits from a good AGENTS.md, so this is not the
 # place to save on model quality. "off"/"none"/"0" (and other disable spellings)
 # turn the bootstrap off; any other value is used verbatim as the --model.
-AGENTS_MODEL="${AGENTS_MODEL:-claude-sonnet}"
+AGENTS_MODEL="${AGENTS_MODEL:-claude-sonnet-4.5}"
 case "$AGENTS_MODEL" in off|none|no|0|false) AGENTS_MODEL="" ;; esac
 
 # Auto-merge each PR instead of leaving it for review. Normalise the various
@@ -2043,6 +2043,22 @@ EOF
   local copilot_rc=$COPILOT_RC
   cd "$REPO_DIR" 2>/dev/null || true
   log "AGENTS.md: copilot exited with code $copilot_rc"
+
+  # A pinned model the CLI doesn't recognise (a typo, or one since retired) makes
+  # copilot exit at once without writing anything, which would otherwise skip the
+  # bootstrap silently on every pass. Retry once letting Copilot pick a model, so
+  # a bad --agents-model degrades to "auto" instead of disabling the bootstrap.
+  if [ "$copilot_rc" -ne 0 ] && [ "$AGENTS_MODEL" != "auto" ] \
+     && grep -q 'from --model flag is not available' "$log_file" 2>/dev/null; then
+    log "AGENTS.md: model '$AGENTS_MODEL' is not available; retrying with --model auto"
+    copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none --model auto)
+    if cd "$WORKSPACE_DIR" 2>/dev/null; then
+      run_copilot "$log_file" "${copilot_args[@]}"
+      copilot_rc=$COPILOT_RC
+      cd "$REPO_DIR" 2>/dev/null || true
+      log "AGENTS.md: copilot (--model auto) exited with code $copilot_rc"
+    fi
+  fi
 
   # A timed-out run (COPILOT_TIMEOUT exceeded) or one that produced no AGENTS.md
   # is not a failure of the loop — just skip so issue work is never blocked.

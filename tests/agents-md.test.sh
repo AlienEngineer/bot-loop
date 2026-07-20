@@ -82,10 +82,25 @@ log() { :; }
 # shellcheck disable=SC2329
 run_copilot() {
   printf 'call\n' >>"$CALLS"
-  if [ "$COPILOT_MODE" = "write" ]; then
-    printf '# %s\n\nConcise repo context.\n' "$(basename "$WORKSPACE_DIR")" >"$WORKSPACE_DIR/AGENTS.md"
-  fi
-  COPILOT_RC=0
+  local log_file="$1"
+  case "$COPILOT_MODE" in
+    write)
+      printf '# %s\n\nConcise repo context.\n' "$(basename "$WORKSPACE_DIR")" >"$WORKSPACE_DIR/AGENTS.md"
+      COPILOT_RC=0 ;;
+    empty)
+      COPILOT_RC=0 ;;
+    unavailable)
+      # Mimic the CLI rejecting a pinned --model, then succeeding once the
+      # bootstrap retries with --model auto.
+      case " $* " in
+        *" --model auto "*)
+          printf '# %s\n\nConcise repo context.\n' "$(basename "$WORKSPACE_DIR")" >"$WORKSPACE_DIR/AGENTS.md"
+          COPILOT_RC=0 ;;
+        *)
+          printf 'Error: Model "%s" from --model flag is not available.\n' "$AGENTS_MODEL" >>"$log_file"
+          COPILOT_RC=1 ;;
+      esac ;;
+  esac
 }
 
 # Record gh calls; hand back a fake PR URL for `gh pr create` so the success path
@@ -193,6 +208,17 @@ assert_eq "empty gen: copilot run once"               "$(copilot_calls)" "1"
 assert_eq "empty gen: no PR opened"                   "$(pr_creates)" "0"
 assert_eq "empty gen: no bootstrap branch on origin"  "$(origin_branch "$BOOT_BRANCH")" "no"
 assert_eq "empty gen: working tree clean"             "$(git -C "$clone" status --porcelain | wc -l | tr -d ' ')" "0"
+
+# --- resilient: pinned model unavailable -> retry with auto, then open PR ----
+setup_repo
+COPILOT_MODE="unavailable"
+generate_agents_md; rc=$?
+COPILOT_MODE="write"
+assert_eq "bad model: returns success"                "$rc" "0"
+assert_eq "bad model: copilot run twice (pinned + auto)" "$(copilot_calls)" "2"
+assert_eq "bad model: AGENTS.md committed to the branch" \
+  "$(origin_file "$BOOT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "1"
+assert_eq "bad model: a PR was opened"                "$(pr_creates)" "1"
 
 # --- idempotent: bootstrap branch already on origin (PR open) -> skip --------
 setup_repo
