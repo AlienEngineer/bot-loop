@@ -423,10 +423,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::DarkGray),
         ));
     } else {
-        // Actions stay hidden until `space` opens the menu; only navigation and
-        // the leader hint show here (#129).
+        // Actions stay hidden until `space` opens the menu; only navigation, the
+        // global refresh, and the leader hint show here (#129, #174).
         spans.push(Span::styled(
-            "j/k move · g/G top/bottom · space actions · q quit",
+            "j/k move · g/G top/bottom · f refresh · space actions · q quit",
             Style::new().fg(Color::DarkGray),
         ));
     }
@@ -461,7 +461,6 @@ fn leader_actions(app: &App) -> Vec<(&'static str, &'static str)> {
         ("p", "pr-output"),
         ("t", "closed"),
         ("$", "cost"),
-        ("f", "refresh"),
         ("Esc", "cancel"),
     ]
 }
@@ -1616,8 +1615,10 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         let text = buffer_text(&terminal);
-        // Only the leader hint shows; the issue actions stay hidden (#129).
+        // Only navigation, the global refresh, and the leader hint show; the
+        // issue actions stay hidden (#129, #174).
         assert!(text.contains("space actions"));
+        assert!(text.contains("f refresh"));
         assert!(!text.contains("c new"));
         assert!(!text.contains("m models"));
         assert!(!text.contains("ACTIONS"));
@@ -1642,7 +1643,8 @@ mod tests {
         assert!(text.contains("m models"));
         assert!(text.contains("add-worker"));
         assert!(text.contains("s summary"));
-        assert!(text.contains("f refresh"));
+        // Refresh left the issue menu — it is a global key now (#174).
+        assert!(!text.contains("f refresh"));
         // The footer still flags the open menu and how to leave it.
         assert!(text.contains("ACTIONS"));
         assert!(text.contains("esc cancel"));
@@ -1657,11 +1659,12 @@ mod tests {
         let app = App::new(plain);
         let keys: Vec<&str> = leader_actions(&app).iter().map(|(k, _)| *k).collect();
         // Every leader binding is present, matching handle_leader_key (#160).
+        // Refresh is not here — it moved to the global keymap (#174).
         assert_eq!(
             keys,
             vec![
                 "c", "r", "x", "d", "i", "l", "L", "b", "M", "a", "q", "s", "m", "o", "p", "t",
-                "$", "f", "Esc"
+                "$", "Esc"
             ]
         );
         // An unlabelled selection is offered *ready*…
@@ -1719,8 +1722,8 @@ mod tests {
         // The refreshing indicator now lives on the message line, while the leader
         // badge stays on the keybinds line below it (#182)…
         assert!(text.contains("ACTIONS"));
-        // …and the bindings live in the popup above them both (#160).
-        assert!(text.contains("f refresh"));
+        // …and the issue bindings live in the popup above them both (#160).
+        assert!(text.contains("c new"));
     }
 
     #[test]

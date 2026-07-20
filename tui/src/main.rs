@@ -248,6 +248,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
         KeyCode::Char('g') | KeyCode::Home => app.first(),
         KeyCode::Char('G') | KeyCode::End => app.last(),
+        // Refresh is global — it reloads the whole list, not the selected issue,
+        // so it sits on the base keymap instead of the `space` menu (#174).
+        KeyCode::Char('f') => app.refresh(),
         KeyCode::Char(' ') => app.enter_leader(),
         _ => {}
     }
@@ -255,8 +258,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 /// Handle the key pressed after the `space` leader: run the matching issue
 /// action and close the menu; any unbound key (e.g. `Esc`) just cancels it.
-/// Reusing the leader namespace lets `r` mean *ready* while refresh moves to
-/// `f` (#129).
+/// Refresh is not an issue action, so it lives on the base keymap (`f`) rather
+/// than here (#174); `r` stays free for *ready* (#129).
 fn handle_leader_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('c') => app.open_create(),
@@ -276,7 +279,6 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') => app.open_pr_output(),
         KeyCode::Char('t') => app.open_closed(),
         KeyCode::Char('$') => app.open_cost(),
-        KeyCode::Char('f') => app.refresh(),
         _ => {}
     }
     app.exit_leader();
@@ -570,6 +572,34 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.leader_active());
         assert!(!app.is_creating());
+    }
+
+    #[test]
+    fn f_refreshes_from_the_base_keymap_without_the_leader() {
+        // Refresh is global now (#174): pressing `f` on the list — no `space`
+        // first — kicks off a refresh, shown by the in-flight "Refreshing…"
+        // state. Attaching a fetcher takes the off-thread path so the flag flips
+        // without a blocking `gh` fetch on the test thread.
+        use crate::worker::IssueFetcher;
+        let mut app = App::new(Vec::new());
+        app.set_fetcher(IssueFetcher::spawn(1));
+        assert!(!app.is_refreshing());
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.is_refreshing());
+        assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn f_is_no_longer_an_issue_action_behind_the_leader() {
+        // Refresh left the issue-action menu (#174): `space` then `f` no longer
+        // refreshes — `f` is unbound in the leader, so it just cancels the menu.
+        use crate::worker::IssueFetcher;
+        let mut app = App::new(Vec::new());
+        app.set_fetcher(IssueFetcher::spawn(1));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!app.is_refreshing());
+        assert!(!app.leader_active());
     }
 
     #[test]

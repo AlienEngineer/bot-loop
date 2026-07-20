@@ -183,7 +183,8 @@ cd tui
 cargo run
 ```
 
-Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit — which asks
+Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `f` refresh the list, `q` (or
+`Esc`) quit — which asks
 for confirmation first (`y` quits, `n`/`Esc` cancels) so a stray key does not drop
 you out of the TUI (#167). Press
 `space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
@@ -196,7 +197,7 @@ stopped/failed worker in place, or all with `R`), `M` show the messages popup (a
 log of the latest feedback), `a` toggle
 auto-merge, `q` toggle quality assurance, `s` toggle the closing summary, `m` pick
 the model, `o` show/hide the output panel, `p` show the resolving-PRs popup, `t`
-show closed issues and their cost, `$` open the cost dashboard, `f` refresh, `Esc`
+show closed issues and their cost, `$` open the cost dashboard, `Esc`
 cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels. In the reply popup: `↑`/`↓`
