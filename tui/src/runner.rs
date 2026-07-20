@@ -322,6 +322,27 @@ impl LoopRunner {
         Ok(worker.pid)
     }
 
+    /// Stop the running worker in slot `id` (TERM its process group, escalating
+    /// to KILL after a grace period that matches [`stop_all`](Self::stop_all)), so
+    /// the user can end one worker from the bots popup without touching the others
+    /// (#210). The stopped worker is kept (marked "stopped") so it can be
+    /// restarted in place. Errors when no such slot exists; a no-op when it has
+    /// already exited.
+    pub fn stop(&mut self, id: usize) -> Result<()> {
+        let worker = self
+            .workers
+            .iter_mut()
+            .find(|w| w.id == id)
+            .with_context(|| format!("no bot #{id} to stop"))?;
+        worker.poll();
+        if let Some(mut child) = worker.child.take() {
+            terminate(&mut child);
+            worker.exit = child.wait().ok();
+            worker.stopped_by_user = true;
+        }
+        Ok(())
+    }
+
     /// Stop every running worker (TERM each process group, escalating to KILL
     /// after a grace period that matches the bash TUI's `stop_bot`). Stopped
     /// workers are kept (marked "stopped") so they can be restarted in place
@@ -674,6 +695,53 @@ mod tests {
         assert_eq!(views.len(), 2);
         assert!(views.iter().all(|v| v.status == WorkerStatus::Stopped));
 
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&log1);
+        let _ = fs::remove_file(&log2);
+    }
+
+    #[test]
+    fn stopping_an_unknown_slot_errors() {
+        let mut runner = LoopRunner::new();
+        let err = runner.stop(99).unwrap_err();
+        assert!(err.to_string().contains("no bot #99"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_ends_only_the_named_worker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Two sleeping stand-ins, so stopping one must leave the other running.
+        let mut script = std::env::temp_dir();
+        script.push(format!("copilot-loop-stopone-{}.sh", std::process::id()));
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = std::env::temp_dir();
+        let log1 = dir.join(format!(
+            "copilot-loop-stopone-w1-{}.log",
+            std::process::id()
+        ));
+        let log2 = dir.join(format!(
+            "copilot-loop-stopone-w2-{}.log",
+            std::process::id()
+        ));
+
+        let mut runner = LoopRunner::new();
+        start_worker(&mut runner, 1, &script, &dir, &log1);
+        start_worker(&mut runner, 2, &script, &dir, &log2);
+        assert_eq!(runner.running_count(), 2);
+
+        // Stop only slot 1: it reads as "stopped" while slot 2 keeps running (#210).
+        runner.stop(1).expect("stop worker 1");
+        let views = runner.views();
+        let status_of = |id: usize| views.iter().find(|v| v.id == id).unwrap().status;
+        assert_eq!(status_of(1), WorkerStatus::Stopped);
+        assert_eq!(status_of(2), WorkerStatus::Running);
+        assert_eq!(runner.running_count(), 1);
+
+        runner.stop_all();
         let _ = fs::remove_file(&script);
         let _ = fs::remove_file(&log1);
         let _ = fs::remove_file(&log2);

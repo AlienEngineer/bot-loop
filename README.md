@@ -176,9 +176,12 @@ stopped or failed worker in place — re-spawned with the same options it was
 launched with (repo dir and forwarded loop flags such as `--model` and
 `--auto-merge`) and reusing its slot, so its previous capture log is archived to
 `.copilot-loop/tui/loop-<n>.log.<k>` rather than overwritten — or `R` to restart
-every stopped or failed worker at once. Running workers are left untouched, and
-`Esc` (or `b`/`q`) closes the popup. This turns a transient failure into a one-key
-restart instead of losing the worker's slot and context (#82).
+every stopped or failed worker at once. Press `s` to stop the selected running
+worker without touching the others; it is kept in the list (marked `stopped`) so
+it can be restarted in place (#210). Running workers are otherwise left
+untouched, and `Esc` (or `b`/`q`) closes the popup. This turns a transient
+failure into a one-key restart instead of losing the worker's slot and context
+(#82).
 
 Feedback messages appear on their own line just above the keybinds, so a status
 never crowds the bindings. Press `space` then `M` to open the messages popup: a
@@ -202,7 +205,8 @@ selected issue (confirm with `y`), `d` view the selected issue's details and
 comments, `i` reply to a Copilot question (`needs-info` issues), `e` add/remove a
 label on the selected issue, `l` add a
 background worker, `L` stop all workers, `b` bots (restart a
-stopped/failed worker in place, or all with `R`), `M` show the messages popup (a
+stopped/failed worker in place, or all with `R`; `s` stops a running one),
+`M` show the messages popup (a
 log of the latest feedback), `a` toggle
 auto-merge, `q` toggle quality assurance, `s` toggle the closing summary, `m` pick
 the model, `o` show/hide the output panel, `p` show the resolving-PRs popup, `t`

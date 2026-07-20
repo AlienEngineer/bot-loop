@@ -1388,8 +1388,8 @@ fn render_label_editor(frame: &mut Frame, area: Rect, app: &mut App) {
 /// Draw the bots popup: a centered, navigable list of every background worker
 /// the session has started — running, stopped, or failed — so a stopped or
 /// failed one can be restarted in place with the same options it was launched
-/// with (#82). A [`Clear`] underneath wipes the cells so the list behind it does
-/// not show through.
+/// with (#82), and a running one can be stopped from here (#210). A [`Clear`]
+/// underneath wipes the cells so the list behind it does not show through.
 fn render_bots(frame: &mut Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(70, 70, area);
     frame.render_widget(Clear, popup);
@@ -1409,7 +1409,9 @@ fn render_bots(frame: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .title(title)
         .title_alignment(Alignment::Center)
-        .title_bottom(Line::from(" j/k move · r restart · R restart all · Esc close ").centered())
+        .title_bottom(
+            Line::from(" j/k move · r restart · R restart all · s stop · Esc close ").centered(),
+        )
         .border_style(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
         .style(Style::new().bg(Color::Black));
 
@@ -2906,6 +2908,8 @@ mod tests {
         assert!(text.contains("pid 4242"));
         // A stopped/failed worker shows no live pid and defaults to the auto model.
         assert!(text.contains("model auto"));
+        // The footer advertises the stop action so the user can end a bot (#210).
+        assert!(text.contains("s stop"));
     }
 
     #[test]
