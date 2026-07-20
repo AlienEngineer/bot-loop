@@ -224,6 +224,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The label editor captures keys while it is open so typing goes to the label
+    // name rather than the list (#204).
+    if app.label_editor_open() {
+        handle_label_editor_key(app, key);
+        return;
+    }
+
     // The messages popup captures keys while it is open (#182).
     if app.messages_open() {
         handle_messages_key(app, key);
@@ -267,6 +274,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') => app.request_close(),
         KeyCode::Char('d') => app.open_details(),
         KeyCode::Char('i') => app.open_reply(),
+        KeyCode::Char('e') => app.open_label_editor(),
         KeyCode::Char('l') => app.start_worker(),
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('b') => app.open_bots(),
@@ -441,6 +449,26 @@ fn handle_reply_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Handle a key while the label editor is open: type the label name, Backspace
+/// to delete, Enter to add it when absent (or remove it when present), Esc to
+/// close (#204).
+fn handle_label_editor_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.close_label_editor(),
+        KeyCode::Backspace => app.label_editor_backspace(),
+        KeyCode::Enter => app.submit_label_editor(),
+        // Ignore control/alt combos so shortcuts don't leak into the name.
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.label_editor_input(c)
+        }
+        _ => {}
+    }
+}
+
 /// Handle a key while the new-issue form is open: type into the focused field,
 /// Tab to switch fields, Ctrl+S to create, Esc to cancel.
 fn handle_create_key(app: &mut App, key: KeyEvent) {
@@ -563,6 +591,35 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         assert!(app.selected_is_ready());
         assert!(!app.leader_active());
+    }
+
+    #[test]
+    fn leader_e_opens_the_label_editor_and_closes_the_menu() {
+        let issues = parse_issues(r#"[{"number":7,"title":"t","labels":[]}]"#).unwrap();
+        let mut app = App::new(issues);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.label_editor_open());
+        assert!(!app.leader_active());
+        // A key inside the popup is captured by it, not the list: Esc closes it.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.label_editor_open());
+    }
+
+    #[test]
+    fn typing_a_label_then_enter_adds_it_from_the_editor() {
+        let issues = parse_issues(r#"[{"number":7,"title":"t","labels":[]}]"#).unwrap();
+        let mut app = App::new(issues);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('e'));
+        for c in "bug".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        // The label lands on the issue and the popup stays open with a blank field.
+        assert!(app.issues[0].has_label("bug"));
+        assert!(app.label_editor_open());
+        assert!(app.label_editor_text().is_empty());
     }
 
     #[test]

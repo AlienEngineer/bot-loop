@@ -161,6 +161,14 @@ issue comment, and `Esc` cancels. A running loop then resumes the issue on its
 next pass — it picks a `needs-info` issue back up once the latest comment is not
 its own — so the reply alone unblocks it and no label needs changing by hand.
 
+Press `space` then `e` to add or remove a label on the selected issue (#204). The
+popup lists the issue's current labels above a text field: type a label name and
+`Enter` adds it when the issue lacks it, or removes it when it already carries it.
+The field clears but the popup stays open so several labels can be set in a row,
+and `Esc` closes it. The change is applied with `gh` and reflected in the list
+right away. Unlike `space r` (which only toggles the trigger label), this sets any
+label — a missing label is created first, matching how the loop ensures its own.
+
 Press `space` then `b` to open the bots popup: a list of every worker the session has
 started, each showing its slot, status (`running`, `stopped`, or `failed`), and
 model. Navigate with `j`/`k`; press `r` (or `Enter`) to restart the selected
@@ -191,7 +199,8 @@ you out of the TUI (#167). Press
 the ready label (mark ready, or remove it if already ready; marking an
 `in-progress` issue ready confirms first), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
-comments, `i` reply to a Copilot question (`needs-info` issues), `l` add a
+comments, `i` reply to a Copilot question (`needs-info` issues), `e` add/remove a
+label on the selected issue, `l` add a
 background worker, `L` stop all workers, `b` bots (restart a
 stopped/failed worker in place, or all with `R`), `M` show the messages popup (a
 log of the latest feedback), `a` toggle

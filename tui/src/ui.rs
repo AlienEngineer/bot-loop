@@ -70,6 +70,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.reply_open() {
         render_reply(frame, frame.area(), app);
     }
+    // The label editor popup floats on top of everything else when open (#204).
+    if app.label_editor_open() {
+        render_label_editor(frame, frame.area(), app);
+    }
     // The messages popup floats on top of everything else when open (#182).
     if app.messages_open() {
         render_messages(frame, frame.area(), app);
@@ -449,6 +453,7 @@ fn leader_actions(app: &App) -> Vec<(&'static str, &'static str)> {
         ("x", "close"),
         ("d", "details"),
         ("i", "reply"),
+        ("e", "labels"),
         ("l", "add-worker"),
         ("L", "stop-all"),
         ("b", "bots"),
@@ -1242,6 +1247,62 @@ fn render_reply(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// Draw the label editor popup: the issue's current labels above a field for a
+/// label name, which Enter adds when the issue lacks it or removes when it
+/// already carries it (#204). A [`Clear`] underneath wipes the cells so the list
+/// behind it does not show through.
+fn render_label_editor(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(60, 40, area);
+    frame.render_widget(Clear, popup);
+
+    let number = app.label_editor_issue().unwrap_or(0);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Labels · #{number} "))
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" type label · Enter add/remove · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let [labels_area, field_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(inner);
+
+    let names = app.label_editor_labels();
+    let current = if names.is_empty() {
+        Line::from(Span::styled(
+            "(no labels)",
+            Style::new().fg(Color::DarkGray),
+        ))
+    } else {
+        let mut spans: Vec<Span> = Vec::new();
+        for name in &names {
+            spans.push(Span::styled(
+                format!(" {name} "),
+                Style::new().fg(Color::Black).bg(Color::Cyan),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        Line::from(spans)
+    };
+    let labels = Paragraph::new(current)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Current ")
+                .border_style(Style::new().fg(Color::Magenta)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(labels, labels_area);
+
+    // The name field is always the focused surface here, so it shows a cursor.
+    frame.render_widget(
+        field_widget("Label", app.label_editor_text(), true),
+        field_area,
+    );
+}
+
 /// Draw the bots popup: a centered, navigable list of every background worker
 /// the session has started — running, stopped, or failed — so a stopped or
 /// failed one can be restarted in place with the same options it was launched
@@ -1663,8 +1724,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "c", "r", "x", "d", "i", "l", "L", "b", "M", "a", "q", "s", "m", "o", "p", "t",
-                "$", "Esc"
+                "c", "r", "x", "d", "i", "e", "l", "L", "b", "M", "a", "q", "s", "m", "o", "p",
+                "t", "$", "Esc"
             ]
         );
         // An unlabelled selection is offered *ready*…
@@ -2605,6 +2666,35 @@ mod tests {
         assert!(text.contains("use"));
         // The send/cancel hint is offered on the border.
         assert!(text.contains("Ctrl+S send"));
+    }
+
+    #[test]
+    fn renders_the_label_editor_with_current_labels_and_typed_name() {
+        let issues = crate::github::parse_issues(
+            r#"[{"number":204,"title":"t","labels":[{"name":"bug"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        app.open_label_editor();
+        app.label_editor_input('r');
+        app.label_editor_input('e');
+        app.label_editor_input('a');
+        app.label_editor_input('d');
+        app.label_editor_input('y');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Labels"));
+        assert!(text.contains("#204"));
+        // The issue's existing labels are shown so the user knows what to remove.
+        assert!(text.contains("Current"));
+        assert!(text.contains("bug"));
+        // The typed label name shows in the field.
+        assert!(text.contains("ready"));
+        // The add/remove hint is offered on the border.
+        assert!(text.contains("Enter add/remove"));
     }
 
     #[test]
