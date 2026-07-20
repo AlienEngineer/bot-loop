@@ -128,7 +128,7 @@ jobs:
 
       - name: Repoint the Homebrew formula and mirror it to the tap
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
           URL: ${{ steps.build.outputs.url }}
           SHA256: ${{ steps.build.outputs.sha256 }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -147,14 +147,21 @@ jobs:
           fi
 
           # Mirror the formula to the tap `brew tap alienengineer/bot-loop` uses.
-          # Needs a HOMEBREW_TAP_TOKEN secret with write access to the tap repo;
-          # until that secret and the tap repo exist, the release and in-repo
-          # formula are already correct, so skip the mirror instead of failing.
-          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set; skipping tap mirror."
+          # Auth is a dedicated write deploy key (HOMEBREW_TAP_SSH_KEY) scoped to
+          # the tap repo alone, so it cannot touch any other repo. When the key is
+          # absent the release and in-repo formula are already correct, so skip
+          # the mirror instead of failing.
+          if [ -z "${HOMEBREW_TAP_SSH_KEY}" ]; then
+            echo "HOMEBREW_TAP_SSH_KEY not set; skipping tap mirror."
             exit 0
           fi
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/AlienEngineer/homebrew-bot-loop.git" tap
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "${HOMEBREW_TAP_SSH_KEY}" > "$HOME/.ssh/tap_key"
+          chmod 600 "$HOME/.ssh/tap_key"
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/tap_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          git clone git@github.com:AlienEngineer/homebrew-bot-loop.git tap
           mkdir -p tap/Formula
           cp Formula/bot-loop.rb tap/Formula/bot-loop.rb
           git -C tap config user.name "github-actions[bot]"
