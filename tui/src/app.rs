@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
 
+use crate::cost::{self, MonthlyCost, YearMonth};
 use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
 use crate::models;
@@ -179,6 +180,11 @@ pub struct App {
     /// How many close summaries are in flight, so the footer can show a
     /// "Summarizing…" indicator until they land (#161).
     reporting: usize,
+    /// Whether the cost dashboard popup is open (#163).
+    cost_open: bool,
+    /// Issues (open and closed) fetched with their comments so the dashboard can
+    /// total and graph the loop's spend by day. Loaded when the popup opens (#163).
+    cost_issues: Vec<Issue>,
 }
 
 impl App {
@@ -232,6 +238,8 @@ impl App {
             summary_model: models::summary_model(),
             reporter: None,
             reporting: 0,
+            cost_open: false,
+            cost_issues: Vec::new(),
         }
     }
 
@@ -1194,6 +1202,48 @@ impl App {
         self.closed_state.select(Some(prev));
     }
 
+    /// Whether the cost dashboard popup is open (#163).
+    pub fn cost_open(&self) -> bool {
+        self.cost_open
+    }
+
+    /// Open the cost dashboard, fetching every issue (open and closed) with its
+    /// comments so the loop's spend can be totalled and graphed by day (#163).
+    ///
+    /// The fetch is synchronous, matching the other `gh`-backed popups. On
+    /// failure the dashboard still opens (showing an empty month) with the error
+    /// on the status line, so the key never feels dead.
+    pub fn open_cost(&mut self) {
+        match github::fetch_cost_issues(self.limit) {
+            Ok(issues) => {
+                self.cost_issues = issues;
+                self.status = None;
+            }
+            Err(err) => {
+                self.cost_issues = Vec::new();
+                self.status = Some(format!("Error: {err}"));
+            }
+        }
+        self.cost_open = true;
+    }
+
+    /// Close the cost dashboard popup (#163).
+    pub fn close_cost(&mut self) {
+        self.cost_open = false;
+    }
+
+    /// The current month's spend, aggregated from the loaded issues (#163). Reads
+    /// the clock for "this month"; see [`App::monthly_cost_for`] to pin the month.
+    pub fn monthly_cost(&self) -> MonthlyCost {
+        self.monthly_cost_for(cost::current_month())
+    }
+
+    /// The spend for a specific month, aggregated from the loaded issues (#163).
+    /// Split out so tests can pin the month regardless of the wall clock.
+    pub fn monthly_cost_for(&self, month: YearMonth) -> MonthlyCost {
+        cost::monthly_cost(self.cost_issues.iter(), month)
+    }
+
     /// Whether the issue-details popup is open (#152).
     pub fn details_open(&self) -> bool {
         self.details_open
@@ -1425,6 +1475,15 @@ impl App {
     pub fn open_closed_with(&mut self, issues: Vec<Issue>) {
         self.closed_issues = issues;
         self.present_closed();
+    }
+
+    /// Seed the cost dashboard with issues and open it (tests only), standing in
+    /// for the `gh` fetch in [`open_cost`] so the aggregation and rendering are
+    /// testable without a live fetch (#163).
+    #[cfg(test)]
+    pub fn open_cost_with(&mut self, issues: Vec<Issue>) {
+        self.cost_issues = issues;
+        self.cost_open = true;
     }
 
     /// Seed the details popup with an issue and open it (tests only), standing in

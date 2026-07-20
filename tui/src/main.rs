@@ -4,6 +4,7 @@
 //! with the `gh` CLI and show them in a scrollable, vim-navigable list.
 
 mod app;
+mod cost;
 mod github;
 mod logs;
 mod models;
@@ -168,6 +169,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The cost dashboard popup captures keys while it is open (#163).
+    if app.cost_open() {
+        handle_cost_key(app, key);
+        return;
+    }
+
     // The issue-details popup captures keys while it is open (#152).
     if app.details_open() {
         handle_details_key(app, key);
@@ -223,6 +230,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),
         KeyCode::Char('t') => app.open_closed(),
+        KeyCode::Char('$') => app.open_cost(),
         KeyCode::Char('f') => app.refresh(),
         _ => {}
     }
@@ -273,6 +281,15 @@ fn handle_closed_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down => app.closed_next(),
         KeyCode::Char('k') | KeyCode::Up => app.closed_previous(),
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('t') => app.close_closed(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the cost dashboard popup is open: it has no selection to
+/// move, so only close on `q`, `Esc`, or `$` (#163).
+fn handle_cost_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('$') => app.close_cost(),
         _ => {}
     }
 }
@@ -379,6 +396,17 @@ mod tests {
         // A key inside the popup is captured by it, not the list: b closes it.
         press(&mut app, KeyCode::Char('b'));
         assert!(!app.bots_open());
+    }
+
+    #[test]
+    fn cost_dashboard_popup_captures_and_closes_on_dollar() {
+        // Seed the popup open (avoids a live `gh` fetch), then a `$` press is
+        // captured by the popup and closes it (#163).
+        let mut app = App::new(Vec::new());
+        app.open_cost_with(Vec::new());
+        assert!(app.cost_open());
+        press(&mut app, KeyCode::Char('$'));
+        assert!(!app.cost_open());
     }
 
     #[test]
