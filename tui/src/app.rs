@@ -889,6 +889,16 @@ impl App {
         self.in_progress_prs.iter().map(|pr| pr.number).collect()
     }
 
+    /// Whether any issue or PR currently carries the in-progress label, i.e. the
+    /// loop is actively working something — whether the TUI started the worker or
+    /// an external loop did. Drives the header and per-line spinners, the smooth
+    /// animation tick, and the on-a-timer refresh so watching an external loop
+    /// still shows motion and which issue is running, even with no local worker
+    /// (#157).
+    pub fn has_active_work(&self) -> bool {
+        !self.in_progress_numbers().is_empty() || !self.in_progress_pr_numbers().is_empty()
+    }
+
     /// Whether the model picker popup is currently open.
     pub fn model_picker_open(&self) -> bool {
         self.model_picker_open
@@ -1962,6 +1972,29 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(app.in_progress_pr_numbers(), vec![12, 15]);
+    }
+
+    #[test]
+    fn has_active_work_tracks_in_progress_issues_and_prs() {
+        // Nothing in progress: no active work, so the header/line spinners and
+        // the fast animation tick stay off (#157).
+        let mut app = App::new(parse_issues(r#"[{"number":10,"title":"a","labels":[]}]"#).unwrap());
+        assert!(!app.has_active_work());
+
+        // An issue carrying the in-progress label (set by any loop, local or
+        // external) counts as active work.
+        app.set_issues(
+            parse_issues(r#"[{"number":10,"title":"a","labels":[{"name":"in-progress"}]}]"#)
+                .unwrap(),
+        );
+        assert!(app.has_active_work());
+
+        // A PR being resolved counts too, even with no in-progress issue.
+        let mut pr_only = App::new(Vec::new());
+        pr_only.set_in_progress_prs(
+            github::parse_pull_requests(r#"[{"number":12,"title":"a"}]"#).unwrap(),
+        );
+        assert!(pr_only.has_active_work());
     }
 
     #[test]
