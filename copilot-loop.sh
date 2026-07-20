@@ -193,7 +193,7 @@ set -uo pipefail
 # .github/workflows/release.yml on every push to main (kept in step with the
 # Homebrew formula and the TUI). Keep this on its own line: the release workflow
 # rewrites it with sed.
-COPILOT_LOOP_VERSION="0.1.11"
+COPILOT_LOOP_VERSION="0.1.12"
 
 # Preserve the original invocation so self-update can re-exec the loop with the
 # same options after pulling a newer copy of this script (see self_update).
