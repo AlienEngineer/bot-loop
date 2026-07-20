@@ -7,6 +7,7 @@ use ratatui::widgets::ListState;
 use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
 use crate::models;
+use crate::reporter::{CloseReporter, ReportOutcome, ReportRequest, ReportStatus};
 use crate::runner::{self, LoopRunner, WorkerStatus, WorkerView};
 use crate::worker::{FetchOutcome, IssueFetcher};
 
@@ -15,6 +16,22 @@ pub const DEFAULT_LIMIT: u32 = 200;
 
 /// How much of a loop log to read for the output panel (its tail).
 pub const OUTPUT_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Environment variable seeding whether closing an issue posts a summary comment
+/// (#161). Default on; `off`/`0`/`false`/`no` (case-insensitive) start it off.
+pub const SUMMARY_ON_CLOSE_ENV: &str = "SUMMARY_ON_CLOSE";
+
+/// The initial "report on close" state from a raw `SUMMARY_ON_CLOSE` value: on by
+/// default, off only when explicitly disabled. Pure for testing.
+pub fn default_report_on_close(raw: Option<String>) -> bool {
+    match raw {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        ),
+        None => true,
+    }
+}
 
 /// Which input surface currently has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -147,6 +164,18 @@ pub struct App {
     /// The workers shown in the bots popup, refreshed from the runner so their
     /// live status (running/stopped/failed) tracks each background loop (#82).
     bots: Vec<WorkerView>,
+    /// Whether closing an issue posts an auto-generated summary comment on it
+    /// (#161). Default on; toggled with `space s`, seeded from `SUMMARY_ON_CLOSE`.
+    report_on_close: bool,
+    /// The light model that writes the close summary, or `None` for auto (#161).
+    /// Kept separate from the coding model so the summary stays cheap.
+    summary_model: Option<String>,
+    /// Background reporter that writes the close summary off the UI thread so the
+    /// model call never freezes input or redraws (#161). `None` in unit tests.
+    reporter: Option<CloseReporter>,
+    /// How many close summaries are in flight, so the footer can show a
+    /// "Summarizing…" indicator until they land (#161).
+    reporting: usize,
 }
 
 impl App {
@@ -195,6 +224,10 @@ impl App {
             bots_open: false,
             bots_state: ListState::default(),
             bots: Vec::new(),
+            report_on_close: default_report_on_close(std::env::var(SUMMARY_ON_CLOSE_ENV).ok()),
+            summary_model: models::summary_model(),
+            reporter: None,
+            reporting: 0,
         }
     }
 
@@ -479,6 +512,15 @@ impl App {
             return;
         };
 
+        // Capture the title before the issue leaves the list so the summary
+        // prompt can name it (#161).
+        let title = self
+            .issues
+            .iter()
+            .find(|i| i.number == number)
+            .map(|i| i.title.clone())
+            .unwrap_or_default();
+
         match github::close_issue(number) {
             Ok(()) => {
                 if let Some(pos) = self.issues.iter().position(|i| i.number == number) {
@@ -492,8 +534,92 @@ impl App {
                     }
                 }
                 self.status = Some(format!("Closed issue #{number}."));
+                self.report_close(number, &title);
             }
             Err(err) => self.status = Some(format!("Error: {err}")),
+        }
+    }
+
+    /// Kick off the background close summary for a just-closed issue, when the
+    /// feature is on (#161).
+    ///
+    /// Reads the issue's session-log tail on the UI thread (cheap file IO) and,
+    /// when there is context to summarize, hands it to the reporter thread so the
+    /// model call and `gh issue comment` never freeze the UI. A no-op when the
+    /// feature is off, no reporter is attached (unit tests), or the issue has no
+    /// loop log to summarize.
+    fn report_close(&mut self, number: u64, title: &str) {
+        if !self.report_on_close {
+            return;
+        }
+        let Some(reporter) = self.reporter.as_ref() else {
+            return;
+        };
+
+        let context = self.session_context(number);
+        if context.trim().is_empty() {
+            self.status = Some(format!(
+                "Closed issue #{number}. No session log to summarize."
+            ));
+            return;
+        }
+
+        reporter.request(ReportRequest {
+            number,
+            title: title.to_string(),
+            model: self.summary_model.clone(),
+            context,
+        });
+        self.reporting += 1;
+        self.status = Some(format!("Closed issue #{number}. Summarizing…"));
+    }
+
+    /// The sanitized tail of the newest loop log for `number`, capped for the
+    /// summary prompt, or an empty string when the issue has no log (#161).
+    fn session_context(&self, number: u64) -> String {
+        let Some(path) = logs::latest_issue_log(&logs::logs_dir(&self.repo_root), number) else {
+            return String::new();
+        };
+        match logs::read_log_tail(&path, github::SUMMARY_CONTEXT_BYTES) {
+            Ok(raw) => logs::sanitize(&raw),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Whether closing an issue posts an auto-generated summary comment (#161).
+    pub fn report_on_close(&self) -> bool {
+        self.report_on_close
+    }
+
+    /// Toggle whether closing an issue posts a summary comment (#161).
+    pub fn toggle_report_on_close(&mut self) {
+        self.report_on_close = !self.report_on_close;
+        let state = if self.report_on_close { "on" } else { "off" };
+        self.status = Some(format!("Close summary {state}."));
+    }
+
+    /// Attach the background close reporter so summaries run off the UI thread
+    /// (#161). Wired once at startup; unit tests leave it unset.
+    pub fn set_reporter(&mut self, reporter: CloseReporter) {
+        self.reporter = Some(reporter);
+    }
+
+    /// Whether a close summary is currently being written, so the footer can
+    /// animate a "Summarizing…" indicator until it lands (#161).
+    pub fn is_reporting(&self) -> bool {
+        self.reporting > 0
+    }
+
+    /// Fold any completed close summaries into the status line. Called each UI
+    /// tick so a posted summary (or a failure) is reported without the UI thread
+    /// ever blocking on the model call (#161).
+    pub fn poll_report_results(&mut self) {
+        let Some(outcomes) = self.reporter.as_ref().map(CloseReporter::drain) else {
+            return;
+        };
+        for outcome in outcomes {
+            self.reporting = self.reporting.saturating_sub(1);
+            self.status = Some(report_status_message(&outcome));
         }
     }
 
@@ -1259,6 +1385,14 @@ impl App {
         self.refreshing = refreshing;
     }
 
+    /// Force the "reporting" count (tests only) so the footer's animated
+    /// "Summarizing…" indicator can be rendered without wiring a reporter or
+    /// calling the model (#161).
+    #[cfg(test)]
+    pub fn set_reporting(&mut self, reporting: bool) {
+        self.reporting = usize::from(reporting);
+    }
+
     /// Seed the closed-issues popup and open it (tests only), standing in for the
     /// `gh issue list --state closed` fetch in [`open_closed`] (#145).
     #[cfg(test)]
@@ -1363,6 +1497,20 @@ fn combine_feedback(issue_msg: Option<String>, pr_msg: Option<String>) -> Option
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
+    }
+}
+
+/// The status line for a completed close summary (#161): confirmed when posted,
+/// noted when there was nothing to summarize, or the error when it failed. Pure
+/// for testing.
+fn report_status_message(outcome: &ReportOutcome) -> String {
+    let number = outcome.number;
+    match &outcome.result {
+        Ok(ReportStatus::Posted) => format!("Posted a summary on #{number}."),
+        Ok(ReportStatus::NoContext) => {
+            format!("No session log for #{number}; summary skipped.")
+        }
+        Err(err) => format!("Summary for #{number} failed: {err}"),
     }
 }
 
@@ -1775,6 +1923,72 @@ mod tests {
         // No gh call is made and the list is unchanged.
         assert_eq!(app.issues.len(), 2);
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn report_on_close_is_on_by_default() {
+        // With SUMMARY_ON_CLOSE unset the summary is on, and nothing is in flight.
+        let app = app_with(0);
+        assert!(app.report_on_close());
+        assert!(!app.is_reporting());
+    }
+
+    #[test]
+    fn default_report_on_close_respects_disable_words() {
+        assert!(default_report_on_close(None));
+        assert!(default_report_on_close(Some("on".to_string())));
+        assert!(default_report_on_close(Some("anything".to_string())));
+        for off in ["off", "0", "false", "no", "OFF", " No "] {
+            assert!(
+                !default_report_on_close(Some(off.to_string())),
+                "raw = {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_report_on_close_flips_and_reports() {
+        let mut app = app_with(1);
+        assert!(app.report_on_close());
+        app.toggle_report_on_close();
+        assert!(!app.report_on_close());
+        assert_eq!(app.status.as_deref(), Some("Close summary off."));
+        app.toggle_report_on_close();
+        assert!(app.report_on_close());
+        assert_eq!(app.status.as_deref(), Some("Close summary on."));
+    }
+
+    #[test]
+    fn report_status_message_reads_each_outcome() {
+        let posted = report_status_message(&ReportOutcome {
+            number: 7,
+            result: Ok(ReportStatus::Posted),
+        });
+        assert_eq!(posted, "Posted a summary on #7.");
+
+        let none = report_status_message(&ReportOutcome {
+            number: 8,
+            result: Ok(ReportStatus::NoContext),
+        });
+        assert!(none.contains("#8"));
+        assert!(none.contains("skipped"));
+
+        let failed = report_status_message(&ReportOutcome {
+            number: 9,
+            result: Err(anyhow::anyhow!("boom")),
+        });
+        assert!(failed.contains("#9"));
+        assert!(failed.contains("boom"));
+    }
+
+    #[test]
+    fn poll_report_results_is_a_no_op_without_a_reporter() {
+        // Unit tests leave the reporter unset, so polling never touches `gh` or a
+        // model and simply does nothing.
+        let mut app = app_with(1);
+        app.poll_report_results();
+        assert!(app.status.is_none());
+        assert!(!app.is_reporting());
     }
 
     #[test]

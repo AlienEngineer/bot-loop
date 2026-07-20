@@ -7,6 +7,7 @@ mod app;
 mod github;
 mod logs;
 mod models;
+mod reporter;
 mod runner;
 mod ui;
 mod worker;
@@ -57,6 +58,10 @@ fn main() -> Result<()> {
     // auto-refresh never blocks the UI loop (#144).
     app.set_fetcher(worker::IssueFetcher::spawn(DEFAULT_LIMIT));
 
+    // Write close summaries on a worker thread so the model call never freezes
+    // the UI (#161).
+    app.set_reporter(reporter::CloseReporter::spawn());
+
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
@@ -82,6 +87,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         // list tracks the loop without the UI thread ever blocking on `gh`.
         app.poll_fetch_results();
 
+        // Fold in any close summaries the reporter thread finished, so a posted
+        // summary (or a failure) surfaces without blocking on the model (#161).
+        app.poll_report_results();
+
         // Keep the bots popup's worker statuses live while it is open (#82).
         if app.bots_open() {
             app.refresh_bots();
@@ -90,9 +99,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         terminal.draw(|frame| ui::render(frame, app))?;
 
         // Poll briefly while anything animates — a background refresh's
-        // "Refreshing…" indicator (#130) or the running loop's spinner (#115) —
-        // so the spinner turns smoothly; otherwise wait longer to stay near-idle.
-        let poll_timeout = if app.is_refreshing() || app.loop_running() {
+        // "Refreshing…" indicator (#130), a close summary in flight (#161), or
+        // the running loop's spinner (#115) — so the spinner turns smoothly;
+        // otherwise wait longer to stay near-idle.
+        let poll_timeout = if app.is_refreshing() || app.is_reporting() || app.loop_running() {
             ANIMATION_TICK
         } else {
             IDLE_TICK
@@ -207,6 +217,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('b') => app.open_bots(),
         KeyCode::Char('a') => app.toggle_auto_merge(),
+        KeyCode::Char('s') => app.toggle_report_on_close(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
         KeyCode::Char('p') => app.open_pr_output(),
@@ -400,6 +411,18 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.leader_active());
         assert!(!app.is_creating());
+    }
+
+    #[test]
+    fn leader_s_toggles_the_close_summary_and_closes_the_menu() {
+        // `s` flips the report-on-close setting (on by default) and closes the
+        // leader menu, like the other one-shot actions (#161).
+        let mut app = App::new(Vec::new());
+        assert!(app.report_on_close());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('s'));
+        assert!(!app.report_on_close());
+        assert!(!app.leader_active());
     }
 
     #[test]
