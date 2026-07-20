@@ -128,6 +128,7 @@ fn header_spans(
     model_label: &str,
     auto_merge: bool,
     quality_assurance: bool,
+    report_on_close: bool,
     spinner: &str,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -208,6 +209,17 @@ fn header_spans(
             Color::DarkGray
         }),
     ));
+    spans.push(Span::styled(
+        format!(
+            "  ·  summary: {}",
+            if report_on_close { "on" } else { "off" }
+        ),
+        Style::new().fg(if report_on_close {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    ));
     spans
 }
 
@@ -221,6 +233,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, work
         app.current_model_label(),
         app.auto_merge(),
         app.quality_assurance(),
+        app.report_on_close(),
         spinner_frame(),
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -318,9 +331,25 @@ fn refreshing_indicator(refreshing: bool, spinner: &str) -> Option<Span<'static>
     })
 }
 
+/// The footer's summarizing indicator: an animated spinner and "Summarizing…"
+/// while a close summary is being written (#161), or `None` when idle. Pure so
+/// the animated branch is unit-testable without the model call.
+fn reporting_indicator(reporting: bool, spinner: &str) -> Option<Span<'static>> {
+    reporting.then(|| {
+        Span::styled(
+            format!("{spinner} Summarizing… "),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )
+    })
+}
+
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some(indicator) = refreshing_indicator(app.is_refreshing(), spinner_frame()) {
+        spans.push(indicator);
+        spans.push(Span::raw("  "));
+    }
+    if let Some(indicator) = reporting_indicator(app.is_reporting(), spinner_frame()) {
         spans.push(indicator);
         spans.push(Span::raw("  "));
     }
@@ -347,7 +376,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
+            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · s summary · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -404,7 +433,7 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
         .map(|issue| issue.title.clone())
         .unwrap_or_default();
 
-    let popup = centered_popup(area, 50, 6);
+    let popup = centered_popup(area, 50, 7);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -413,6 +442,20 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
         .title_bottom(Line::from(" y confirm · n/Esc cancel ").centered())
         .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
         .style(Style::new().bg(Color::Black));
+
+    // Tell the operator whether closing will post an auto-generated summary, and
+    // how to flip it, so the side effect is never a surprise (#161).
+    let summary_line = if app.report_on_close() {
+        Span::styled(
+            "A summary will be posted (space s to toggle).",
+            Style::new().fg(Color::Green),
+        )
+    } else {
+        Span::styled(
+            "No summary will be posted (space s to toggle).",
+            Style::new().fg(Color::DarkGray),
+        )
+    };
 
     let body = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -424,6 +467,7 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
             "This closes the issue on GitHub.",
             Style::new().fg(Color::DarkGray),
         )),
+        Line::from(summary_line),
     ])
     .block(block)
     .wrap(Wrap { trim: false });
@@ -1109,7 +1153,7 @@ mod tests {
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(180, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1120,6 +1164,7 @@ mod tests {
         assert!(text.contains("r ready"));
         assert!(text.contains("m models"));
         assert!(text.contains("add-worker"));
+        assert!(text.contains("s summary"));
         assert!(text.contains("f refresh"));
         assert!(text.contains("esc cancel"));
         // The action menu replaces the base navigation hint.
@@ -1188,6 +1233,27 @@ mod tests {
         let span = refreshing_indicator(true, "⠋").expect("indicator while refreshing");
         assert!(span.content.contains("Refreshing"));
         assert!(span.content.contains("⠋"));
+    }
+
+    #[test]
+    fn reporting_indicator_shows_only_while_reporting() {
+        assert!(reporting_indicator(false, "⠋").is_none());
+        let span = reporting_indicator(true, "⠋").expect("indicator while reporting");
+        assert!(span.content.contains("Summarizing"));
+        assert!(span.content.contains("⠋"));
+    }
+
+    #[test]
+    fn footer_shows_the_summarizing_indicator_while_reporting() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.set_reporting(true);
+        let mut terminal = Terminal::new(TestBackend::new(120, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("Summarizing"));
     }
 
     #[test]
@@ -1269,6 +1335,23 @@ mod tests {
         assert!(text.contains("Close issue #96?"));
         assert!(text.contains("y confirm"));
         assert!(text.contains("cancel"));
+        // The popup states the summary side effect, on by default (#161).
+        assert!(text.contains("summary will be posted"));
+    }
+
+    #[test]
+    fn close_confirmation_reflects_a_disabled_summary() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"create a TUI","labels":[],"author":null}]"#)
+                .unwrap();
+        let mut app = App::new(issues);
+        app.toggle_report_on_close(); // turn the summary off
+        app.request_close();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("No summary will be posted"));
     }
 
     fn spans_text(spans: &[Span]) -> String {
@@ -1313,6 +1396,7 @@ mod tests {
             "auto",
             false,
             true,
+            true,
             "⠋",
         ));
         assert!(text.contains("⠋ loop: running"));
@@ -1332,6 +1416,7 @@ mod tests {
             &[],
             "auto",
             false,
+            true,
             true,
             "⠋",
         ));
@@ -1353,6 +1438,7 @@ mod tests {
             "auto",
             false,
             true,
+            true,
             "⠋",
         ));
         assert!(text.contains("loop: running"));
@@ -1372,6 +1458,7 @@ mod tests {
             "auto",
             false,
             true,
+            true,
             "⠋",
         ));
         assert!(text.contains("working #96"));
@@ -1388,6 +1475,7 @@ mod tests {
             &[],
             "auto",
             false,
+            true,
             true,
             "⠋",
         ));
@@ -1406,6 +1494,7 @@ mod tests {
             "auto",
             false,
             true,
+            true,
             "⠋",
         ));
         assert!(text.contains("loop: off"));
@@ -1417,7 +1506,18 @@ mod tests {
 
     #[test]
     fn header_reflects_auto_merge_state() {
-        let on = spans_text(&header_spans(1, None, 0, &[], &[], "auto", true, true, "⠋"));
+        let on = spans_text(&header_spans(
+            1,
+            None,
+            0,
+            &[],
+            &[],
+            "auto",
+            true,
+            true,
+            true,
+            "⠋",
+        ));
         assert!(on.contains("auto-merge: on"));
         let off = spans_text(&header_spans(
             1,
@@ -1427,6 +1527,7 @@ mod tests {
             &[],
             "auto",
             false,
+            true,
             true,
             "⠋",
         ));
@@ -1444,6 +1545,7 @@ mod tests {
             "auto",
             false,
             true,
+            false,
             "⠋",
         ));
         assert!(on.contains("qa: on"));
@@ -1456,9 +1558,40 @@ mod tests {
             "auto",
             false,
             false,
+            false,
             "⠋",
         ));
         assert!(off.contains("qa: off"));
+    }
+
+    #[test]
+    fn header_reflects_summary_state() {
+        let on = spans_text(&header_spans(
+            1,
+            None,
+            0,
+            &[],
+            &[],
+            "auto",
+            false,
+            false,
+            true,
+            "⠋",
+        ));
+        assert!(on.contains("summary: on"));
+        let off = spans_text(&header_spans(
+            1,
+            None,
+            0,
+            &[],
+            &[],
+            "auto",
+            false,
+            false,
+            false,
+            "⠋",
+        ));
+        assert!(off.contains("summary: off"));
     }
 
     #[test]

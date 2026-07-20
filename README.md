@@ -106,8 +106,10 @@ label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
 absent so the loop picks the issue up, or removed when present so a
 mistakenly-queued issue can be pulled back out (#146). Press `space` then `c` to create a new issue: fill in a title and description, then
 `Ctrl+S` to submit it (no label is added by default). Press `space` then `x` to close the
-selected issue: a confirmation popup names it, then `y` closes it on GitHub
-(`n`/`Esc` cancels). Press `space` then `l` to start a background `copilot-loop.sh` worker
+selected issue: a confirmation popup names it (and whether a summary will be
+posted), then `y` closes it on GitHub (`n`/`Esc` cancels), and — unless the
+summary is turned off — a short recap of what the loop did is posted as a comment
+(#161, see below). Press `space` then `l` to start a background `copilot-loop.sh` worker
 that works through the ready issues; press `space` then `l` again to add more workers running
 in parallel. Each worker claims issues under a GitHub lock (and isolates each in
 its own git worktree), so multiple workers safely pick *different* issues (#134).
@@ -154,6 +156,17 @@ is impractical). The header shows `qa: on`/`qa: off`; turning it off starts the 
 with `--no-quality-assurance` to save cost. Like auto-merge, the setting takes effect
 the next time the loop starts.
 
+Press `space` then `s` to toggle the closing summary (#161). When on (the default),
+closing an issue posts a comment recapping what the loop did: a *light* model reads
+the tail of that issue's session log (its `.copilot-loop/logs/issue-<n>-…log`) and
+writes a short Markdown summary, which is posted with `gh issue comment`. The header
+shows `summary: on`/`off` and the close confirmation says whether a summary will be
+posted. It runs on a background thread so the model call never freezes the UI, and
+issues with no session log (e.g. closed by hand) are skipped. The summary model is a
+cheap default (`gpt-5-mini`) to keep costs down — override it with `$SUMMARY_MODEL`
+(`auto`/`off` lets Copilot pick), and set `$SUMMARY_ON_CLOSE=off` to start with the
+summary disabled.
+
 Press `space` then `t` to open a popup listing the repository's closed issues alongside how
 much each one cost to resolve. The spend is the sum of the `AI Credits` the loop
 posted on the issue (its `<!-- copilot-loop:usage -->` comments), shown per row
@@ -189,9 +202,9 @@ the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
 comments, `l` add a background worker, `L` stop all workers, `b` bots (restart a
 stopped/failed worker in place, or all with `R`), `a` toggle
-auto-merge, `q` toggle quality assurance, `m` pick the model, `o` show/hide the output panel, `p` show the
-resolving-PRs popup, `t` show closed issues and their cost, `f` refresh, `Esc`
-cancel. In the new-issue
+auto-merge, `q` toggle quality assurance, `s` toggle the closing summary, `m` pick
+the model, `o` show/hide the output panel, `p` show the resolving-PRs popup, `t`
+show closed issues and their cost, `f` refresh, `Esc` cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
 description), `Ctrl+S` creates, `Esc` cancels.
 

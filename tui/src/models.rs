@@ -8,14 +8,23 @@
 /// Environment variable overriding the built-in model list.
 pub const MODELS_ENV: &str = "COPILOT_MODELS";
 
+/// Environment variable overriding the model that writes the close summary (#161).
+pub const SUMMARY_MODEL_ENV: &str = "SUMMARY_MODEL";
+
 /// Sentinel model meaning "let Copilot choose". Selecting it passes no
 /// `--model` to the loop, matching an empty `COPILOT_MODEL`.
 pub const AUTO_MODEL: &str = "auto";
+
+/// Default *light* model used to summarize a closed issue's session, chosen to
+/// keep the summary cheap (#161). Deliberately a mini model; overridable via
+/// `SUMMARY_MODEL` for when the catalogue moves on.
+pub const DEFAULT_SUMMARY_MODEL: &str = "gpt-5-mini";
 
 /// Built-in fallback catalogue. Deliberately short and overridable; the exact
 /// set is data, not logic — the picker works with whatever list it is given.
 const DEFAULT_MODELS: &[&str] = &[
     AUTO_MODEL,
+    "claude-opus-4.8",
     "claude-opus-4.5",
     "claude-sonnet-4.5",
     "claude-sonnet-4",
@@ -57,6 +66,29 @@ pub fn available() -> Vec<String> {
 /// Whether a model id is the "auto" sentinel (case-insensitive).
 pub fn is_auto(model: &str) -> bool {
     model.eq_ignore_ascii_case(AUTO_MODEL)
+}
+
+/// Resolve the model that writes the close summary (#161).
+///
+/// `SUMMARY_MODEL` wins when set to a real id; unset (or empty) falls back to the
+/// built-in light [`DEFAULT_SUMMARY_MODEL`] so the summary stays cheap by default.
+/// `auto`/`off`/`none`/`0` return `None` so no `--model` is passed and Copilot
+/// picks — the feature's on/off switch lives separately in the TUI, so this only
+/// chooses *which* model, never whether to summarize.
+pub fn summary_model() -> Option<String> {
+    resolve_summary_model(std::env::var(SUMMARY_MODEL_ENV).ok().as_deref())
+}
+
+/// Pure core of [`summary_model`]: map a raw `SUMMARY_MODEL` value (or `None`
+/// when unset) to the model to use, or `None` for "let Copilot pick". Pure for
+/// testing.
+pub fn resolve_summary_model(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw.unwrap_or_default().trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "" => Some(DEFAULT_SUMMARY_MODEL.to_string()),
+        "auto" | "off" | "none" | "0" => None,
+        _ => Some(trimmed.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +133,32 @@ mod tests {
         assert!(is_auto("auto"));
         assert!(is_auto("AUTO"));
         assert!(!is_auto("gpt-5"));
+    }
+
+    #[test]
+    fn summary_model_defaults_to_the_light_model_when_unset_or_empty() {
+        assert_eq!(
+            resolve_summary_model(None).as_deref(),
+            Some(DEFAULT_SUMMARY_MODEL)
+        );
+        assert_eq!(
+            resolve_summary_model(Some("   ")).as_deref(),
+            Some(DEFAULT_SUMMARY_MODEL)
+        );
+    }
+
+    #[test]
+    fn summary_model_uses_an_explicit_id_verbatim() {
+        assert_eq!(
+            resolve_summary_model(Some(" o4-mini ")).as_deref(),
+            Some("o4-mini")
+        );
+    }
+
+    #[test]
+    fn summary_model_disable_words_mean_let_copilot_pick() {
+        for raw in ["auto", "off", "None", "0"] {
+            assert_eq!(resolve_summary_model(Some(raw)), None, "raw = {raw}");
+        }
     }
 }
