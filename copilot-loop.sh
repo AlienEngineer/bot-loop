@@ -1517,7 +1517,7 @@ process_issue() {
   # add user-perspective tests for the work. Wrapped in blank lines so it reads
   # as its own paragraph; empty (no extra blank line) when QA is off.
   qa_block=""
-  [ "$QUALITY_ASSURANCE" = 1 ] && qa_block=$'\n'"$(qa_instruction)"$'\n'
+  [ "$QUALITY_ASSURANCE" = 1 ] && qa_block=$'\n'"$(qa_instruction "$QUALITY_ASSURANCE")"$'\n'
 
   local prompt
   prompt="$(cat <<EOF
