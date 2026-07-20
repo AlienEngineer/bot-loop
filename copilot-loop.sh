@@ -52,7 +52,13 @@
 #        a. an issue awaiting a reply ("needs-info") or a failed issue
 #           ("copilot-failed") whose latest comment came from a human (the user
 #           answered a question or gave more guidance) -> resume it; else
-#        b. the oldest open issue with the trigger label (default: "ready").
+#        b. an issue labelled for plan mode (default: "plan") -> draft an
+#           implementation plan (no code changes) with Copilot, post it on the
+#           issue for review, label it "plan-review" and wait for the user to add
+#           the trigger label to run it (see plan_issue); else
+#        c. the oldest open issue with the trigger label (default: "ready"). When
+#           that issue was planned first, the approved plan is in its thread and
+#           Copilot is told to follow it (see comments_have_plan).
 #      Issues that declare a dependency ("Wait for: #N" in the body) are held
 #      back (and labelled "pending" while they wait) until every issue they name
 #      is closed (see "Issue dependencies: Wait for: #N" further down).
@@ -106,6 +112,10 @@
 # Options (each is also settable via the matching environment variable; when
 # both are given the command-line flag wins):
 #   --trigger-label <label>  Label that marks an issue as ready   (default: ready)
+#   --plan-label <label>     Label that puts an issue into plan mode: Copilot
+#                            drafts an implementation plan (no code changes) which
+#                            is posted for review, then the issue waits for the
+#                            trigger label to run the plan          (default: plan)
 #   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
 #   --repo-dir <dir>         Repository to operate in              (default: current git repo)
 #   --model <model>          Model passed to copilot --model       (default: unset/auto)
@@ -155,7 +165,7 @@
 #   -V, --version            Print the copilot-loop version and exit.
 #
 # Environment variables (equivalent to the flags above):
-#   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
+#   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
 #   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
@@ -203,6 +213,12 @@ SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)/$(basename "$S
 # --repo-dir can still influence the derived paths (ISSUES_DIR, WORK_DIR, ...).
 REPO_DIR="${REPO_DIR:-}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-}"
+# Label that puts an issue into plan mode: instead of implementing it straight
+# away the loop asks Copilot for an implementation plan (no code changes), posts
+# it for review, and waits for the user to add the trigger label to run it. Read
+# raw here; the default ("plan") is filled after argument parsing so --plan-label
+# can override it (mirrors TRIGGER_LABEL).
+PLAN_LABEL="${PLAN_LABEL:-}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
 # Wall-clock limit for each main Copilot run so a stuck run can never block the
@@ -284,6 +300,11 @@ NEEDS_INFO_LABEL="needs-info"
 # ("Wait for: #N"), so the wait is visible in GitHub. Reconciled every pass and
 # removed once every dependency closes (or the issue is claimed for work).
 PENDING_LABEL="pending"
+# Marks an issue whose implementation plan has been generated and posted for the
+# user to review (see PLAN_LABEL / plan_issue). The loop leaves the issue alone
+# while it carries this label; the user adds the trigger label once happy with
+# the plan to have the loop execute it, and the label is dropped when claimed.
+PLAN_REVIEW_LABEL="plan-review"
 # Marks a PR whose conflicts the loop tried and failed to resolve, so it is not
 # retried forever. Remove it by hand to let the loop try again.
 CONFLICT_UNRESOLVED_LABEL="conflict-unresolved"
@@ -307,6 +328,11 @@ FAILURE_MARKER="<!-- copilot-loop:failed -->"
 # Hidden marker appended to every per-run cost/usage comment so they are easy to
 # recognise (and filter) in the thread (mirrors QUESTION_MARKER).
 USAGE_MARKER="<!-- copilot-loop:usage -->"
+
+# Hidden marker appended to the plan comment the loop posts in plan mode, so the
+# execution pass can tell the issue was planned (and the plan approved) and hand
+# Copilot the approved plan to follow (mirrors QUESTION_MARKER).
+PLAN_MARKER="<!-- copilot-loop:plan -->"
 
 # --- Helpers -----------------------------------------------------------------
 # Emit a timestamped status line to stdout. When CURRENT_RUN_LOG is set (during a
@@ -389,6 +415,10 @@ Options (each is also settable via the matching environment variable; when both
 are given the command-line flag wins). "--flag value" and "--flag=value" both
 work:
   --trigger-label <label>  Label that marks an issue as ready    (default: ready)
+  --plan-label <label>     Label that puts an issue into plan mode: Copilot
+                           proposes an implementation plan (no code changes)
+                           which is posted for review, then the issue waits for
+                           the trigger label to run the plan     (default: plan)
   --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
   --repo-dir <dir>         Repository to operate in               (default: current git repo)
   --model <model>          Model passed to copilot --model        (default: unset/auto)
@@ -444,7 +474,7 @@ work:
   -V, --version            Print the copilot-loop version and exit.
 
 Environment variables (equivalent to the flags above):
-  TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
+  TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 EOF
@@ -772,6 +802,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --trigger-label)   need_arg $# "$1"; TRIGGER_LABEL="$2"; shift ;;
     --trigger-label=*) TRIGGER_LABEL="${1#*=}" ;;
+    --plan-label)      need_arg $# "$1"; PLAN_LABEL="$2"; shift ;;
+    --plan-label=*)    PLAN_LABEL="${1#*=}" ;;
     --sleep-minutes)   need_arg $# "$1"; SLEEP_MINUTES="$2"; shift ;;
     --sleep-minutes=*) SLEEP_MINUTES="${1#*=}" ;;
     --repo-dir)        need_arg $# "$1"; REPO_DIR="$2"; shift ;;
@@ -816,6 +848,10 @@ done
 # so running from a subdirectory still targets the whole repo.
 REPO_DIR="${REPO_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
+# Label that routes an issue through plan mode before it is implemented. Kept
+# distinct from the trigger label so the same issue can be planned first
+# (labelled PLAN_LABEL) and then run (labelled TRIGGER_LABEL) after review.
+PLAN_LABEL="${PLAN_LABEL:-plan}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-5}"
 QUIET="${QUIET:-0}"
 ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
@@ -1086,7 +1122,7 @@ log "  gh account:  ${BOT_LOGIN:-<unknown>} @ ${GH_HOST_ORIGIN:-github.com}"
 log "  origin url:  $ORIGIN_URL"
 log "  local dir:   $REPO_DIR"
 log "============================================================"
-log "default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL sleep=${SLEEP_MINUTES}m"
+log "default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL plan_label=$PLAN_LABEL sleep=${SLEEP_MINUTES}m"
 if [ "$USE_WORKTREES" = 1 ]; then
   log "isolation: per-issue git worktrees under $WORKTREE_BASE (default branch never checked out)"
 else
@@ -1118,6 +1154,8 @@ else
 fi
 
 ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up"
+ensure_label "$PLAN_LABEL"       "5319e7" "Ask the copilot loop for an implementation plan before running it"
+ensure_label "$PLAN_REVIEW_LABEL" "5319e7" "A plan was posted; waiting for the user to review it and add the trigger label"
 ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot loop"
 ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the copilot loop"
 ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce changes"
@@ -1451,11 +1489,24 @@ sweep_merged_branches() {
 # <<< cleanup helpers <<<
 
 # --- Core: process a single issue -------------------------------------------
+# Whether an issue's comment thread already carries a posted plan (the hidden
+# PLAN_MARKER), i.e. the issue went through plan mode and the user approved the
+# plan by adding the trigger label. Pure (reads the comments string on $1), so it
+# is extracted verbatim by tests/plan-mode.test.sh — keep the markers intact.
+# >>> plan-detect helpers >>>
+comments_have_plan() {
+  case "$1" in
+    *"<!-- copilot-loop:plan -->"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# <<< plan-detect helpers <<<
+
 # Returns 0 on success (PR opened), 1 on failure.
 process_issue() {
   local num="$1"
   local title body slug branch commit_msg commit_text commit_out pr_body log_file ahead pr_url
-  local question_file comments comments_block qa_block
+  local question_file comments comments_block qa_block plan_block
 
   # One API round-trip for everything we need from the issue (title, body, and
   # the comment thread) instead of three separate `gh issue view` calls. Fields
@@ -1519,6 +1570,15 @@ process_issue() {
   qa_block=""
   [ "$QUALITY_ASSURANCE" = 1 ] && qa_block=$'\n'"$(qa_instruction "$QUALITY_ASSURANCE")"$'\n'
 
+  # Plan mode follow-up: if this issue was planned first (its thread carries the
+  # posted plan) the user approved that plan by adding the trigger label to run
+  # it. Tell Copilot to follow the approved plan — the latest one, so any changes
+  # the user made in a later comment win — instead of re-deciding the approach.
+  plan_block=""
+  if comments_have_plan "$comments"; then
+    plan_block=$'\n'"An implementation plan for this issue was proposed earlier in the conversation above and approved by the user. Follow that plan. If the user amended it in a later comment, follow the most recent version of the plan."$'\n'
+  fi
+
   local prompt
   prompt="$(cat <<EOF
 You are working in a git repository to resolve a GitHub issue.
@@ -1526,7 +1586,7 @@ You are working in a git repository to resolve a GitHub issue.
 Issue #${num}: ${title}
 
 ${body}${comments_block}
-
+${plan_block}
 Implement the necessary code changes in the current working directory to fully
 resolve this issue. Run any build or test commands needed to verify your work.
 Do NOT run git commit, git push, create branches, or open pull requests — those
@@ -1892,6 +1952,116 @@ _ask_issue() {
   cleanup_workspace "$branch"
 }
 
+# --- Core: plan a single issue (plan mode) ----------------------------------
+# Instead of implementing the issue, ask Copilot for an implementation plan and
+# post it on the issue for the user to review. No branch is pushed and no PR is
+# opened: Copilot runs in the issue's workspace (so it can read the real code to
+# ground the plan) but is told to make no code changes and to write only the plan
+# to a dedicated file, which the loop then posts as a comment. The issue is then
+# labelled PLAN_REVIEW_LABEL and left alone until the user adds the trigger label
+# to run the approved plan (process_issue picks it up and follows it — see
+# comments_have_plan). Returns 0 when a plan was posted, 1 on failure. Mirrors
+# process_issue's setup so the two stay consistent.
+plan_issue() {
+  local num="$1"
+  local title body slug branch log_file comments comments_block plan_file plan
+  local coding_model copilot_rc
+
+  { IFS= read -r -d '' title; IFS= read -r -d '' body; IFS= read -r -d '' comments; } < <(
+    gh issue view "$num" --json title,body,comments \
+      --jq '[.title, (.body // ""), ([.comments[] | "--- @" + (.author.login // "ghost") + " wrote:\n" + (.body // "")] | join("\n"))] | join("\u0000")' 2>/dev/null)
+  slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' \
+          | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)"
+  [ -n "$slug" ] || slug="issue"
+  branch="${BRANCH_PREFIX}${num}-${slug}"
+  log_file="$LOG_DIR/issue-${num}-plan-$(date '+%Y%m%d-%H%M%S').log"
+  CURRENT_RUN_LOG="$log_file"
+
+  log "issue #$num on $REPO_SLUG: planning: $title"
+
+  # Prepare a workspace so Copilot can read the repository while drafting the
+  # plan. The branch is never pushed; it (and its worktree) is cleaned up below.
+  git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+  local start="origin/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
+  if ! prepare_workspace "$branch" "$start"; then
+    _fail_issue "$num" "$log_file" "could not create plan workspace $branch"
+    return 1
+  fi
+
+  # Copilot writes the plan here (inside the gitignored control dir of the
+  # workspace, so it is never part of any diff). Cleared defensively.
+  plan_file="$WORKSPACE_DIR/.copilot-loop/issue-${num}.plan.md"
+  mkdir -p "$(dirname "$plan_file")" 2>/dev/null || true
+  rm -f "$plan_file"
+
+  log "issue #$num: drafting plan on branch $branch"
+  set_terminal_title "$branch (plan)"
+
+  comments_block=""
+  [ -n "$comments" ] && comments_block=$'\n\nConversation so far (most recent last):\n'"$comments"
+
+  local prompt
+  prompt="$(cat <<EOF
+You are working in a git repository. Your task is to PLAN the work for a GitHub
+issue — not to implement it.
+
+Issue #${num}: ${title}
+
+${body}${comments_block}
+
+Investigate the repository as needed to understand the code, then write a clear,
+actionable implementation plan for resolving this issue. Do NOT make any code
+changes, do NOT run git, and do NOT open a pull request — this is a planning step
+only. The plan will be posted on the issue for a human to review before any code
+is written, so make it self-contained and easy to follow: summarise the approach,
+list the concrete steps and the files/functions each step touches, note the tests
+to add, and call out risks, assumptions, or open questions.
+
+Write the plan as GitHub-flavoured Markdown to this file (create it, overwriting
+any existing content) and write nothing else to disk:
+  ${plan_file}
+EOF
+)"
+
+  coding_model="$COPILOT_MODEL"
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
+  [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
+
+  log "issue #$num: running copilot to draft plan (log: $log_file)"
+  if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+    _fail_issue "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run"
+    return 1
+  fi
+  run_copilot "$log_file" "${copilot_args[@]}"
+  copilot_rc=$COPILOT_RC
+  cd "$REPO_DIR" 2>/dev/null || true
+  log "issue #$num: copilot (plan) exited with code $copilot_rc"
+
+  _report_usage issue "$num" "$log_file" "$coding_model"
+
+  if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+    _fail_issue "$num" "$log_file" "copilot timed out after ${COPILOT_TIMEOUT} while planning (rc=$copilot_rc)"
+    return 1
+  fi
+
+  if [ ! -s "$plan_file" ]; then
+    _fail_issue "$num" "$log_file" "copilot produced no plan (rc=$copilot_rc)"
+    return 1
+  fi
+
+  plan="$(cat "$plan_file" 2>/dev/null)"
+  log "issue #$num: plan drafted, posting for review"
+  # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
+  gh issue comment "$num" --body "$(printf '**copilot-loop drafted an implementation plan for this issue.**\n\nReview the plan below. When you are happy with it, add the `%s` label and the loop will implement it. To change the plan, leave a comment with your adjustments before adding `%s` — the most recent plan in the thread is what gets executed.\n\n---\n\n%s\n\n%s' \
+    "$TRIGGER_LABEL" "$TRIGGER_LABEL" "$plan" "$PLAN_MARKER")" >/dev/null 2>&1 || true
+  gh issue edit "$num" --add-label "$PLAN_REVIEW_LABEL" >/dev/null 2>&1 || true
+  gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  log "issue #$num: PLAN posted -> waiting for user to add '$TRIGGER_LABEL'"
+  cleanup_workspace "$branch"
+  return 0
+}
+
 # --- Issue dependencies: "Wait for: #N" --------------------------------------
 # An issue can declare that it must not be started until one or more other
 # issues are finished by putting a line like "Wait for: #1" in its body. The
@@ -1967,13 +2137,14 @@ pending_action() {
 # <<< pending-label helpers <<<
 
 # Reconcile the pending label across the whole open working set (issues carrying
-# the trigger, needs-info or failed label) so it always reflects reality: mark
-# an issue "pending" while it waits for an open dependency and unmark it once
+# the trigger, plan, needs-info or failed label) so it always reflects reality:
+# mark an issue "pending" while it waits for an open dependency and unmark it once
 # nothing blocks it. Only issues whose state actually changed are edited, and gh
 # failures never abort the loop. Relies on issue_open_blockers and pending_action.
 reconcile_pending_labels() {
   local nums n body blockers has_pending
   nums="$( { gh issue list --state open --label "$TRIGGER_LABEL"    --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$PLAN_LABEL"       --limit 1000 --json number --jq '.[].number' 2>/dev/null;
              gh issue list --state open --label "$NEEDS_INFO_LABEL" --limit 1000 --json number --jq '.[].number' 2>/dev/null;
              gh issue list --state open --label "$FAILED_LABEL"     --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
            | sort -n -u )"
@@ -2018,6 +2189,9 @@ claim_next_ready_issue() {
     gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
     gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
+    # If this issue was planned first, the trigger label the user added to run the
+    # plan is what got us here; drop the now-stale review label as we start work.
+    gh issue edit "$issue" --remove-label "$PLAN_REVIEW_LABEL" >/dev/null 2>&1 || true
     break
   # Emit one joined string, not a stream: gh/jq append a newline after every
   # streamed result, and with NUL-delimited records that newline leaks into the
@@ -2031,6 +2205,44 @@ claim_next_ready_issue() {
   [ -n "$issue" ] && printf '%s\n' "$issue"
   [ -n "$issue" ]
 }
+
+# Atomically find and claim the next issue that should be PLANNED (carries the
+# plan label), protected by the GitHub lock. Mirrors claim_next_ready_issue but
+# for PLAN_LABEL: oldest first, skipping issues blocked by an open dependency,
+# and claims by adding "in-progress" and removing the plan/pending labels so no
+# other instance grabs the same one. Returns the issue number on success, empty
+# string if none available. Extracted verbatim by tests/plan-mode.test.sh, so
+# keep the marker comments intact.
+# >>> plan-issue helpers >>>
+claim_next_plan_issue() {
+  local n body blockers issue=""
+  acquire_github_lock || return 1
+
+  while IFS= read -r -d '' n && IFS= read -r -d '' body; do
+    blockers="$(issue_open_blockers "$n" "$body")"
+    if [ -n "$blockers" ]; then
+      log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
+      continue
+    fi
+    # Claim it while HOLDING THE LOCK: add in-progress and drop the plan label so
+    # the plan is generated exactly once and no other instance re-plans it. The
+    # review label is added later, once the plan has been posted.
+    issue="$n"
+    gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$PLAN_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
+    break
+  # See claim_next_ready_issue for why the records are emitted as one NUL-only
+  # joined string rather than a newline-terminated stream.
+  done < <(gh issue list --state open --label "$PLAN_LABEL" --limit 1000 \
+             --json number,body \
+             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000"] | join("")' 2>/dev/null)
+
+  release_github_lock
+  [ -n "$issue" ] && printf '%s\n' "$issue"
+  [ -n "$issue" ]
+}
+# <<< plan-issue helpers <<<
 
 # Log the open issues currently carrying the trigger label (the ready queue),
 # oldest first, so the operator can see the backlog before the next issue is
@@ -2732,6 +2944,18 @@ while true; do
   if [ -n "$next_issue" ]; then
     log "issue #$next_issue: user replied, resuming"
     process_issue "$next_issue" || true
+    continue
+  fi
+
+  # Plan mode: an issue labelled with the plan label is drafted into an
+  # implementation plan (no code changes) that is posted for review, instead of
+  # being implemented straight away. Claimed atomically under the lock like ready
+  # issues; the issue then waits (labelled plan-review) for the user to add the
+  # trigger label, which routes it through normal execution above/below.
+  plan_target="$(claim_next_plan_issue || true)"
+  if [ -n "$plan_target" ]; then
+    log "issue #$plan_target: labelled '$PLAN_LABEL', drafting a plan for review"
+    plan_issue "$plan_target" || true
     continue
   fi
 
