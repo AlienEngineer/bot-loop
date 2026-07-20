@@ -12,3 +12,8 @@ serde_json = "1.0.150"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Profile the release workflow builds with for the Homebrew universal binary.
+[profile.dist]
+inherits = "release"
+lto = "thin"

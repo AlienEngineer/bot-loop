@@ -14,18 +14,21 @@ use crate::github::Issue;
 use crate::logs;
 use crate::runner::{WorkerStatus, WorkerView};
 
-/// Draw the whole UI: header, issue list (or placeholder), and footer.
+/// Draw the whole UI: header, issue list (or placeholder), the feedback message
+/// line, and the keybinds footer.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let workers = app.workers_running();
-    let [header_area, body_area, footer_area] = Layout::vertical([
+    let [header_area, body_area, message_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
     render_header(frame, header_area, app, workers);
     render_body(frame, body_area, app);
+    render_message(frame, message_area, app);
     render_footer(frame, footer_area, app);
 
     // The model picker floats above everything else when open.
@@ -66,6 +69,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // The reply popup floats on top of everything else when open (#165).
     if app.reply_open() {
         render_reply(frame, frame.area(), app);
+    }
+    // The messages popup floats on top of everything else when open (#182).
+    if app.messages_open() {
+        render_messages(frame, frame.area(), app);
     }
     // The leader-key action menu floats above the list as a which-key popup so
     // the bindings are discoverable after tapping `space` (#160).
@@ -374,7 +381,10 @@ fn reporting_indicator(reporting: bool, spinner: &str) -> Option<Span<'static>> 
     })
 }
 
-fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+/// The feedback message line, drawn just above the keybinds so status messages
+/// never crowd the bindings (#182). Shows the in-flight refreshing/summarizing
+/// indicators and the latest status message; blank when there is nothing to say.
+fn render_message(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some(indicator) = refreshing_indicator(app.is_refreshing(), spinner_frame()) {
         spans.push(indicator);
@@ -389,8 +399,15 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             format!(" {status} "),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw("  "));
     }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The keybinds footer: the leader badge while the action menu is open (#160),
+/// otherwise the base navigation hint. Feedback messages live on their own line
+/// above this one so they never share the keybinds line (#182).
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = Vec::new();
     if app.leader_active() {
         // The full binding list now lives in the leader popup (#160); the footer
         // just flags the menu is open and how to leave it.
@@ -435,6 +452,7 @@ fn leader_actions(app: &App) -> Vec<(&'static str, &'static str)> {
         ("l", "add-worker"),
         ("L", "stop-all"),
         ("b", "bots"),
+        ("M", "messages"),
         ("a", "auto-merge"),
         ("q", "qa"),
         ("s", "summary"),
@@ -1296,6 +1314,46 @@ fn bot_item(view: &WorkerView) -> ListItem<'static> {
     ]))
 }
 
+/// Draw the messages popup: a centered, scrollable log of the feedback messages
+/// the TUI has reported, newest first, so a status that scrolled past on the
+/// message line can be read back later (#182). A [`Clear`] underneath wipes the
+/// cells so the list behind it does not show through.
+fn render_messages(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let messages: Vec<String> = app.messages().to_vec();
+    let title = format!(" Messages · {} ", messages.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" j/k move · g/G top/bottom · Esc close ").centered())
+        .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    if messages.is_empty() {
+        let body = Paragraph::new("No messages yet.")
+            .block(block)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(body, popup);
+        return;
+    }
+
+    // Newest first so the latest feedback sits at the top of the log.
+    let items: Vec<ListItem> = messages
+        .iter()
+        .rev()
+        .map(|message| ListItem::new(Line::from(message.clone())))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, popup, &mut app.messages_state);
+}
+
 /// A rectangle of `width` columns and `height` rows centered within `area`,
 /// clamped to fit. `width` is a percentage of `area`'s width.
 fn centered_popup(area: Rect, width_pct: u16, height: u16) -> Rect {
@@ -1474,6 +1532,18 @@ mod tests {
             .collect()
     }
 
+    /// The text of a single terminal row, so a test can assert what lands on a
+    /// specific line (e.g. the message line vs the keybinds line) (#182).
+    fn row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let start = row as usize * width;
+        buffer.content[start..start + width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn renders_issue_rows() {
         let issues = parse_issues(
@@ -1590,8 +1660,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "c", "r", "x", "d", "i", "l", "L", "b", "a", "q", "s", "m", "o", "p", "t", "$",
-                "f", "Esc"
+                "c", "r", "x", "d", "i", "l", "L", "b", "M", "a", "q", "s", "m", "o", "p", "t",
+                "$", "f", "Esc"
             ]
         );
         // An unlabelled selection is offered *ready*…
@@ -1646,9 +1716,10 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("Refreshing"));
-        // The refreshing indicator shares the footer with the leader badge…
+        // The refreshing indicator now lives on the message line, while the leader
+        // badge stays on the keybinds line below it (#182)…
         assert!(text.contains("ACTIONS"));
-        // …while the bindings live in the popup above it (#160).
+        // …and the bindings live in the popup above them both (#160).
         assert!(text.contains("f refresh"));
     }
 
@@ -2583,5 +2654,69 @@ mod tests {
         assert!(text.contains("pid 4242"));
         // A stopped/failed worker shows no live pid and defaults to the auto model.
         assert!(text.contains("model auto"));
+    }
+
+    #[test]
+    fn message_line_sits_on_its_own_row_above_the_keybinds() {
+        // Feedback moves off the keybinds line onto its own line above it (#182).
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.set_status("Created issue #7.");
+        let height = 10u16;
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let message_row = row_text(&terminal, height - 2);
+        let keybinds_row = row_text(&terminal, height - 1);
+        // The status shows on the message line…
+        assert!(message_row.contains("Created issue #7."));
+        // …the keybinds show on their own line…
+        assert!(keybinds_row.contains("space actions"));
+        // …and the two never share a line.
+        assert!(!keybinds_row.contains("Created issue #7."));
+        assert!(!message_row.contains("space actions"));
+    }
+
+    #[test]
+    fn messages_popup_lists_the_recorded_feedback_newest_first() {
+        let mut app = App::new(Vec::new());
+        app.set_status("Older message.");
+        app.set_status("Newer message.");
+        app.open_messages();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Messages"));
+        assert!(text.contains("Older message."));
+        assert!(text.contains("Newer message."));
+        assert!(text.contains("Esc close"));
+    }
+
+    #[test]
+    fn messages_popup_shows_a_placeholder_when_empty() {
+        let mut app = App::new(Vec::new());
+        app.open_messages();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("No messages yet."));
+    }
+
+    #[test]
+    fn leader_popup_advertises_the_messages_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("M messages"));
     }
 }
