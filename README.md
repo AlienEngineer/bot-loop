@@ -188,6 +188,16 @@ author, date, and body) — so an issue can be read without leaving the TUI. The
 content is fetched fresh with `gh issue view`; scroll it with `j`/`k` (`g`/`G`
 jump to top/bottom) and `Esc` (or `d`/`q`) closes it (#152).
 
+Press `space` then `i` to reply to a Copilot question straight from the TUI (#165).
+When Copilot needs more information it posts the question on the issue and labels
+it `needs-info`; those issues carry a magenta `?` marker in the list so a pending
+question is easy to spot. The popup shows Copilot's question (fetched fresh with
+`gh issue view`) above a text field for your answer: type your reply, `↑`/`↓`
+scroll a long question, `Enter` inserts a newline, `Ctrl+S` posts the reply as an
+issue comment, and `Esc` cancels. A running loop then resumes the issue on its
+next pass — it picks a `needs-info` issue back up once the latest comment is not
+its own — so the reply alone unblocks it and no label needs changing by hand.
+
 Press `space` then `b` to open the bots popup: a list of every worker the session has
 started, each showing its slot, status (`running`, `stopped`, or `failed`), and
 model. Navigate with `j`/`k`; press `r` (or `Enter`) to restart the selected
@@ -210,14 +220,16 @@ you out of the TUI (#167). Press
 `space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
 the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
-comments, `l` add a background worker, `L` stop all workers, `b` bots (restart a
+comments, `i` reply to a Copilot question (`needs-info` issues), `l` add a
+background worker, `L` stop all workers, `b` bots (restart a
 stopped/failed worker in place, or all with `R`), `a` toggle
 auto-merge, `q` toggle quality assurance, `s` toggle the closing summary, `m` pick
 the model, `o` show/hide the output panel, `p` show the resolving-PRs popup, `t`
 show closed issues and their cost, `$` open the cost dashboard, `f` refresh, `Esc`
 cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
-description), `Ctrl+S` creates, `Esc` cancels.
+description), `Ctrl+S` creates, `Esc` cancels. In the reply popup: `↑`/`↓`
+scroll the question, `Enter` adds a newline, `Ctrl+S` sends, `Esc` cancels.
 
 
 ### Branch and worktree cleanup
@@ -340,7 +352,7 @@ Each issue moves through these labels:
 | `ready` | Trigger label — queued and waiting to be picked up (this is the default; configurable via `--trigger-label`). |
 | `pending` | Held back because it declares a still-open dependency (`Wait for: #N`). Cleared once every dependency closes. |
 | `in-progress` | Claimed by a loop instance and being worked on. |
-| `needs-info` | Copilot asked a question; waiting for a human reply. A reply resumes the issue. |
+| `needs-info` | Copilot asked a question; waiting for a human reply. Reply from the TUI with `space` then `i`, or comment on the issue; a reply resumes it. |
 | `copilot-done` | Resolved successfully and a PR was opened. |
 | `copilot-failed` | Failed; the loop does not retry automatically. A later human reply resumes it for another attempt. |
 
