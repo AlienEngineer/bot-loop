@@ -875,7 +875,7 @@ fn bar_dims(width: u16, days: u32) -> (u16, u16) {
 
 /// Build one bar per day from `values`, labelling only day 1 and every fifth day
 /// so the axis stays legible across a full month, and blanking each bar's value
-/// text (the KPI header and titles carry the numbers) so the graph reads as a
+/// text (the Y-axis and KPI header carry the numbers) so the graph reads as a
 /// shape rather than a wall of figures (#163).
 fn day_bars(values: &[u64]) -> Vec<Bar<'static>> {
     values
@@ -894,6 +894,89 @@ fn day_bars(values: &[u64]) -> Vec<Bar<'static>> {
                 .text_value(String::new())
         })
         .collect()
+}
+
+/// Build the right-aligned Y-axis gutter for a day chart whose drawing area is
+/// `height` rows tall (bars fill every row above the bottom X-axis label row).
+/// The scale runs from `max` at the top down to `0` on the baseline row, with a
+/// handful of evenly spaced rows carrying a tick value and every row drawing the
+/// vertical rule, so the reader sizes each bar against values on the axis instead
+/// of a number stamped on every bar (#203). Pure for testing.
+fn y_axis(max: u64, height: u16) -> Vec<Line<'static>> {
+    let h = height.max(1);
+    if h == 1 {
+        return vec![Line::from("0 └")];
+    }
+    let span = h - 1; // rows between the top of the scale and the baseline
+    let mut lines: Vec<Line<'static>> = (0..h)
+        .map(|i| {
+            if i == h - 1 {
+                Line::from("0 └")
+            } else {
+                Line::from("│")
+            }
+        })
+        .collect();
+    if max == 0 {
+        return lines;
+    }
+
+    // Aim for a tick roughly every three rows, but never more ticks than the axis
+    // has rows or whole-number values to place — so a small scale (e.g. max issues
+    // of 1) shows just its endpoints rather than a run of rounded-down zeros.
+    let mut divisions = (span / 3).clamp(1, 5).min(span);
+    if u64::from(divisions) > max {
+        divisions = max as u16;
+    }
+    for k in 1..=divisions {
+        let value = max * u64::from(k) / u64::from(divisions);
+        let pos =
+            (u32::from(k) * u32::from(span) + u32::from(divisions) / 2) / u32::from(divisions);
+        let row = span - pos.min(u32::from(span)) as u16;
+        lines[usize::from(row)] = Line::from(format!("{value} ┤"));
+    }
+    lines
+}
+
+/// Draw one day chart: a titled panel with a labelled Y-axis down the left gutter
+/// and the day bars filling the rest, so spend (or issue count) reads against a
+/// scale on the axis rather than a value printed on every bar (#203).
+fn draw_day_chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    values: &[u64],
+    days: u32,
+    color: Color,
+) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(title.to_string());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let max = values.iter().copied().max().unwrap_or(0);
+    let gutter_width = ((max.to_string().len() as u16) + 2)
+        .clamp(3, 8)
+        .min(inner.width);
+    let [gutter, plot] =
+        Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(0)]).areas(inner);
+
+    let axis = Paragraph::new(y_axis(max, inner.height))
+        .alignment(Alignment::Right)
+        .style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(axis, gutter);
+
+    let (bar_width, bar_gap) = bar_dims(plot.width, days);
+    let chart = BarChart::new(day_bars(values))
+        .bar_width(bar_width)
+        .bar_gap(bar_gap)
+        .bar_style(Style::new().fg(color))
+        .label_style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(chart, plot);
 }
 
 /// The dashboard's KPI header: total spent this month, how many issues were
@@ -978,33 +1061,24 @@ fn render_cost(frame: &mut Frame, area: Rect, app: &App) {
             .areas(charts_area);
 
     let cost_values: Vec<u64> = mc.cost_per_day.iter().map(|c| c.round() as u64).collect();
-    let (bar_width, bar_gap) = bar_dims(cost_area.width, mc.days);
-    let cost_chart = BarChart::new(day_bars(&cost_values))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title("Cost / day (cr)"),
-        )
-        .bar_width(bar_width)
-        .bar_gap(bar_gap)
-        .bar_style(Style::new().fg(Color::Green))
-        .label_style(Style::new().fg(Color::DarkGray));
-    frame.render_widget(cost_chart, cost_area);
+    draw_day_chart(
+        frame,
+        cost_area,
+        "Cost / day (cr)",
+        &cost_values,
+        mc.days,
+        Color::Green,
+    );
 
     let issue_values: Vec<u64> = mc.issues_per_day.iter().map(|&n| u64::from(n)).collect();
-    let max_issues = issue_values.iter().copied().max().unwrap_or(0);
-    let (bar_width, bar_gap) = bar_dims(issues_area.width, mc.days);
-    let issue_chart = BarChart::new(day_bars(&issue_values))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title(format!("Issues / day · max {max_issues}")),
-        )
-        .bar_width(bar_width)
-        .bar_gap(bar_gap)
-        .bar_style(Style::new().fg(Color::Cyan))
-        .label_style(Style::new().fg(Color::DarkGray));
-    frame.render_widget(issue_chart, issues_area);
+    draw_day_chart(
+        frame,
+        issues_area,
+        "Issues / day",
+        &issue_values,
+        mc.days,
+        Color::Cyan,
+    );
 }
 
 /// Build the details popup's content as logical (pre-wrap) lines, each paired
@@ -2492,6 +2566,73 @@ mod tests {
         assert!(text.contains("Issues / day"));
         // The peak day surfaces the day's spend.
         assert!(text.contains("Peak day"));
+    }
+
+    #[test]
+    fn y_axis_scales_from_max_down_to_zero() {
+        let plain = |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let lines: Vec<String> = y_axis(120, 10).iter().map(plain).collect();
+
+        assert_eq!(lines.len(), 10);
+        // The top of the axis carries the max as a tick value, not the bars.
+        assert!(
+            lines[0].starts_with("120"),
+            "top tick = max, got {:?}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with('┤'));
+        // The baseline is zero with a corner rule that meets the X-axis.
+        assert_eq!(lines[9], "0 └");
+        // Every row draws a rule so the axis reads as one continuous line.
+        for l in &lines {
+            let last = l.chars().last().unwrap();
+            assert!(matches!(last, '┤' | '│' | '└'), "row {:?} lacks a rule", l);
+        }
+        // An intermediate tick interpolates a value strictly between 0 and max.
+        let ticks: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+            .collect();
+        assert!(ticks.contains(&120) && ticks.contains(&0));
+        assert!(
+            ticks.iter().any(|&v| v > 0 && v < 120),
+            "no interior tick in {ticks:?}"
+        );
+
+        // A single-row axis degrades to just the baseline.
+        assert_eq!(y_axis(50, 1), vec![Line::from("0 └")]);
+        // A zero max never divides by zero: only the baseline is labelled, the
+        // rest of the axis is a plain rule.
+        let zero = y_axis(0, 6);
+        assert_eq!(plain(zero.last().unwrap()), "0 └");
+        assert!(zero[..zero.len() - 1].iter().all(|l| plain(l) == "│"));
+    }
+
+    #[test]
+    fn cost_dashboard_draws_a_labelled_y_axis() {
+        // Date the usage in the current month so it lands in the dashboard's view.
+        let m = crate::cost::current_month();
+        let date = format!("{:04}-{:02}-02T10:00:00Z", m.year, m.month);
+        let body = "```\nAI Credits 120 (1s)\n```\n<!-- copilot-loop:usage -->";
+        let json = format!(
+            r#"[{{"number":1,"title":"t","comments":[{{"body":{},"createdAt":"{date}"}}]}}]"#,
+            serde_json::to_string(body).unwrap()
+        );
+        let mut app = App::new(Vec::new());
+        app.open_cost_with(parse_issues(&json).unwrap());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        // The charts now carry a Y-axis: tick marks and a baseline corner down the
+        // left gutter, with the scale value at the top rather than on each bar.
+        assert!(text.contains('┤'), "expected a Y-axis tick rule");
+        assert!(text.contains('└'), "expected a Y-axis baseline corner");
+        assert!(
+            text.contains("120"),
+            "expected the peak spend on the axis scale"
+        );
     }
 
     #[test]
