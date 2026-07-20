@@ -491,6 +491,161 @@ pub fn create_issue(title: &str, body: &str) -> Result<u64> {
     })
 }
 
+/// How much of the session log to feed the summary model when reporting on a
+/// closed issue (#161). Bounded so a long transcript can never blow up the prompt
+/// or the cost — the same cap-the-input approach the loop uses for its cheap
+/// commit-message model.
+pub const SUMMARY_CONTEXT_BYTES: u64 = 16 * 1024;
+
+/// Wall-clock cap (seconds) for the summary `copilot` call, so a hung model never
+/// leaves the reporter thread stuck. Applied only when a `timeout` utility is on
+/// PATH, mirroring the loop's `_run_with_timeout`.
+const SUMMARY_TIMEOUT_SECS: u64 = 120;
+
+/// Build the `gh issue comment` arguments. Pure for testing.
+fn comment_issue_args(number: u64, body: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "comment".to_string(),
+        number.to_string(),
+        "--body".to_string(),
+        body.to_string(),
+    ]
+}
+
+/// Post a comment on an issue using the `gh` CLI.
+///
+/// Runs `gh issue comment <number> --body <body>`. Returns an error when `gh` is
+/// missing, not authenticated, or the command fails.
+pub fn comment_issue(number: u64, body: &str) -> Result<()> {
+    // Tests drive the pure arg builder directly; never shell out so the suite
+    // stays hermetic and cannot comment on real issues.
+    if cfg!(test) {
+        return Ok(());
+    }
+
+    let output = Command::new("gh")
+        .args(comment_issue_args(number, body))
+        .output()
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`gh issue comment` failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Build the prompt asking a light model to summarize the work done on an issue
+/// from its session log. Pure for testing.
+fn summary_prompt(number: u64, title: &str, context: &str) -> String {
+    format!(
+        "You are writing a closing comment for GitHub issue #{number} (\"{title}\").\n\
+Below is the tail of the autonomous coding agent's session log for this issue — its own narration (branch, PR) interleaved with the Copilot transcript.\n\
+From it, summarize what was actually done to resolve the issue: the key changes and the outcome (e.g. the PR that was raised or merged).\n\
+Reply with ONLY the summary in GitHub-flavoured Markdown — a short paragraph or a few bullet points. No preamble, no headings, and do not wrap the whole reply in code fences.\n\n\
+--- session log ---\n{context}"
+    )
+}
+
+/// Build the `copilot` arguments for a summary run: the prompt, an optional
+/// `--model`, and the same quiet, no-tool-noise flags the loop's cheap helpers
+/// use. `None`/blank model omits `--model` so Copilot picks. Pure for testing.
+fn summarize_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+    let mut args = vec!["-p".to_string(), prompt.to_string()];
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args.push("--allow-all-tools".to_string());
+    args.push("--no-color".to_string());
+    args.push("--log-level".to_string());
+    args.push("none".to_string());
+    args
+}
+
+/// Tidy a model's summary reply for posting: drop a stray surrounding ``` fence
+/// (models sometimes wrap the whole answer), trim blank edges, and cap the length
+/// so a runaway reply cannot post a wall of text. Pure for testing.
+fn clean_summary(raw: &str) -> String {
+    let mut lines: Vec<&str> = raw.lines().collect();
+    while lines
+        .first()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
+        lines.remove(0);
+    }
+    while lines
+        .last()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
+        lines.pop();
+    }
+    lines.join("\n").trim().chars().take(4000).collect()
+}
+
+/// A `timeout`/`gtimeout` program on PATH, if any, to wall-clock-bound the call.
+fn timeout_program() -> Option<&'static str> {
+    ["timeout", "gtimeout"].into_iter().find(|prog| {
+        Command::new(prog)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Summarize the session behind a just-closed issue with a *light* model so the
+/// summary is cheap (#161).
+///
+/// Feeds the model only the (capped) session-log tail — no repo access needed —
+/// and returns the tidied summary text. The call is wall-clock-bounded when a
+/// `timeout` utility is present so a hung model cannot stall the reporter thread.
+/// Errors when `copilot` is missing, fails, times out, or returns nothing.
+pub fn summarize_session(
+    number: u64,
+    title: &str,
+    context: &str,
+    model: Option<&str>,
+) -> Result<String> {
+    // Tests never invoke `copilot`; hand back a deterministic stand-in so the
+    // reporter's flow can be exercised hermetically.
+    if cfg!(test) {
+        return Ok(format!("Test summary for #{number}."));
+    }
+
+    let prompt = summary_prompt(number, title, context);
+    let args = summarize_args(&prompt, model);
+
+    let output = match timeout_program() {
+        Some(t) => Command::new(t)
+            .arg(SUMMARY_TIMEOUT_SECS.to_string())
+            .arg("copilot")
+            .args(&args)
+            .output(),
+        None => Command::new("copilot").args(&args).output(),
+    }
+    .context("failed to run `copilot` — is the Copilot CLI installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`copilot` summary failed: {}",
+            stderr.trim().replace('\n', " ")
+        );
+    }
+
+    let text = clean_summary(&String::from_utf8_lossy(&output.stdout));
+    if text.is_empty() {
+        anyhow::bail!("`copilot` returned an empty summary");
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +799,52 @@ mod tests {
     #[test]
     fn builds_close_issue_args() {
         assert_eq!(close_issue_args(96), vec!["issue", "close", "96"]);
+    }
+
+    #[test]
+    fn builds_comment_issue_args() {
+        assert_eq!(
+            comment_issue_args(96, "great work"),
+            vec!["issue", "comment", "96", "--body", "great work"]
+        );
+    }
+
+    #[test]
+    fn summary_prompt_carries_the_issue_and_context() {
+        let prompt = summary_prompt(161, "report on close", "branch created\nPR #200 opened");
+        assert!(prompt.contains("#161"));
+        assert!(prompt.contains("report on close"));
+        assert!(prompt.contains("PR #200 opened"));
+        // Asks for markdown only, no fences, so the reply drops straight into a comment.
+        assert!(prompt.contains("Markdown"));
+    }
+
+    #[test]
+    fn summarize_args_include_the_model_and_quiet_flags() {
+        let with = summarize_args("do it", Some("gpt-5-mini"));
+        assert_eq!(with[0], "-p");
+        assert_eq!(with[1], "do it");
+        assert!(with.windows(2).any(|w| w == ["--model", "gpt-5-mini"]));
+        assert!(with.iter().any(|a| a == "--allow-all-tools"));
+        assert!(with.windows(2).any(|w| w == ["--log-level", "none"]));
+    }
+
+    #[test]
+    fn summarize_args_omit_the_model_when_auto() {
+        let auto = summarize_args("do it", None);
+        assert!(!auto.iter().any(|a| a == "--model"));
+        // A blank model is treated the same as auto.
+        let blank = summarize_args("do it", Some("  "));
+        assert!(!blank.iter().any(|a| a == "--model"));
+    }
+
+    #[test]
+    fn clean_summary_strips_wrapping_fences_and_trims() {
+        assert_eq!(
+            clean_summary("```markdown\nDid the thing.\n```"),
+            "Did the thing."
+        );
+        assert_eq!(clean_summary("\n\n  kept  \n\n"), "kept");
     }
 
     #[test]
