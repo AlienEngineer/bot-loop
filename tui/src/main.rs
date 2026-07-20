@@ -73,6 +73,10 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
+    // Closing the TUI stops every worker it started so no detached
+    // `copilot-loop.sh` loop is left running (#209). Runs on every exit path —
+    // the quit prompt, Ctrl-c, or a run error — since all return through here.
+    app.shutdown();
     result
 }
 
