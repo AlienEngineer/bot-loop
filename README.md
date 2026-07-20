@@ -374,11 +374,12 @@ Requires `git`, the authenticated GitHub CLI (`gh auth login`), and the
 Install from the tap with Homebrew:
 
 ```sh
-brew tap alienengineer/bot-loop https://github.com/AlienEngineer/bot-loop
+brew tap alienengineer/bot-loop
 brew install bot-loop
 ```
 
-Homebrew pulls in `git` and `gh`, but not `copilot` — install that separately.
+Homebrew installs a prebuilt universal (arm64 + x86_64) macOS binary and pulls in
+`git` and `gh`, but not `copilot` — install that separately.
 Upgrade with `brew upgrade bot-loop`.
 
 Then run from inside your repository:
