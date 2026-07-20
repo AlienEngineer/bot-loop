@@ -175,6 +175,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The mark-ready confirmation captures keys while it is open (#173).
+    if app.ready_confirm().is_some() {
+        handle_ready_confirm_key(app, key);
+        return;
+    }
+
     // The PR-output popup captures keys while it is open (#143).
     if app.pr_output_open() {
         handle_pr_output_key(app, key);
@@ -285,6 +291,22 @@ fn handle_close_confirm_key(app: &mut App, key: KeyEvent) {
         | KeyCode::Char('q')
         | KeyCode::Esc
         | KeyCode::Enter => app.cancel_close(),
+        _ => {}
+    }
+}
+
+/// Handle keys while the mark-ready confirmation is open (#173). The loop is
+/// already working the in-progress issue, so it defaults to safe: only `y`
+/// confirms; `n`, `Esc`, `q` and Enter cancel, and any other key is ignored so
+/// the prompt stays put — mirroring the close-issue confirmation.
+fn handle_ready_confirm_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_ready(),
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('q')
+        | KeyCode::Esc
+        | KeyCode::Enter => app.cancel_ready(),
         _ => {}
     }
 }
@@ -662,5 +684,51 @@ mod tests {
         assert!(!app.bots_open());
         assert!(!app.quit_confirm());
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn marking_an_in_progress_issue_ready_opens_a_confirmation() {
+        // `space r` on an issue the loop is already working asks first (#173).
+        let issues = parse_issues(
+            r#"[{"number":96,"title":"t","labels":[{"name":"in-progress"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.ready_confirm(), Some(96));
+    }
+
+    #[test]
+    fn n_esc_and_q_cancel_the_ready_prompt() {
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            let issues = parse_issues(
+                r#"[{"number":96,"title":"t","labels":[{"name":"in-progress"}],"author":null}]"#,
+            )
+            .unwrap();
+            let mut app = App::new(issues);
+            press(&mut app, KeyCode::Char(' '));
+            press(&mut app, KeyCode::Char('r'));
+            assert_eq!(app.ready_confirm(), Some(96));
+            press(&mut app, cancel);
+            assert_eq!(
+                app.ready_confirm(),
+                None,
+                "prompt should close on {cancel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbound_key_keeps_the_ready_prompt_open() {
+        let issues = parse_issues(
+            r#"[{"number":96,"title":"t","labels":[{"name":"in-progress"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.ready_confirm(), Some(96));
     }
 }
