@@ -164,9 +164,6 @@ mod tests {
     #[test]
     fn settings_path_lives_under_the_ignored_copilot_loop_dir() {
         let path = settings_path(Path::new("/repo"));
-        assert_eq!(
-            path,
-            PathBuf::from("/repo/.copilot-loop/tui/settings.json")
-        );
+        assert_eq!(path, PathBuf::from("/repo/.copilot-loop/tui/settings.json"));
     }
 }
