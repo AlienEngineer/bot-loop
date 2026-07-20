@@ -315,7 +315,7 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .issues
         .iter()
-        .map(|issue| issue_item(issue, spinner))
+        .map(|issue| issue_item(issue, spinner, app.issue_worker_pid(issue.number)))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -1627,7 +1627,10 @@ fn progress_marker(in_progress: bool, needs_info: bool, spinner: &str) -> Span<'
 
 /// Format a single issue as a list row: an in-progress marker, number, title,
 /// and labels.
-fn issue_item(issue: &Issue, spinner: &str) -> ListItem<'static> {
+/// Build one issue row: a progress marker, the number, the title, any labels,
+/// the author, and — when a background worker (bot) is currently working it —
+/// that worker's pid, so the operator can see which bot is on which issue (#214).
+fn issue_item(issue: &Issue, spinner: &str, worker_pid: Option<u32>) -> ListItem<'static> {
     let mut spans = vec![
         progress_marker(issue.is_in_progress(), issue.needs_info(), spinner),
         Span::styled(
@@ -1653,6 +1656,14 @@ fn issue_item(issue: &Issue, spinner: &str) -> ListItem<'static> {
         spans.push(Span::styled(
             format!("@{author}"),
             Style::new().fg(Color::Green),
+        ));
+    }
+
+    if let Some(pid) = worker_pid {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("bot pid {pid}"),
+            Style::new().fg(Color::Magenta),
         ));
     }
 
@@ -1706,6 +1717,40 @@ mod tests {
         assert!(text.contains("create a TUI"));
         assert!(text.contains("in-progress"));
         assert!(text.contains("octocat"));
+    }
+
+    #[test]
+    fn shows_the_worker_pid_on_the_issue_it_is_working() {
+        let issues = parse_issues(
+            r#"[{"number":96,"title":"create a TUI","labels":[{"name":"in-progress"}],"author":{"login":"octocat"}}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        // The loop published that the worker with this pid is on issue #96, so
+        // the row should name that bot's pid (#214).
+        app.set_worker_issue_pids(std::collections::HashMap::from([(96u64, 4242u32)]));
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("#96"));
+        assert!(text.contains("bot pid 4242"));
+    }
+
+    #[test]
+    fn hides_the_worker_pid_when_no_bot_is_on_the_issue() {
+        let issues = parse_issues(
+            r#"[{"number":96,"title":"create a TUI","labels":[],"author":{"login":"octocat"}}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        // No worker is assigned, so the row carries no bot-pid label (#214).
+        assert!(!buffer_text(&terminal).contains("bot pid"));
     }
 
     #[test]

@@ -91,7 +91,10 @@ While workers run the header shows a turning spinner next to `loop: running`,
 how many workers are running, and the issues they are working (`working #96, #97`,
 or `waiting for work` when idle), and the list refreshes on its own so
 `in-progress` issues — flagged with a spinner in their row — appear as the
-workers claim them, without a manual refresh (#115). The workers also handle pull
+workers claim them, without a manual refresh (#115). An issue a worker is
+actively working also shows that bot's process id on its row (`bot pid 12345`),
+so with several workers running it is clear which one is on which issue (#214).
+The workers also handle pull
 requests (resolving merge conflicts and fixing failing checks); since PRs are not
 in the issue list, the header calls that out with its own spinner and a
 `resolving PR #12` note, and the status line announces each PR a worker starts, so
@@ -315,6 +318,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--agents-model <model>` | `AGENTS_MODEL` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap) (default: `claude-sonnet-4.5`; `off` disables) |
 | `--issues-dir <dir>` | `ISSUES_DIR` | Folder scanned for issue markdown files |
 | `--quiet` | `QUIET` | Log only to files, do not stream to stdout |
+| `--verbose` / `-v` | `VERBOSE` | Narrate each loop phase (sync, sweep, PR scans, queue scan, claim, sleep), not only Copilot's output (default: off) |
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Per-issue worktrees (default: on) |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | Merge each PR automatically |
 | `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | Ask Copilot to add user-perspective tests for each issue (default: on; `--qa`/`--no-qa` aliases) |
@@ -488,6 +492,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--agents-model <model>` | `AGENTS_MODEL` | `claude-sonnet-4.5` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap). Runs once per repo (high-leverage), so it defaults to a capable mid model rather than the cheapest. `off` disables the bootstrap. |
 | `--issues-dir <dir>` | `ISSUES_DIR` | `<repo>/issues` | Folder scanned for issue markdown files. |
 | `--quiet` | `QUIET` | off | Only write Copilot's output to the per-run log files; do not stream it to stdout. |
+| `--verbose` / `-v` | `VERBOSE` | off | Emit extra loop-level narration — each pass's phases (sync, sweep, PR scans, queue scan, claim, sleep) — so the output shows what the loop itself is doing, not only Copilot's transcript. Useful when a run ends and it is not obvious why. |
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | on | Give every issue its own git worktree (never touch the shared checkout), or work in the current checkout instead. |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | off | Merge every PR automatically (GitHub auto-merge when the repo allows it, otherwise an immediate merge), or leave PRs open for manual review. |
 | `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | on | Ask Copilot to add tests for each issue, written from the user's perspective. Aliases: `--qa` / `--no-qa`. Turn off to save cost. |

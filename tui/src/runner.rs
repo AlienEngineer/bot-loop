@@ -9,6 +9,7 @@
 //! a GitHub lock (and isolates each in its own git worktree), so workers always
 //! pick *different* issues (#134).
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -77,6 +78,35 @@ pub fn log_path(repo_root: &Path, worker_id: usize) -> PathBuf {
         .join(".copilot-loop")
         .join("tui")
         .join(format!("loop-{worker_id}.log"))
+}
+
+/// Where `copilot-loop.sh` publishes which issue each worker is on: one file per
+/// loop process, `.copilot-loop/workers/worker-<pid>.issue`, holding the issue
+/// number that process is currently working (`WORKER_STATE_DIR` in the script).
+/// The TUI reads these to show a bot's pid on its issue's row (#214).
+pub fn worker_state_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".copilot-loop").join("workers")
+}
+
+/// Map issue number -> the pid of the worker (bot) working it, read from `dir`'s
+/// `worker-<pid>.issue` files for only the pids in `running` (#214).
+///
+/// Consulting just the running pids is deliberate: a worker that crashed or was
+/// hard-killed can leave a stale file behind, and a foreign process's file must
+/// never mislabel an issue, so a file is trusted only when its pid belongs to a
+/// worker the TUI knows is alive. Missing or malformed files are skipped.
+pub fn worker_issue_map(dir: &Path, running: &[u32]) -> HashMap<u64, u32> {
+    let mut map = HashMap::new();
+    for &pid in running {
+        let path = dir.join(format!("worker-{pid}.issue"));
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(number) = contents.trim().parse::<u64>() {
+            map.insert(number, pid);
+        }
+    }
+    map
 }
 
 /// The first candidate path that exists as a file, if any.
@@ -563,6 +593,53 @@ mod tests {
             log_path(Path::new("/repo"), 3),
             PathBuf::from("/repo/.copilot-loop/tui/loop-3.log")
         );
+    }
+
+    #[test]
+    fn worker_state_dir_is_under_the_state_dir() {
+        assert_eq!(
+            worker_state_dir(Path::new("/repo")),
+            PathBuf::from("/repo/.copilot-loop/workers")
+        );
+    }
+
+    #[test]
+    fn worker_issue_map_reads_running_workers_and_ignores_the_rest() {
+        let dir = std::env::temp_dir().join(format!("copilot-loop-workers-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // A running worker (pid 111) on issue #96, a running worker (pid 222) on
+        // issue #97, a stale file from a crashed worker (pid 333) no longer
+        // running, and a malformed file (pid 444).
+        fs::write(dir.join("worker-111.issue"), "96\n").unwrap();
+        fs::write(dir.join("worker-222.issue"), "97").unwrap();
+        fs::write(dir.join("worker-333.issue"), "500\n").unwrap();
+        fs::write(dir.join("worker-444.issue"), "not-a-number").unwrap();
+
+        // Only pids the caller says are running are trusted; 333's stale file and
+        // 444's malformed file are ignored (#214).
+        let map = worker_issue_map(&dir, &[111, 222, 444]);
+
+        assert_eq!(map.get(&96), Some(&111));
+        assert_eq!(map.get(&97), Some(&222));
+        assert_eq!(map.get(&500), None); // pid 333 not in the running set
+        assert_eq!(map.len(), 2); // pid 444's malformed file contributed nothing
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_issue_map_is_empty_when_nothing_is_running() {
+        let dir =
+            std::env::temp_dir().join(format!("copilot-loop-workers-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("worker-111.issue"), "96\n").unwrap();
+
+        // No running pids -> no issue is attributed to a worker, even though a
+        // file exists on disk (#214).
+        assert!(worker_issue_map(&dir, &[]).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
