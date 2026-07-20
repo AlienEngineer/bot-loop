@@ -42,6 +42,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(number) = app.close_confirm() {
         render_close_confirm(frame, frame.area(), app, number);
     }
+    // The mark-ready confirmation floats on top of the list (#173).
+    if let Some(number) = app.ready_confirm() {
+        render_ready_confirm(frame, frame.area(), app, number);
+    }
     // The PR-output popup floats on top of everything else when open (#143).
     if app.pr_output_open() {
         render_pr_output(frame, frame.area(), app);
@@ -581,6 +585,46 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
             Style::new().fg(Color::DarkGray),
         )),
         Line::from(summary_line),
+    ])
+    .block(block)
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(body, popup);
+}
+
+/// Draw the mark-ready confirmation popup: a centered prompt naming the
+/// in-progress issue about to be re-queued with the trigger label, with a
+/// [`Clear`] underneath so the list does not show through (#173). A yellow
+/// border marks it a caution rather than a destructive action.
+fn render_ready_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
+    let title = app
+        .issues
+        .iter()
+        .find(|issue| issue.number == number)
+        .map(|issue| issue.title.clone())
+        .unwrap_or_default();
+
+    let popup = centered_popup(area, 50, 7);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Mark #{number} ready? "))
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" y confirm · n/Esc cancel ").centered())
+        .border_style(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    let body = Paragraph::new(vec![
+        Line::from(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The loop is already working this issue; marking it ready re-queues it.",
+            Style::new().fg(Color::DarkGray),
+        )),
     ])
     .block(block)
     .wrap(Wrap { trim: false });
@@ -1829,6 +1873,24 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("Quit bot-loop?"));
         assert!(text.contains("y quit"));
+        assert!(text.contains("cancel"));
+    }
+
+    #[test]
+    fn renders_the_ready_confirmation_for_an_in_progress_issue() {
+        let issues = parse_issues(
+            r#"[{"number":96,"title":"create a TUI","labels":[{"name":"in-progress"}],"author":null}]"#,
+        )
+        .unwrap();
+        let mut app = App::new(issues);
+        app.toggle_ready(); // in-progress → opens the confirmation (#173)
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Mark #96 ready?"));
+        assert!(text.contains("y confirm"));
         assert!(text.contains("cancel"));
     }
 

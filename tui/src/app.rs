@@ -114,6 +114,10 @@ pub struct App {
     show_output: bool,
     /// The number of the issue awaiting a close confirmation, if any (#118).
     close_confirm: Option<u64>,
+    /// The number of the in-progress issue awaiting a *mark ready*
+    /// confirmation, if any. The loop is already working such an issue, so
+    /// re-queuing it with the trigger label asks first (#173).
+    ready_confirm: Option<u64>,
     /// Whether a quit confirmation is open, so a stray `q`/`Esc` asks before it
     /// exits the TUI (#167).
     quit_confirm: bool,
@@ -243,6 +247,7 @@ impl App {
             repo_root: runner::repo_root(),
             show_output: false,
             close_confirm: None,
+            ready_confirm: None,
             quit_confirm: false,
             known_in_progress: Vec::new(),
             auto_merge: false,
@@ -598,16 +603,32 @@ impl App {
                 }
                 Err(err) => self.set_status(format!("Error: {err}")),
             }
+        } else if issue.is_in_progress() {
+            // The loop is already working this issue; re-queuing it with the
+            // trigger label is easy to do by accident, so confirm first (#173).
+            self.ready_confirm = Some(number);
         } else {
-            match github::add_label(number, &label) {
-                Ok(()) => {
-                    self.issues[index].labels.push(Label {
+            self.mark_ready(number);
+        }
+    }
+
+    /// Add the trigger label to issue `number` via `gh`, reflecting it locally
+    /// so the row updates without a refetch and reporting on the status line.
+    /// Shared by the direct path and the in-progress confirmation (#173).
+    fn mark_ready(&mut self, number: u64) {
+        let label = github::ready_label();
+        match github::add_label(number, &label) {
+            Ok(()) => {
+                if let Some(issue) = self.issues.iter_mut().find(|i| i.number == number)
+                    && !issue.has_label(&label)
+                {
+                    issue.labels.push(Label {
                         name: label.clone(),
                     });
-                    self.set_status(format!("#{number} marked '{label}'."));
                 }
-                Err(err) => self.set_status(format!("Error: {err}")),
+                self.set_status(format!("#{number} marked '{label}'."));
             }
+            Err(err) => self.set_status(format!("Error: {err}")),
         }
     }
 
@@ -616,6 +637,28 @@ impl App {
     pub fn selected_is_ready(&self) -> bool {
         let label = github::ready_label();
         self.selected().is_some_and(|issue| issue.has_label(&label))
+    }
+
+    /// The number of the in-progress issue awaiting a *mark ready*
+    /// confirmation, if any (#173).
+    pub fn ready_confirm(&self) -> Option<u64> {
+        self.ready_confirm
+    }
+
+    /// Dismiss the mark-ready confirmation without changing any label (#173).
+    pub fn cancel_ready(&mut self) {
+        if let Some(number) = self.ready_confirm.take() {
+            self.set_status(format!("Marking #{number} 'ready' cancelled."));
+        }
+    }
+
+    /// Apply the pending mark-ready: add the trigger label to the confirmed
+    /// in-progress issue. A no-op when no confirmation is pending (#173).
+    pub fn confirm_ready(&mut self) {
+        let Some(number) = self.ready_confirm.take() else {
+            return;
+        };
+        self.mark_ready(number);
     }
 
     /// The number of the issue awaiting a close confirmation, if any (#118).
@@ -2304,6 +2347,39 @@ mod tests {
         let json = format!(r#"[{{"number":7,"title":"t","labels":[{{"name":"{label}"}}]}}]"#);
         let app = App::new(parse_issues(&json).unwrap());
         assert!(app.selected_is_ready());
+    }
+
+    #[test]
+    fn marking_an_in_progress_issue_ready_asks_for_confirmation() {
+        // An issue the loop is already working (in-progress, not yet ready):
+        // marking it ready opens a confirmation and adds no label until the
+        // operator confirms (#173).
+        let json = r#"[{"number":7,"title":"t","labels":[{"name":"in-progress"}]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.toggle_ready();
+        assert_eq!(app.ready_confirm(), Some(7));
+        assert!(!app.selected_is_ready());
+    }
+
+    #[test]
+    fn cancel_ready_clears_the_prompt_without_marking() {
+        let json = r#"[{"number":7,"title":"t","labels":[{"name":"in-progress"}]}]"#;
+        let mut app = App::new(parse_issues(json).unwrap());
+        app.toggle_ready();
+        assert_eq!(app.ready_confirm(), Some(7));
+        app.cancel_ready();
+        assert_eq!(app.ready_confirm(), None);
+        assert!(!app.selected_is_ready());
+        assert_eq!(app.status.as_deref(), Some("Marking #7 'ready' cancelled."));
+    }
+
+    #[test]
+    fn confirm_ready_without_a_pending_prompt_is_a_no_op() {
+        // No pending confirmation means no gh call and no status change.
+        let mut app = app_with(2);
+        app.confirm_ready();
+        assert_eq!(app.ready_confirm(), None);
+        assert!(app.status.is_none());
     }
 
     #[test]

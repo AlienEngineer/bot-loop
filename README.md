@@ -65,7 +65,9 @@ key (#129): press `space` to reveal them in a which-key popup (#160), then one
 key runs the action (or `Esc` cancels). Press `space` then `r` to toggle the trigger
 label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
 absent so the loop picks the issue up, or removed when present so a
-mistakenly-queued issue can be pulled back out (#146). Press `space` then `c` to create a new issue: fill in a title and description, then
+mistakenly-queued issue can be pulled back out (#146). Marking an `in-progress`
+issue ready asks for confirmation first, since the loop is already working it
+(`y` confirms, `n`/`Esc` cancels) (#173). Press `space` then `c` to create a new issue: fill in a title and description, then
 `Ctrl+S` to submit it (no label is added by default). Press `space` then `x` to close the
 selected issue: a confirmation popup names it (and whether a summary will be
 posted), then `y` closes it on GitHub (`n`/`Esc` cancels), and — unless the
@@ -185,7 +187,8 @@ Keys: `j`/`k` move, `g`/`G` jump to top/bottom, `q` (or `Esc`) quit — which as
 for confirmation first (`y` quits, `n`/`Esc` cancels) so a stray key does not drop
 you out of the TUI (#167). Press
 `space` to open the issue-action menu, then: `c` create a new issue, `r` toggle
-the ready label (mark ready, or remove it if already ready), `x` close the
+the ready label (mark ready, or remove it if already ready; marking an
+`in-progress` issue ready confirms first), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
 comments, `i` reply to a Copilot question (`needs-info` issues), `l` add a
 background worker, `L` stop all workers, `b` bots (restart a
