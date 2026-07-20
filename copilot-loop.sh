@@ -73,9 +73,12 @@
 #      triage is enabled (TRIAGE_MODEL) the issue is first classified by that
 #      cheap model as trivial/normal/complex and the coding model is picked from
 #      TRIAGE_MAP, so cheap issues run on a cheap model; any failure falls back
-#      to the global COPILOT_MODEL. Unless quality assurance is disabled
-#      (QUALITY_ASSURANCE=0 / --no-quality-assurance) the prompt also asks Copilot
-#      to add tests for the work, written from the user's perspective.
+#      to the global COPILOT_MODEL. That same cheap model also checks the issue
+#      is specified well enough to implement: a genuinely vague one is asked a
+#      clarifying question via the needs-info flow (6a) and gets no coding run
+#      (asked at most once, biased toward proceeding). Unless quality assurance
+#      is disabled (QUALITY_ASSURANCE=0 / --no-quality-assurance) the prompt also
+#      asks Copilot to add tests for the work, written from the user's perspective.
 #   5b. Right after the run, post what that prompt cost (the "AI Credits" and
 #      "Tokens" summary Copilot prints at the end, taken from the run's log) as a
 #      comment on the issue/PR, tagged with the hidden "copilot-loop:usage"
@@ -239,8 +242,12 @@ COPILOT_TIMEOUT="${COPILOT_TIMEOUT:-}"
 COMMIT_MODEL="${COMMIT_MODEL:-}"
 # Optional cheap model used to CLASSIFY each issue as trivial/normal/complex
 # before coding, so the expensive coding model is reserved for hard issues (the
-# COMMIT_MODEL idea applied to routing). Empty/"off" disables triage and every
-# issue runs on COPILOT_MODEL exactly as before.
+# COMMIT_MODEL idea applied to routing). The same model also gates genuinely
+# vague issues: when it decides an issue is too under-specified to implement
+# confidently it asks the author a clarifying question (via the needs-info flow)
+# and skips the coding run, asking at most once and biased toward proceeding.
+# Empty/"off" disables triage and every issue runs on COPILOT_MODEL exactly as
+# before.
 TRIAGE_MODEL="${TRIAGE_MODEL:-}"
 # Maps a difficulty class to the coding model, as comma-separated "class=model"
 # pairs, e.g. "trivial=gpt-5-mini,complex=claude-opus-4.5". A class with no entry
@@ -459,8 +466,10 @@ work:
                            "Resolve #<n>: <title>" message         (default: off)
   --triage-model <model>   Cheap model that classifies each issue as
                            trivial/normal/complex before coding so the coding
-                           model can be chosen per difficulty; unset/"off"
-                           disables triage (current behaviour)      (default: off)
+                           model can be chosen per difficulty, and asks the
+                           author to clarify an issue too vague to implement;
+                           unset/"off" disables triage (current behaviour)
+                                                                    (default: off)
   --triage-map <map>       Comma-separated class=model pairs mapping a triage
                            class to the coding model, e.g.
                            "trivial=gpt-5-mini,complex=claude-opus-4.5". An
@@ -732,6 +741,49 @@ parse_triage_map() {
 }
 # <<< triage helpers <<<
 
+# --- Vagueness triage: ask before coding an under-specified issue ------------
+# comments_have_question and parse_vague_question are pure and covered by
+# tests/vague-triage.test.sh (extracted between the markers), so keep the marker
+# comments intact.
+# >>> vagueness helpers >>>
+# Whether an issue's comment thread already carries a question the loop posted
+# (the hidden QUESTION_MARKER string), i.e. we have already asked the author for
+# more information at least once. Used to ask at most once: the vagueness gate is
+# skipped when this is true, so an author's reply resumes the issue best-effort
+# instead of being asked again. Pure (reads the comments string on $1).
+comments_have_question() {
+  case "$1" in
+    *"<!-- copilot-loop:needs-info -->"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Parse the clarity verdict the cheap triage model returns into the clarifying
+# question to ask, or nothing when the issue should proceed to coding. Biased
+# toward proceeding: only an explicit "VAGUE" verdict (the first non-blank line)
+# followed by a non-empty question asks; a "CLEAR" verdict, an empty answer, or
+# any unrecognised text all proceed. Echoes the question (possibly multi-line),
+# or nothing. Pure (reads only $1).
+parse_vague_question() {
+  local raw="$1" body first q
+  # Drop leading blank lines so the verdict keyword is the first thing seen.
+  body="$(printf '%s' "$raw" | sed -e '/[^[:space:]]/,$!d')"
+  first="$(printf '%s\n' "$body" | head -n1 | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//')"
+  case "$first" in
+    vague*)
+      # Strip the leading VAGUE token (and an optional :/-/. separator) from the
+      # first line; the rest of that line plus any following lines is the question.
+      q="$(printf '%s' "$body" | sed -E '1s/^[[:space:]]*[Vv][Aa][Gg][Uu][Ee][[:space:]]*[:.-]?[[:space:]]*//')"
+      # Drop any blank lines the strip left at the front; the trailing newlines
+      # are removed by the command substitution below.
+      q="$(printf '%s' "$q" | sed -e '/[^[:space:]]/,$!d')"
+      [ -n "$q" ] && printf '%s' "$q"
+      ;;
+    *) return 0 ;;
+  esac
+}
+# <<< vagueness helpers <<<
+
 # >>> quality-assurance helpers >>>
 # Decide whether quality assurance is on from a raw config value. QA is ON by
 # default (issue #162 asked for it to run by default), so only the explicit falsy
@@ -807,6 +859,62 @@ EOF
   [ -n "$class" ] && printf '%s' "$class"
   return 0
 }
+
+# Judge with the cheap TRIAGE_MODEL whether an issue is specified well enough for
+# an autonomous coding agent to implement confidently. Echoes the clarifying
+# question(s) to ask when the issue is genuinely too vague, or nothing when it is
+# clear enough to proceed (see parse_vague_question). Biased toward proceeding so
+# it rarely stalls the backlog. Mirrors triage_issue: only the issue text is sent
+# (no repo access needed), the call is time-boxed and pinned to the issue
+# workspace, and every failure/timeout/unrecognised answer falls back to
+# proceeding, so the check can never block or fail the loop. Never returns
+# non-zero. Extracted verbatim by tests/vague-triage.test.sh -- keep the markers.
+# >>> triage-vagueness helper >>>
+triage_vagueness() {
+  local num="$1" title="$2" body="$3" log_file="${4:-/dev/null}"
+  local prompt raw capped question
+
+  [ -n "$TRIAGE_MODEL" ] || return 0
+
+  # Cap the body like triage_issue so a huge issue cannot blow up the prompt/cost.
+  capped="$(printf '%s' "$body" | head -c 4000)"
+
+  prompt="$(cat <<EOF
+You are triaging a GitHub issue for an autonomous coding agent that will
+implement it in one shot, with no chance to ask follow-up questions mid-run.
+Decide whether the issue is specified well enough to implement confidently.
+
+Bias STRONGLY toward proceeding. Only flag an issue when it is genuinely too
+ambiguous to know what to build: the core what or where is missing, it is
+self-contradictory, or it could reasonably be built in several incompatible ways
+with no way to choose. Do NOT flag an issue merely because it omits minor
+detail, edge cases, naming, or polish -- a capable agent fills those in.
+
+Answer in ONE of these two forms and nothing else:
+  CLEAR
+    (the issue is clear enough to implement)
+  VAGUE: <one or two specific clarifying questions>
+    (genuinely too vague; ask only what you must know to start)
+
+Issue #${num}: ${title}
+
+${capped}
+EOF
+)"
+
+  # Cheapest model, no color/logs, time-boxed. Pin to the issue workspace (when
+  # one exists) so the check never runs against the shared checkout. Append
+  # provider noise to the log for debugging but keep stdout to just the verdict.
+  local -a _ws_args=()
+  [ -n "${WORKSPACE_DIR:-}" ] && _ws_args=(-C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR")
+  raw="$(_run_with_timeout 60 copilot -p "$prompt" \
+           ${_ws_args[@]+"${_ws_args[@]}"} \
+           --model "$TRIAGE_MODEL" --allow-all-tools --no-color --log-level none 2>>"$log_file")"
+  question="$(parse_vague_question "$raw")"
+  [ -n "$question" ] && printf '%s' "$question"
+  return 0
+}
+# <<< triage-vagueness helper <<<
 
 # Sleep for the given number of seconds, but wake early if the user presses
 # 'f'. Returns 0 if the full time elapsed, 1 if the user asked to start now.
@@ -1733,6 +1841,16 @@ process_issue() {
     plan_block=$'\n'"An implementation plan for this issue was proposed earlier in the conversation above and approved by the user. Follow that plan. If the user amended it in a later comment, follow the most recent version of the plan."$'\n'
   fi
 
+  # Vagueness gate (#188): before spending a coding run, let the cheap
+  # TRIAGE_MODEL judge whether the issue is specified well enough to implement. If
+  # it is genuinely too vague, ask the author the clarifying question(s) via the
+  # needs-info flow and stop here (no coding run); the issue resumes normally once
+  # they reply. A no-op when triage is off, when we already asked this issue (ask
+  # at most once), or for an approved plan.
+  if maybe_ask_when_vague "$num" "$title" "$body" "$comments" "$question_file" "$log_file"; then
+    return 0
+  fi
+
   local prompt
   prompt="$(cat <<EOF
 You are working in a git repository to resolve a GitHub issue.
@@ -2278,7 +2396,10 @@ _fail_pr_checks() {
 
 # Copilot needs more information: post its question to the issue, mark it
 # "needs-info", and leave it for the user to answer. Discards any work in
-# progress so the branch is clean for the eventual resume.
+# progress so the branch is clean for the eventual resume. maybe_ask_when_vague
+# reuses this same needs-info flow, so tests/vague-triage.test.sh sources both
+# verbatim -- keep the markers intact.
+# >>> needs-info helpers >>>
 _ask_issue() {
   local num="$1" qf="$2" question
   question="$(cat "$qf" 2>/dev/null)"
@@ -2291,6 +2412,38 @@ _ask_issue() {
   rm -f "$qf"
   cleanup_workspace "$branch"
 }
+
+# Vagueness gate (issue #188), triage's "tight issues" cost lever automated.
+# Before spending a coding run, let the cheap TRIAGE_MODEL judge whether the issue
+# is specified well enough to implement; if it is genuinely too vague, post the
+# clarifying question(s) via the existing needs-info flow (_ask_issue) and signal
+# the caller to stop, so no coding run happens and the issue resumes normally once
+# the author replies. Guardrails: it is a no-op (returns 1 -> proceed) when triage
+# is off, when the thread already carries a question we posted (ask at most once,
+# so a reply proceeds best-effort and never loops), or when an approved plan
+# already pins the approach. Returns 0 when it asked (caller must stop, no coding
+# run), 1 when the issue should proceed to coding.
+maybe_ask_when_vague() {
+  local num="$1" title="$2" body="$3" comments="$4" qf="$5" log_file="${6:-/dev/null}"
+  local question
+
+  [ -n "$TRIAGE_MODEL" ] || return 1
+  comments_have_question "$comments" && return 1
+  comments_have_plan "$comments" && return 1
+
+  log "issue #$num: checking clarity with $TRIAGE_MODEL"
+  question="$(triage_vagueness "$num" "$title" "$body" "$log_file")"
+  if [ -z "$question" ]; then
+    log "issue #$num: clear enough to implement -> proceeding"
+    return 1
+  fi
+
+  log "issue #$num: too vague to implement confidently -> asking the author"
+  printf '%s\n' "$question" >"$qf"
+  _ask_issue "$num" "$qf"
+  return 0
+}
+# <<< needs-info helpers <<<
 
 # --- Core: plan a single issue (plan mode) ----------------------------------
 # Instead of implementing the issue, ask Copilot for an implementation plan and

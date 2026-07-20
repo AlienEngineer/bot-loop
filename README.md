@@ -295,7 +295,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--model <model>` | `COPILOT_MODEL` | Model passed to `copilot --model` |
 | `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | Wall-clock limit for each Copilot run so a stuck run cannot block the loop; seconds or an `s`/`m`/`h`/`d` suffix (`30m`), `0`/`off` disables (default: `30m`) |
 | `--commit-model <model>` | `COMMIT_MODEL` | Model that writes the commit message |
-| `--triage-model <model>` | `TRIAGE_MODEL` | Cheap model that classifies each issue |
+| `--triage-model <model>` | `TRIAGE_MODEL` | Cheap model that classifies each issue and asks the author to clarify vague ones |
 | `--triage-map <map>` | `TRIAGE_MAP` | `class=model` pairs mapping difficulty to model |
 | `--agents-model <model>` | `AGENTS_MODEL` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap) (default: `claude-sonnet-4.5`; `off` disables) |
 | `--issues-dir <dir>` | `ISSUES_DIR` | Folder scanned for issue markdown files |
@@ -436,7 +436,10 @@ Each pass the loop:
    never collide).
 7. Creates a branch — and its own worktree — from the latest default branch.
 8. Runs Copilot to resolve it, then posts the run's cost as an issue comment.
-   Unless disabled, Copilot also adds tests from the user's perspective.
+   Unless disabled, Copilot also adds tests from the user's perspective. When
+   triage is on, the cheap model first checks the issue is specified well enough;
+   a genuinely vague one is asked a clarifying question (labelled `needs-info`)
+   and skips the coding run (asked at most once, biased toward proceeding).
 9. If Copilot needs more info, posts the question, labels the issue `needs-info`,
    and waits. Otherwise commits, rebases the branch onto the latest default
    branch — handing any rebase conflicts to Copilot to resolve rather than
@@ -461,7 +464,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--model <model>` | `COPILOT_MODEL` | auto | Model passed to `copilot --model`. |
 | `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | `30m` | Wall-clock limit per Copilot run so a stuck run cannot block the loop. Seconds, or an `s`/`m`/`h`/`d` suffix (`1800`, `30m`, `2h`); `0`/`off` disables it. |
 | `--commit-model <model>` | `COMMIT_MODEL` | `off` | Model that writes the commit message from the staged diff. `off` uses a deterministic `Resolve #<n>: <title>` message. |
-| `--triage-model <model>` | `TRIAGE_MODEL` | `off` | Cheap model that classifies each issue as trivial/normal/complex before coding, so the coding model can be chosen per difficulty. `off` disables triage. |
+| `--triage-model <model>` | `TRIAGE_MODEL` | `off` | Cheap model that classifies each issue as trivial/normal/complex before coding, so the coding model can be chosen per difficulty. The same model also checks whether the issue is specified well enough: a genuinely vague one is asked a clarifying question (labelled `needs-info`) and gets no coding run — asked at most once and biased toward proceeding. `off` disables triage. |
 | `--triage-map <map>` | `TRIAGE_MAP` | unset | Comma-separated `class=model` pairs mapping a triage class to the coding model, e.g. `trivial=gpt-5-mini,complex=claude-opus-4.5`. An unmapped class falls back to `--model`. |
 | `--agents-model <model>` | `AGENTS_MODEL` | `claude-sonnet-4.5` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap). Runs once per repo (high-leverage), so it defaults to a capable mid model rather than the cheapest. `off` disables the bootstrap. |
 | `--issues-dir <dir>` | `ISSUES_DIR` | `<repo>/issues` | Folder scanned for issue markdown files. |
