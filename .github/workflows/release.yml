@@ -1,9 +1,11 @@
 name: release
 
 # Every push to main cuts a new patch release: bump the version in the sources,
-# tag it, publish a GitHub release, and repoint the Homebrew formula at the new
-# tag's tarball so `brew upgrade` picks it up. The two bot commits carry
-# "[skip ci]" so this workflow never retriggers itself.
+# tag it, build a universal (arm64 + x86_64) macOS binary, publish a GitHub
+# release with that prebuilt tarball, and repoint the Homebrew formula at it —
+# mirrored to the alienengineer/homebrew-bot-loop tap so `brew upgrade` picks it
+# up. The two bot commits carry "[skip ci]" so this workflow never retriggers
+# itself.
 on:
   push:
     branches: [main]
@@ -17,7 +19,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     # Skip the workflow's own version-bump / formula commits.
     if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
     steps:
@@ -55,8 +57,9 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          sed -i -E "s/^COPILOT_LOOP_VERSION=.*/COPILOT_LOOP_VERSION=\"${VERSION}\"/" copilot-loop.sh
-          sed -i -E "0,/^version = \".*\"/s//version = \"${VERSION}\"/" tui/Cargo.toml
+          sed -i.bak -E "s|^COPILOT_LOOP_VERSION=.*|COPILOT_LOOP_VERSION=\"${VERSION}\"|" copilot-loop.sh
+          sed -i.bak -E "s|^version = \".*\"|version = \"${VERSION}\"|" tui/Cargo.toml
+          rm -f copilot-loop.sh.bak tui/Cargo.toml.bak
           # Keep Cargo.lock's own package entry in step so `--locked` builds work.
           ( cd tui && cargo update -p copilot-loop-tui --precise "${VERSION}" --offline \
               || cargo update -p copilot-loop-tui --precise "${VERSION}" )
@@ -71,37 +74,65 @@ jobs:
           git push origin HEAD:main
           git push origin "${TAG}"
 
-      - name: Download the tag tarball and compute its sha256
-        id: sha
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
-          # GitHub materialises the archive a moment after the tag lands; retry.
-          for _ in $(seq 1 10); do
-            if curl -fsSL "$url" -o release.tar.gz; then break; fi
-            sleep 3
-          done
-          sha="$(sha256sum release.tar.gz | cut -d' ' -f1)"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
-          echo "sha256=$sha"
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Repoint the Homebrew formula at the new release
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+
+      - name: Build the universal binary and package the release tarball
+        id: build
         env:
-          URL: ${{ steps.sha.outputs.url }}
-          SHA256: ${{ steps.sha.outputs.sha256 }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          sed -i -E "s|^  url \".*\"|  url \"${URL}\"|" Formula/bot-loop.rb
-          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" Formula/bot-loop.rb
-          git add Formula/bot-loop.rb
-          git commit -m "Update Homebrew formula for ${TAG} [skip ci]"
-          git push origin HEAD:main
+          ( cd tui
+            cargo build --profile dist --locked --target aarch64-apple-darwin
+            cargo build --profile dist --locked --target x86_64-apple-darwin )
+          # Fuse the two slices into one universal binary named `bot-loop`, then
+          # ship it alongside the bash loop the formula also installs.
+          lipo -create \
+            tui/target/aarch64-apple-darwin/dist/copilot-loop-tui \
+            tui/target/x86_64-apple-darwin/dist/copilot-loop-tui \
+            -output bot-loop
+          chmod +x bot-loop copilot-loop.sh
+          tar -czf bot-loop-macos.tar.gz bot-loop copilot-loop.sh
+          sha="$(shasum -a 256 bot-loop-macos.tar.gz | awk '{print $1}')"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/bot-loop-macos.tar.gz"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha"
 
       - name: Publish the GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${TAG}" --title "${TAG}" --generate-notes release.tar.gz
+          gh release create "${TAG}" --title "${TAG}" --generate-notes bot-loop-macos.tar.gz
+
+      - name: Repoint the Homebrew formula and mirror it to the tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          URL: ${{ steps.build.outputs.url }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          sed -i.bak -E "s|^  url \".*\"|  url \"${URL}\"|" Formula/bot-loop.rb
+          sed -i.bak -E "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" Formula/bot-loop.rb
+          sed -i.bak -E "s|^  version \".*\"|  version \"${VERSION}\"|" Formula/bot-loop.rb
+          rm -f Formula/bot-loop.rb.bak
+          git add Formula/bot-loop.rb
+          git commit -m "Update Homebrew formula for ${TAG} [skip ci]"
+          git push origin HEAD:main
+
+          # Mirror the formula to the tap `brew tap alienengineer/bot-loop` uses.
+          # Needs a HOMEBREW_TAP_TOKEN secret with write access to the tap repo.
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/AlienEngineer/homebrew-bot-loop.git" tap
+          mkdir -p tap/Formula
+          cp Formula/bot-loop.rb tap/Formula/bot-loop.rb
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/bot-loop.rb
+          git -C tap commit -m "bot-loop ${TAG}"
+          git -C tap push
