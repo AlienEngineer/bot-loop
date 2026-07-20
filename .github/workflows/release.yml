@@ -69,9 +69,20 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           git add copilot-loop.sh tui/Cargo.toml tui/Cargo.lock
-          git commit -m "Release ${TAG} [skip ci]"
-          git tag -a "${TAG}" -m "Release ${TAG}"
-          git push origin HEAD:main
+          # The first release can already carry the target version in the sources,
+          # making the bump a no-op; an empty `git commit` must not abort the run.
+          if git diff --cached --quiet; then
+            echo "Sources already at ${TAG}; skipping version-bump commit."
+          else
+            git commit -m "Release ${TAG} [skip ci]"
+            git push origin HEAD:main
+          fi
+          # Tag idempotently so a re-run does not abort on an existing tag.
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists; leaving it in place."
+          else
+            git tag -a "${TAG}" -m "Release ${TAG}"
+          fi
           git push origin "${TAG}"
 
       - name: Add Rust targets
@@ -108,7 +119,12 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${TAG}" --title "${TAG}" --generate-notes bot-loop-macos.tar.gz
+          # Upsert so a re-run of the same tag refreshes the asset instead of failing.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" bot-loop-macos.tar.gz --clobber
+          else
+            gh release create "${TAG}" --title "${TAG}" --generate-notes bot-loop-macos.tar.gz
+          fi
 
       - name: Repoint the Homebrew formula and mirror it to the tap
         env:
@@ -123,16 +139,30 @@ jobs:
           sed -i.bak -E "s|^  version \".*\"|  version \"${VERSION}\"|" Formula/bot-loop.rb
           rm -f Formula/bot-loop.rb.bak
           git add Formula/bot-loop.rb
-          git commit -m "Update Homebrew formula for ${TAG} [skip ci]"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "Formula already points at ${TAG}; nothing to update."
+          else
+            git commit -m "Update Homebrew formula for ${TAG} [skip ci]"
+            git push origin HEAD:main
+          fi
 
           # Mirror the formula to the tap `brew tap alienengineer/bot-loop` uses.
-          # Needs a HOMEBREW_TAP_TOKEN secret with write access to the tap repo.
+          # Needs a HOMEBREW_TAP_TOKEN secret with write access to the tap repo;
+          # until that secret and the tap repo exist, the release and in-repo
+          # formula are already correct, so skip the mirror instead of failing.
+          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping tap mirror."
+            exit 0
+          fi
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/AlienEngineer/homebrew-bot-loop.git" tap
           mkdir -p tap/Formula
           cp Formula/bot-loop.rb tap/Formula/bot-loop.rb
           git -C tap config user.name "github-actions[bot]"
           git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C tap add Formula/bot-loop.rb
-          git -C tap commit -m "bot-loop ${TAG}"
-          git -C tap push
+          if git -C tap diff --cached --quiet; then
+            echo "Tap already up to date for ${TAG}."
+          else
+            git -C tap commit -m "bot-loop ${TAG}"
+            git -C tap push
+          fi
