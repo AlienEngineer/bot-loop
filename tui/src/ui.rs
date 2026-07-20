@@ -1416,7 +1416,10 @@ mod tests {
         // Every leader binding is present, matching handle_leader_key (#160).
         assert_eq!(
             keys,
-            vec!["c", "r", "x", "d", "l", "L", "b", "a", "q", "s", "m", "o", "p", "t", "$", "f", "Esc"]
+            vec![
+                "c", "r", "x", "d", "l", "L", "b", "a", "q", "s", "m", "o", "p", "t", "$", "f",
+                "Esc"
+            ]
         );
         // An unlabelled selection is offered *ready*…
         assert!(leader_actions(&app).contains(&("r", "ready")));
