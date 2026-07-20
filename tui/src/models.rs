@@ -16,6 +16,7 @@ pub const AUTO_MODEL: &str = "auto";
 /// set is data, not logic — the picker works with whatever list it is given.
 const DEFAULT_MODELS: &[&str] = &[
     AUTO_MODEL,
+    "claude-opus-4.8",
     "claude-opus-4.5",
     "claude-sonnet-4.5",
     "claude-sonnet-4",
