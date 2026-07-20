@@ -59,6 +59,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.bots_open() {
         render_bots(frame, frame.area(), app);
     }
+    // The quit confirmation floats above everything else so a stray `q`/`Esc`
+    // asks before it exits the TUI (#167).
+    if app.quit_confirm() {
+        render_quit_confirm(frame, frame.area(), app);
+    }
 }
 
 /// Braille spinner frames used to signal the loop is alive (#115).
@@ -483,6 +488,45 @@ fn render_close_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
         Line::from(summary_line),
     ])
     .block(block)
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(body, popup);
+}
+
+/// Draw the quit confirmation popup: a centered prompt asking whether to exit
+/// the TUI, with a [`Clear`] underneath so the list does not show through
+/// (#167). The red border matches the close prompt, marking it a guarded exit.
+fn render_quit_confirm(frame: &mut Frame, area: Rect, app: &mut App) {
+    let popup = centered_popup(area, 50, 7);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Quit bot-loop? ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::from(" y quit · n/Esc cancel ").centered())
+        .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    // Reassure the operator that quitting the TUI leaves the detached background
+    // loops running; only mention it when a loop is actually up (#167).
+    let note = if app.workers_running() > 0 {
+        "Background loops keep running."
+    } else {
+        "This closes the terminal UI."
+    };
+
+    let body = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Exit the TUI?",
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(note, Style::new().fg(Color::DarkGray))),
+    ])
+    .block(block)
+    .alignment(Alignment::Center)
     .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, popup);
@@ -1509,6 +1553,20 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         assert!(buffer_text(&terminal).contains("No summary will be posted"));
+    }
+
+    #[test]
+    fn renders_the_quit_confirmation_popup_when_open() {
+        let mut app = App::new(Vec::new());
+        app.request_quit();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Quit bot-loop?"));
+        assert!(text.contains("y quit"));
+        assert!(text.contains("cancel"));
     }
 
     fn spans_text(spans: &[Span]) -> String {
