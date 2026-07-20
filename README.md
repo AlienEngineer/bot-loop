@@ -100,8 +100,8 @@ A ratatui-based rewrite of the terminal UI lives in [`tui/`](./tui) (see #51). T
 first slice lists the repository's open GitHub issues in a scrollable,
 vim-navigable view. It reads issues with the `gh` CLI, so `gh` must be
 authenticated for the target repo. Issue actions live behind a `space` leader
-key (#129): press `space` to reveal them in the footer, then one key runs the
-action (or `Esc` cancels). Press `space` then `r` to toggle the trigger
+key (#129): press `space` to reveal them in a which-key popup (#160), then one
+key runs the action (or `Esc` cancels). Press `space` then `r` to toggle the trigger
 label (`ready`, or `$TRIGGER_LABEL`) on the selected issue: it is added when
 absent so the loop picks the issue up, or removed when present so a
 mistakenly-queued issue can be pulled back out (#146). Press `space` then `c` to create a new issue: fill in a title and description, then

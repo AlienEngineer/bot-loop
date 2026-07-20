@@ -59,6 +59,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.bots_open() {
         render_bots(frame, frame.area(), app);
     }
+    // The leader-key action menu floats above the list as a which-key popup so
+    // the bindings are discoverable after tapping `space` (#160).
+    if app.leader_active() {
+        render_leader_popup(frame, frame.area(), app);
+    }
     // The quit confirmation floats above everything else so a stray `q`/`Esc`
     // asks before it exits the TUI (#167).
     if app.quit_confirm() {
@@ -378,14 +383,9 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ));
         spans.push(Span::raw("  "));
     }
-    let ready_key = if app.selected_is_ready() {
-        "r unready"
-    } else {
-        "r ready"
-    };
     if app.leader_active() {
-        // The leader menu lists the issue actions unlocked by `space` (#129),
-        // including auto-merge (#135) and quality-assurance (#162).
+        // The full binding list now lives in the leader popup (#160); the footer
+        // just flags the menu is open and how to leave it.
         spans.push(Span::styled(
             " ACTIONS ",
             Style::new()
@@ -394,7 +394,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · s summary · m models · o output · p pr-output · t closed · $ cost · f refresh · esc cancel"),
+            "  pick an action · esc cancel",
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -406,6 +406,78 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The issue actions unlocked by the `space` leader key, as `(key, label)`
+/// pairs. Kept in one place so the leader popup renders every binding and the
+/// ready entry flips to *unready* when the selection already carries the label
+/// (#160, #146).
+fn leader_actions(app: &App) -> Vec<(&'static str, &'static str)> {
+    let ready = if app.selected_is_ready() {
+        "unready"
+    } else {
+        "ready"
+    };
+    vec![
+        ("c", "new"),
+        ("r", ready),
+        ("x", "close"),
+        ("d", "details"),
+        ("l", "add-worker"),
+        ("L", "stop-all"),
+        ("b", "bots"),
+        ("a", "auto-merge"),
+        ("q", "qa"),
+        ("s", "summary"),
+        ("m", "models"),
+        ("o", "output"),
+        ("p", "pr-output"),
+        ("t", "closed"),
+        ("$", "cost"),
+        ("f", "refresh"),
+        ("Esc", "cancel"),
+    ]
+}
+
+/// Draw the leader-key action menu as a centered which-key popup: one binding
+/// per row with the key highlighted, so the actions unlocked by `space` are
+/// discoverable rather than memorised (#160). A [`Clear`] underneath wipes the
+/// list so it does not show through.
+fn render_leader_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let actions = leader_actions(app);
+    let rows: Vec<Line> = actions
+        .iter()
+        .map(|(key, label)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {key:>3} "),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(*label),
+            ])
+        })
+        .collect();
+
+    // Size the popup to its contents: the key column, the widest label, borders
+    // and a little breathing room.
+    let label_w = actions
+        .iter()
+        .map(|(_, label)| label.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let width = label_w + 9;
+    let height = actions.len() as u16 + 2;
+    let popup = centered_popup_fixed(area, width, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Actions ")
+        .title_alignment(Alignment::Center)
+        .border_style(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Black));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(rows).block(block), popup);
 }
 
 /// Draw the model picker popup: a centered, bordered list of models with the
@@ -1121,6 +1193,18 @@ fn centered_popup(area: Rect, width_pct: u16, height: u16) -> Rect {
     col
 }
 
+/// Like [`centered_popup`] but with an absolute column `width` so the leader
+/// menu hugs its contents instead of a screen percentage (#160). Clamped to fit.
+fn centered_popup_fixed(area: Rect, width: u16, height: u16) -> Rect {
+    let [row] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [col] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(row);
+    col
+}
+
 /// Draw the modal new-issue form centered over the list.
 fn render_create_form(frame: &mut Frame, app: &App) {
     let area = centered_rect(70, 60, frame.area());
@@ -1349,36 +1433,64 @@ mod tests {
     }
 
     #[test]
-    fn leader_footer_lists_the_issue_actions() {
+    fn leader_popup_lists_the_issue_actions() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         let text = buffer_text(&terminal);
-        // The menu shows the actions the issue asked for, plus the rest (#129).
-        assert!(text.contains("ACTIONS"));
+        // The popup titles itself and lists every binding the leader unlocks (#160).
+        assert!(text.contains("Actions"));
         assert!(text.contains("c new"));
         assert!(text.contains("r ready"));
         assert!(text.contains("m models"));
         assert!(text.contains("add-worker"));
         assert!(text.contains("s summary"));
         assert!(text.contains("f refresh"));
+        // The footer still flags the open menu and how to leave it.
+        assert!(text.contains("ACTIONS"));
         assert!(text.contains("esc cancel"));
         // The action menu replaces the base navigation hint.
         assert!(!text.contains("space actions"));
     }
 
     #[test]
-    fn footer_advertises_the_output_key() {
+    fn leader_actions_flip_ready_and_cover_every_binding() {
+        let plain =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let app = App::new(plain);
+        let keys: Vec<&str> = leader_actions(&app).iter().map(|(k, _)| *k).collect();
+        // Every leader binding is present, matching handle_leader_key (#160).
+        assert_eq!(
+            keys,
+            vec![
+                "c", "r", "x", "d", "l", "L", "b", "a", "q", "s", "m", "o", "p", "t", "$", "f",
+                "Esc"
+            ]
+        );
+        // An unlabelled selection is offered *ready*…
+        assert!(leader_actions(&app).contains(&("r", "ready")));
+
+        // …and flips to *unready* once the selection carries the label (#146).
+        let ready = parse_issues(
+            r#"[{"number":96,"title":"t","labels":[{"name":"ready"}],"author":null}]"#,
+        )
+        .unwrap();
+        let app = App::new(ready);
+        assert!(leader_actions(&app).contains(&("r", "unready")));
+    }
+
+    #[test]
+    fn leader_popup_advertises_the_output_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1386,12 +1498,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_bots_key() {
+    fn leader_popup_advertises_the_bots_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1405,14 +1517,16 @@ mod tests {
         let mut app = App::new(issues);
         app.set_refreshing(true);
         app.enter_leader();
-        // Wide enough that the whole footer — indicator plus key hints — renders.
-        let mut terminal = Terminal::new(TestBackend::new(220, 6)).unwrap();
+        // Tall enough that the popup and the footer both render without overlap.
+        let mut terminal = Terminal::new(TestBackend::new(220, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         let text = buffer_text(&terminal);
         assert!(text.contains("Refreshing"));
-        // The key hints still share the footer.
+        // The refreshing indicator shares the footer with the leader badge…
+        assert!(text.contains("ACTIONS"));
+        // …while the bindings live in the popup above it (#160).
         assert!(text.contains("f refresh"));
     }
 
@@ -1458,12 +1572,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_close_key() {
+    fn leader_popup_advertises_the_close_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1471,12 +1585,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_auto_merge_key() {
+    fn leader_popup_advertises_the_auto_merge_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1484,12 +1598,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_quality_assurance_key() {
+    fn leader_popup_advertises_the_quality_assurance_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -1497,13 +1611,13 @@ mod tests {
     }
 
     #[test]
-    fn footer_ready_key_flips_to_unready_when_selected_is_labelled() {
+    fn leader_popup_ready_key_flips_to_unready_when_selected_is_labelled() {
         // An unlabelled selection offers to mark it ready…
         let plain =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(plain);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("r ready"));
@@ -1516,7 +1630,7 @@ mod tests {
         .unwrap();
         let mut app = App::new(ready);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(buffer_text(&terminal).contains("r unready"));
     }
@@ -1926,12 +2040,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_pr_output_key() {
+    fn leader_popup_advertises_the_pr_output_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -2012,12 +2126,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_closed_key() {
+    fn leader_popup_advertises_the_closed_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(170, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -2114,12 +2228,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_cost_key() {
+    fn leader_popup_advertises_the_cost_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
@@ -2127,12 +2241,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_details_key() {
+    fn leader_popup_advertises_the_details_key() {
         let issues =
             parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
         let mut app = App::new(issues);
         app.enter_leader();
-        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
