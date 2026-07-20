@@ -147,6 +147,13 @@ repo allows it, otherwise an immediate merge); the header shows `auto-merge: on`
 Like the model, the setting takes effect the next time the loop starts, so a
 running loop keeps its behaviour until restarted.
 
+Press `space` then `q` to toggle quality assurance (#162). It is **on by default**: the
+loop asks Copilot to add tests for the work it did on each issue, written from the
+user's perspective (dropping to technical/unit tests only when a user-level test
+is impractical). The header shows `qa: on`/`qa: off`; turning it off starts the loop
+with `--no-quality-assurance` to save cost. Like auto-merge, the setting takes effect
+the next time the loop starts.
+
 Press `space` then `t` to open a popup listing the repository's closed issues alongside how
 much each one cost to resolve. The spend is the sum of the `AI Credits` the loop
 posted on the issue (its `<!-- copilot-loop:usage -->` comments), shown per row
@@ -182,7 +189,7 @@ the ready label (mark ready, or remove it if already ready), `x` close the
 selected issue (confirm with `y`), `d` view the selected issue's details and
 comments, `l` add a background worker, `L` stop all workers, `b` bots (restart a
 stopped/failed worker in place, or all with `R`), `a` toggle
-auto-merge, `m` pick the model, `o` show/hide the output panel, `p` show the
+auto-merge, `q` toggle quality assurance, `m` pick the model, `o` show/hide the output panel, `p` show the
 resolving-PRs popup, `t` show closed issues and their cost, `f` refresh, `Esc`
 cancel. In the new-issue
 form: `Tab` switches fields, `Enter` adds a newline (or moves from title to
@@ -265,6 +272,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--quiet` | `QUIET` | Log only to files, do not stream to stdout |
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Per-issue worktrees (default: on) |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | Merge each PR automatically |
+| `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | Ask Copilot to add user-perspective tests for each issue (default: on; `--qa`/`--no-qa` aliases) |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge`, `squash`, or `rebase` |
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | Sweep merged branches/worktrees each pass (default: on) |
 | `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | Delete a merged issue's remote branch (default: auto) |

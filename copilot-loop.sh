@@ -67,7 +67,9 @@
 #      triage is enabled (TRIAGE_MODEL) the issue is first classified by that
 #      cheap model as trivial/normal/complex and the coding model is picked from
 #      TRIAGE_MAP, so cheap issues run on a cheap model; any failure falls back
-#      to the global COPILOT_MODEL.
+#      to the global COPILOT_MODEL. Unless quality assurance is disabled
+#      (QUALITY_ASSURANCE=0 / --no-quality-assurance) the prompt also asks Copilot
+#      to add tests for the work, written from the user's perspective.
 #   5b. Right after the run, post what that prompt cost (the "AI Credits" and
 #      "Tokens" summary Copilot prints at the end, taken from the run's log) as a
 #      comment on the issue/PR, tagged with the hidden "copilot-loop:usage"
@@ -137,6 +139,10 @@
 #   --auto-merge / --no-auto-merge
 #                            Merge each PR automatically instead of leaving it for
 #                            review (default: off).
+#   --quality-assurance / --no-quality-assurance
+#                            Ask Copilot to add tests (from the user's perspective)
+#                            for the work it did on each issue; disable to save cost
+#                            (default: on). --qa / --no-qa are accepted aliases.
 #   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
 #                            (default: merge).
 #   --cleanup-merged / --no-cleanup-merged
@@ -151,7 +157,7 @@
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
 #   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
-#   AUTO_MERGE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
+#   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
@@ -247,6 +253,10 @@ USE_WORKTREES="${USE_WORKTREES:-}"
 # Merge each PR automatically instead of leaving it open for review. Off by
 # default; set AUTO_MERGE=1 (or pass --auto-merge) to turn it on.
 AUTO_MERGE="${AUTO_MERGE:-}"
+# Ask Copilot to add tests (from the user's perspective) for the work it did on
+# each issue. On by default (issue #162); set QUALITY_ASSURANCE=0 (or pass
+# --no-quality-assurance) to turn it off and save the extra cost.
+QUALITY_ASSURANCE="${QUALITY_ASSURANCE:-}"
 # Merge method used when AUTO_MERGE is on: merge, squash or rebase.
 MERGE_METHOD="${MERGE_METHOD:-}"
 # Delete the remote head branch of an issue once its PR merges. Empty means
@@ -415,6 +425,11 @@ work:
                            the repo allows it, otherwise an immediate merge) so
                            no manual review is needed. Default: off.
   --no-auto-merge          Leave PRs open for manual review (the default).
+  --quality-assurance      Ask Copilot to add tests for the work it did on each
+                           issue, written from the user's perspective (the
+                           default). Alias: --qa.
+  --no-quality-assurance   Skip the quality-assurance tests to save cost.
+                           Alias: --no-qa.
   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
                            (default: merge).
   --cleanup-merged         Sweep merged issue branches and worktrees each pass
@@ -431,7 +446,7 @@ work:
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
-  AUTO_MERGE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
+  AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 EOF
 }
 
@@ -654,6 +669,38 @@ parse_triage_map() {
 }
 # <<< triage helpers <<<
 
+# >>> quality-assurance helpers >>>
+# Decide whether quality assurance is on from a raw config value. QA is ON by
+# default (issue #162 asked for it to run by default), so only the explicit falsy
+# spellings turn it off; anything else -- including unset/empty -- is on. Echoes
+# 1 (on) or 0 (off).
+qa_enabled() {
+  case "$1" in
+    0|false|no|off|disable|disabled) printf '0\n' ;;
+    *)                               printf '1\n' ;;
+  esac
+}
+
+# The quality-assurance instruction appended to the issue prompt so Copilot adds
+# tests covering the work it just did. Tests are asked for from the user's
+# perspective (observable behaviour/outcomes), dropping to technical/unit tests
+# only when a user-level test is impractical or makes no sense. Echoes the
+# instruction paragraph when enabled ("1"), or nothing when disabled so the
+# prompt is left unchanged.
+qa_instruction() {
+  [ "${1:-1}" = 1 ] || return 0
+  cat <<'EOF'
+Quality assurance: after implementing the change, add automated tests that cover
+everything you did. Write the tests from the perspective of the user -- exercise
+the behaviour and outcomes a user would observe, not internal implementation
+details. Only fall back to technical/unit tests when testing from the user's
+perspective is too complex or does not make sense for the change. Use the
+project's existing test framework and conventions, and run the tests to verify
+they pass.
+EOF
+}
+# <<< quality-assurance helpers <<<
+
 # Classify an issue's difficulty with the cheap TRIAGE_MODEL so the coding model
 # can be chosen per difficulty (see parse_triage_map / TRIAGE_MAP). Echoes one
 # normalized class (trivial|normal|complex) on success, or nothing when triage is
@@ -746,6 +793,8 @@ while [ $# -gt 0 ]; do
     --no-worktrees)    USE_WORKTREES=0 ;;
     --auto-merge)      AUTO_MERGE=1 ;;
     --no-auto-merge)   AUTO_MERGE=0 ;;
+    --quality-assurance|--qa)       QUALITY_ASSURANCE=1 ;;
+    --no-quality-assurance|--no-qa) QUALITY_ASSURANCE=0 ;;
     --merge-method)    need_arg $# "$1"; MERGE_METHOD="$2"; shift ;;
     --merge-method=*)  MERGE_METHOD="${1#*=}" ;;
     --delete-remote-branch)    DELETE_REMOTE_BRANCH=1 ;;
@@ -809,6 +858,9 @@ case "$AUTO_MERGE" in
   1|true|yes|on)  AUTO_MERGE=1 ;;
   *)              AUTO_MERGE=0 ;;
 esac
+# Quality assurance: ask Copilot to add user-perspective tests for the work.
+# On by default (issue #162); only the explicit falsy spellings turn it off.
+QUALITY_ASSURANCE="$(qa_enabled "$QUALITY_ASSURANCE")"
 # Merge method used by auto-merge. Default to a merge commit; reject anything
 # other than the three methods gh understands so a typo fails loudly at startup.
 MERGE_METHOD="${MERGE_METHOD:-merge}"
@@ -1049,6 +1101,11 @@ if [ "$AUTO_MERGE" = 1 ]; then
   log "auto-merge: on (method=$MERGE_METHOD) — PRs merge without review"
 else
   log "auto-merge: off — PRs are left open for review (pass --auto-merge to enable)"
+fi
+if [ "$QUALITY_ASSURANCE" = 1 ]; then
+  log "quality assurance: on — Copilot adds user-perspective tests per issue (pass --no-quality-assurance to disable)"
+else
+  log "quality assurance: off — no tests requested (pass --quality-assurance to enable)"
 fi
 if [ "$CLEANUP_MERGED" = 1 ]; then
   if [ "$DELETE_REMOTE_BRANCH" = 1 ]; then
@@ -1398,7 +1455,7 @@ sweep_merged_branches() {
 process_issue() {
   local num="$1"
   local title body slug branch commit_msg commit_text commit_out pr_body log_file ahead pr_url
-  local question_file comments comments_block
+  local question_file comments comments_block qa_block
 
   # One API round-trip for everything we need from the issue (title, body, and
   # the comment thread) instead of three separate `gh issue view` calls. Fields
@@ -1456,6 +1513,12 @@ process_issue() {
   comments_block=""
   [ -n "$comments" ] && comments_block=$'\n\nConversation so far (most recent last):\n'"$comments"
 
+  # Quality assurance: unless disabled, append an instruction asking Copilot to
+  # add user-perspective tests for the work. Wrapped in blank lines so it reads
+  # as its own paragraph; empty (no extra blank line) when QA is off.
+  qa_block=""
+  [ "$QUALITY_ASSURANCE" = 1 ] && qa_block=$'\n'"$(qa_instruction)"$'\n'
+
   local prompt
   prompt="$(cat <<EOF
 You are working in a git repository to resolve a GitHub issue.
@@ -1468,7 +1531,7 @@ Implement the necessary code changes in the current working directory to fully
 resolve this issue. Run any build or test commands needed to verify your work.
 Do NOT run git commit, git push, create branches, or open pull requests — those
 steps are handled automatically outside this session. Only edit files and verify.
-
+${qa_block}
 If you are blocked and need more information or a decision from the user, do NOT
 guess. Write your question(s) for the user to this file and stop without making
 code changes:

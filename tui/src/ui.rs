@@ -115,8 +115,9 @@ fn pr_summary(prs: &[u64]) -> Option<String> {
 /// something is happening and on what (#115, #133, #134). Pure so the running
 /// branch — which otherwise needs live child processes — is
 /// unit-testable.
-// Combines the multi-worker header (#134) with the auto-merge indicator (#135),
-// which together push this one span past the arg-count lint.
+// Combines the multi-worker header (#134) with the auto-merge (#135) and
+// quality-assurance (#162) indicators, which together push this one span past the
+// arg-count lint.
 #[allow(clippy::too_many_arguments)]
 fn header_spans(
     count: usize,
@@ -126,6 +127,7 @@ fn header_spans(
     working_prs: &[u64],
     model_label: &str,
     auto_merge: bool,
+    quality_assurance: bool,
     spinner: &str,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -198,6 +200,14 @@ fn header_spans(
             Color::DarkGray
         }),
     ));
+    spans.push(Span::styled(
+        format!("  ·  qa: {}", if quality_assurance { "on" } else { "off" }),
+        Style::new().fg(if quality_assurance {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    ));
     spans
 }
 
@@ -210,6 +220,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, work
         &app.in_progress_pr_numbers(),
         app.current_model_label(),
         app.auto_merge(),
+        app.quality_assurance(),
         spinner_frame(),
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -327,7 +338,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     };
     if app.leader_active() {
         // The leader menu lists the issue actions unlocked by `space` (#129),
-        // including auto-merge (#135).
+        // including auto-merge (#135) and quality-assurance (#162).
         spans.push(Span::styled(
             " ACTIONS ",
             Style::new()
@@ -336,7 +347,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
+            format!("  c new · {ready_key} · x close · d details · l add-worker · L stop-all · b bots · a auto-merge · q qa · m models · o output · p pr-output · t closed · f refresh · esc cancel"),
             Style::new().fg(Color::DarkGray),
         ));
     } else {
@@ -1206,6 +1217,19 @@ mod tests {
     }
 
     #[test]
+    fn footer_advertises_the_quality_assurance_key() {
+        let issues =
+            parse_issues(r#"[{"number":96,"title":"t","labels":[],"author":null}]"#).unwrap();
+        let mut app = App::new(issues);
+        app.enter_leader();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("q qa"));
+    }
+
+    #[test]
     fn footer_ready_key_flips_to_unready_when_selected_is_labelled() {
         // An unlabelled selection offers to mark it ready…
         let plain =
@@ -1288,6 +1312,7 @@ mod tests {
             &[],
             "auto",
             false,
+            true,
             "⠋",
         ));
         assert!(text.contains("⠋ loop: running"));
@@ -1307,6 +1332,7 @@ mod tests {
             &[],
             "auto",
             false,
+            true,
             "⠋",
         ));
         assert!(text.contains("loop: running"));
@@ -1318,7 +1344,17 @@ mod tests {
     fn header_shows_pr_work_when_the_loop_resolves_a_pr() {
         // A PR being resolved is not in the issue list, so the header is the
         // only place the user learns the loop is busy (#133).
-        let text = spans_text(&header_spans(3, None, 1, &[], &[12], "auto", false, "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            None,
+            1,
+            &[],
+            &[12],
+            "auto",
+            false,
+            true,
+            "⠋",
+        ));
         assert!(text.contains("loop: running"));
         assert!(text.contains("resolving PR #12"));
         // With PR work in flight the loop is not idle.
@@ -1327,14 +1363,34 @@ mod tests {
 
     #[test]
     fn header_shows_both_issue_and_pr_work() {
-        let text = spans_text(&header_spans(3, None, 1, &[96], &[12], "auto", false, "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            None,
+            1,
+            &[96],
+            &[12],
+            "auto",
+            false,
+            true,
+            "⠋",
+        ));
         assert!(text.contains("working #96"));
         assert!(text.contains("resolving PR #12"));
     }
 
     #[test]
     fn header_says_waiting_when_loop_runs_without_an_issue() {
-        let text = spans_text(&header_spans(3, None, 1, &[], &[], "auto", false, "⠋"));
+        let text = spans_text(&header_spans(
+            3,
+            None,
+            1,
+            &[],
+            &[],
+            "auto",
+            false,
+            true,
+            "⠋",
+        ));
         assert!(text.contains("loop: running"));
         assert!(text.contains("waiting for work"));
     }
@@ -1349,6 +1405,7 @@ mod tests {
             &[12],
             "auto",
             false,
+            true,
             "⠋",
         ));
         assert!(text.contains("loop: off"));
@@ -1360,10 +1417,48 @@ mod tests {
 
     #[test]
     fn header_reflects_auto_merge_state() {
-        let on = spans_text(&header_spans(1, None, 0, &[], &[], "auto", true, "⠋"));
+        let on = spans_text(&header_spans(1, None, 0, &[], &[], "auto", true, true, "⠋"));
         assert!(on.contains("auto-merge: on"));
-        let off = spans_text(&header_spans(1, None, 0, &[], &[], "auto", false, "⠋"));
+        let off = spans_text(&header_spans(
+            1,
+            None,
+            0,
+            &[],
+            &[],
+            "auto",
+            false,
+            true,
+            "⠋",
+        ));
         assert!(off.contains("auto-merge: off"));
+    }
+
+    #[test]
+    fn header_reflects_quality_assurance_state() {
+        let on = spans_text(&header_spans(
+            1,
+            None,
+            0,
+            &[],
+            &[],
+            "auto",
+            false,
+            true,
+            "⠋",
+        ));
+        assert!(on.contains("qa: on"));
+        let off = spans_text(&header_spans(
+            1,
+            None,
+            0,
+            &[],
+            &[],
+            "auto",
+            false,
+            false,
+            "⠋",
+        ));
+        assert!(off.contains("qa: off"));
     }
 
     #[test]

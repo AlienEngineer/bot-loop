@@ -97,6 +97,9 @@ pub struct App {
     known_in_progress: Vec<u64>,
     /// Whether the next loop start enables GitHub auto-merge on each PR (#135).
     auto_merge: bool,
+    /// Whether the next loop start keeps quality-assurance tests on (default) or
+    /// disables them with `--no-quality-assurance` to save cost (#162).
+    quality_assurance: bool,
     /// Monotonic id for the next worker, so each gets its own capture log
     /// (`loop-<id>.log`) even as workers come and go (#134).
     next_worker_id: usize,
@@ -177,6 +180,7 @@ impl App {
             close_confirm: None,
             known_in_progress: Vec::new(),
             auto_merge: false,
+            quality_assurance: true,
             next_worker_id: 1,
             in_progress_prs: Vec::new(),
             known_in_progress_prs: Vec::new(),
@@ -526,6 +530,7 @@ impl App {
             &log,
             model.as_deref(),
             self.auto_merge,
+            self.quality_assurance,
         ) {
             Ok(pid) => {
                 self.next_worker_id += 1;
@@ -534,9 +539,10 @@ impl App {
                 }
                 let count = self.runner.running_count();
                 self.status = Some(format!(
-                    "Worker started (pid {pid}, model {}, auto-merge {}). {count} running. Log: {}",
+                    "Worker started (pid {pid}, model {}, auto-merge {}, QA {}). {count} running. Log: {}",
                     self.current_model_label(),
                     if self.auto_merge { "on" } else { "off" },
+                    if self.quality_assurance { "on" } else { "off" },
                     log.display()
                 ));
             }
@@ -762,6 +768,26 @@ impl App {
             format!("Auto-merge {state} (applies when the loop restarts).")
         } else {
             format!("Auto-merge {state}.")
+        });
+    }
+
+    /// Whether the loop will be started with quality-assurance tests on (#162).
+    pub fn quality_assurance(&self) -> bool {
+        self.quality_assurance
+    }
+
+    /// Toggle whether the loop asks Copilot to add quality-assurance tests (#162).
+    ///
+    /// On by default; turning it off forwards `--no-quality-assurance` to save
+    /// cost. Like auto-merge, it is read when the loop is *started*, so a running
+    /// loop keeps its behaviour and the status line says so.
+    pub fn toggle_quality_assurance(&mut self) {
+        self.quality_assurance = !self.quality_assurance;
+        let state = if self.quality_assurance { "on" } else { "off" };
+        self.status = Some(if self.runner.is_running() {
+            format!("Quality assurance {state} (applies when the loop restarts).")
+        } else {
+            format!("Quality assurance {state}.")
         });
     }
 
@@ -1950,6 +1976,22 @@ mod tests {
         app.toggle_auto_merge();
         assert!(!app.auto_merge());
         assert_eq!(app.status.as_deref(), Some("Auto-merge off."));
+    }
+
+    #[test]
+    fn quality_assurance_defaults_on_and_toggles() {
+        // QA runs by default (#162), so the loop gets tests unless the user turns
+        // it off to save cost.
+        let mut app = app_with(0);
+        assert!(app.quality_assurance());
+
+        app.toggle_quality_assurance();
+        assert!(!app.quality_assurance());
+        assert_eq!(app.status.as_deref(), Some("Quality assurance off."));
+
+        app.toggle_quality_assurance();
+        assert!(app.quality_assurance());
+        assert_eq!(app.status.as_deref(), Some("Quality assurance on."));
     }
 
     #[test]
