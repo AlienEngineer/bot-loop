@@ -62,7 +62,9 @@ Run the loop from inside the repository you want it to work on:
 It opens issues from any markdown files in `issues/`, picks the oldest open
 issue labelled `ready`, works it on a fresh branch, and opens a PR that closes
 the issue. Press `f` while it is sleeping to wake it and check for work
-immediately.
+immediately. Prefer to review the approach first? Label an issue `plan` and the
+loop drafts an implementation plan for you to review before any code is written
+(see [Plan mode](#plan-mode)).
 
 ### Multiple instances / worktrees
 
@@ -297,6 +299,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | Flag | Env var | Purpose |
 |------|---------|---------|
 | `--trigger-label <label>` | `TRIGGER_LABEL` | Label marking an issue ready (default: `ready`) |
+| `--plan-label <label>` | `PLAN_LABEL` | Label that puts an issue into [plan mode](#plan-mode): Copilot drafts a plan for review before any code is written (default: `plan`) |
 | `--sleep-minutes <n>` | `SLEEP_MINUTES` | Idle sleep when no work (default: 5) |
 | `--repo-dir <dir>` | `REPO_DIR` | Repository to operate in |
 | `--model <model>` | `COPILOT_MODEL` | Model passed to `copilot --model` |
@@ -350,11 +353,33 @@ Each issue moves through these labels:
 | Label | Meaning |
 |-------|---------|
 | `ready` | Trigger label — queued and waiting to be picked up (this is the default; configurable via `--trigger-label`). |
+| `plan` | Plan mode — the loop drafts an implementation plan for review before writing any code (configurable via `--plan-label`). See [Plan mode](#plan-mode). |
+| `plan-review` | A plan was posted; waiting for the user to review it and add the trigger label to run it. |
 | `pending` | Held back because it declares a still-open dependency (`Wait for: #N`). Cleared once every dependency closes. |
 | `in-progress` | Claimed by a loop instance and being worked on. |
 | `needs-info` | Copilot asked a question; waiting for a human reply. Reply from the TUI with `space` then `i`, or comment on the issue; a reply resumes it. |
 | `copilot-done` | Resolved successfully and a PR was opened. |
 | `copilot-failed` | Failed; the loop does not retry automatically. A later human reply resumes it for another attempt. |
+
+## Plan mode
+
+For a bigger or riskier change you can have the loop propose a plan and let you
+review it *before* any code is written. Label an issue `plan` (configurable via
+`--plan-label` / `PLAN_LABEL`) instead of `ready`:
+
+1. The loop picks up the `plan`-labelled issue and runs Copilot in a read-only
+   planning pass — it investigates the repository but makes **no code changes**.
+2. Copilot's implementation plan is posted as a comment on the issue, and the
+   issue is relabelled `plan-review`. The loop then leaves it alone.
+3. You review the plan. To adjust it, leave a comment with your changes — the
+   **most recent** plan in the thread is the one that gets executed.
+4. When you're happy, add the trigger label (`ready`) to the issue. The loop
+   picks it up, follows the approved plan, and opens a PR as usual.
+
+Nothing is committed or pushed during planning, so a plan costs only the one
+Copilot run (tracked like any other — see below). An issue that lists a
+dependency (`Wait for: #N`) is held back from planning until its blockers close,
+exactly like a ready issue.
 
 ## Cost tracking
 
