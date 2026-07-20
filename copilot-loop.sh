@@ -1551,6 +1551,111 @@ comments_have_plan() {
 }
 # <<< plan-detect helpers <<<
 
+# --- Rebase conflict resolution ----------------------------------------------
+# When the pre-PR sync rebase (process_issue) conflicts, we do not fail the issue
+# and interrupt the loop (#193): instead we hand the conflicted files to Copilot,
+# continue the rebase, and repeat until it finishes. Extracted between the markers
+# so tests/rebase-conflict.test.sh can source these verbatim.
+# >>> rebase-conflict helpers >>>
+# Continue an in-progress rebase in <dir>, appending git's output to <log_file>.
+# core.editor=true keeps git from opening an editor for the reworded commit.
+# Returns: 0 = rebase fully finished; 2 = stopped again on a fresh conflict (the
+# caller resolves and calls again); 1 = failed for some other reason. A resolution
+# that leaves the commit empty (its change already upstream) is skipped so the
+# rebase can carry on rather than dead-ending on "No changes".
+_rebase_continue() {
+  local dir="$1" log_file="$2" out
+  if out="$(git -C "$dir" -c core.editor=true rebase --continue 2>&1)"; then
+    printf '%s\n' "$out" >>"$log_file"
+    return 0
+  fi
+  printf '%s\n' "$out" >>"$log_file"
+  if [ -n "$(git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+    return 2
+  fi
+  # Continue failed with no conflicts and nothing staged: the resolved commit is
+  # empty because its change already landed upstream. Drop it and keep going.
+  if git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    if out="$(git -C "$dir" rebase --skip 2>&1)"; then
+      printf '%s\n' "$out" >>"$log_file"
+      return 0
+    fi
+    printf '%s\n' "$out" >>"$log_file"
+    [ -n "$(git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null)" ] && return 2
+  fi
+  return 1
+}
+
+# Resolve the conflicts of an in-progress rebase in WORKSPACE_DIR by handing the
+# conflicted files to Copilot, then continue the rebase — looping so a rebase that
+# stops on several commits is carried all the way through. Returns 0 when the
+# rebase completes cleanly, 1 when it cannot be resolved (Copilot times out, leaves
+# markers, or the rebase fails for another reason); the caller aborts + fails then.
+# Usage: resolve_rebase_conflicts <num> <log_file> <upstream>
+resolve_rebase_conflicts() {
+  local num="$1" log_file="$2" upstream="$3"
+  local conflicts copilot_rc f unresolved cont_rc prompt
+
+  while true; do
+    conflicts="$(git -C "$WORKSPACE_DIR" diff --name-only --diff-filter=U 2>/dev/null)"
+    if [ -z "$conflicts" ]; then
+      # Called with no unmerged paths (e.g. a non-conflict pause): try to advance.
+      _rebase_continue "$WORKSPACE_DIR" "$log_file"; cont_rc=$?
+      case "$cont_rc" in 0) return 0 ;; 2) continue ;; *) return 1 ;; esac
+    fi
+
+    log "issue #$num: resolving rebase conflicts in: $(printf '%s' "$conflicts" | tr '\n' ' ')"
+
+    prompt="$(cat <<EOF
+You are working in a git repository. Rebasing this branch onto "${upstream}"
+produced conflicts that must be resolved before the work can be pushed.
+
+These files contain git conflict markers (<<<<<<<, =======, >>>>>>>):
+${conflicts}
+
+Resolve every conflict so the result is correct and preserves the intent of both
+sides, then remove all conflict markers. Run any build or test commands needed to
+verify your work. Do NOT run git commit, git rebase, git push, or create
+branches — those steps are handled automatically outside this session. Only edit
+files to resolve the conflicts and verify.
+EOF
+)"
+    local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
+    [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+
+    log "issue #$num: running copilot to resolve rebase conflicts (log: $log_file)"
+    if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+      return 1
+    fi
+    run_copilot "$log_file" "${copilot_args[@]}"
+    copilot_rc=$COPILOT_RC
+    cd "$REPO_DIR" 2>/dev/null || true
+    log "issue #$num: copilot exited with code $copilot_rc while resolving rebase conflicts"
+
+    # Each resolution run is a separate Copilot invocation, so account for its cost.
+    _report_usage issue "$num" "$log_file" "$COPILOT_MODEL"
+
+    if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+      return 1
+    fi
+
+    # Bail if Copilot left conflict markers behind in any conflicted file.
+    unresolved=""
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ -f "$WORKSPACE_DIR/$f" ] && grep -qE '^(<{7}|>{7})' "$WORKSPACE_DIR/$f" && unresolved="$unresolved $f"
+    done <<< "$conflicts"
+    if [ -n "$unresolved" ]; then
+      return 1
+    fi
+
+    git -C "$WORKSPACE_DIR" add -A >>"$log_file" 2>&1
+    _rebase_continue "$WORKSPACE_DIR" "$log_file"; cont_rc=$?
+    case "$cont_rc" in 0) return 0 ;; 2) continue ;; *) return 1 ;; esac
+  done
+}
+# <<< rebase-conflict helpers <<<
+
 # Returns 0 on success (PR opened), 1 on failure.
 process_issue() {
   local num="$1"
@@ -1746,19 +1851,32 @@ EOF
     git -C "$WORKSPACE_DIR" rev-parse --verify --quiet "$sync_target" >/dev/null 2>&1 || sync_target="FETCH_HEAD"
     if ! rebase_out="$(git -C "$WORKSPACE_DIR" rebase "$sync_target" 2>&1)"; then
       printf '%s\n' "$rebase_out" >>"$log_file"
-      git -C "$WORKSPACE_DIR" rebase --abort >/dev/null 2>&1 || true
-      # Report the actual git error, and only call it a "conflict" when it is
-      # one — an invalid upstream or a lock error is not a merge conflict.
-      detail="$(printf '%s' "$rebase_out" | grep -iE 'fatal|error|conflict' | tail -n1)"
-      if printf '%s' "$rebase_out" | grep -qi 'conflict'; then
-        reason="failed to sync with ${DEFAULT_BRANCH} (rebase conflict)"
-      elif [ -n "$detail" ]; then
-        reason="failed to sync with ${DEFAULT_BRANCH}: ${detail}"
+      # A rebase conflict is not fatal (#193): unmerged paths mean the rebase
+      # stopped on a real conflict, so hand those files to Copilot to resolve and
+      # continue the rebase instead of failing the issue and interrupting the loop.
+      # Anything else (an invalid upstream, a lock error, ...) never leaves
+      # unmerged paths, so it is a genuine failure and still aborts + fails.
+      if [ -n "$(git -C "$WORKSPACE_DIR" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+        if resolve_rebase_conflicts "$num" "$log_file" "$sync_target"; then
+          log "issue #$num: resolved rebase conflicts while syncing with ${DEFAULT_BRANCH}"
+        else
+          git -C "$WORKSPACE_DIR" rebase --abort >/dev/null 2>&1 || true
+          _fail_issue "$num" "$log_file" \
+            "failed to resolve rebase conflicts while syncing with ${DEFAULT_BRANCH}" "$rebase_out"
+          return 1
+        fi
       else
-        reason="failed to sync with ${DEFAULT_BRANCH}"
+        git -C "$WORKSPACE_DIR" rebase --abort >/dev/null 2>&1 || true
+        # Report the actual git error rather than a generic message.
+        detail="$(printf '%s' "$rebase_out" | grep -iE 'fatal|error' | tail -n1)"
+        if [ -n "$detail" ]; then
+          reason="failed to sync with ${DEFAULT_BRANCH}: ${detail}"
+        else
+          reason="failed to sync with ${DEFAULT_BRANCH}"
+        fi
+        _fail_issue "$num" "$log_file" "$reason" "$rebase_out"
+        return 1
       fi
-      _fail_issue "$num" "$log_file" "$reason" "$rebase_out"
-      return 1
     fi
     # The rebase may have dropped our commits entirely (their work already
     # landed on the default branch, or the commit turned out empty). Re-count

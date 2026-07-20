@@ -438,7 +438,9 @@ Each pass the loop:
 8. Runs Copilot to resolve it, then posts the run's cost as an issue comment.
    Unless disabled, Copilot also adds tests from the user's perspective.
 9. If Copilot needs more info, posts the question, labels the issue `needs-info`,
-   and waits. Otherwise commits, pushes, and opens a PR that closes the issue
+   and waits. Otherwise commits, rebases the branch onto the latest default
+   branch — handing any rebase conflicts to Copilot to resolve rather than
+   failing the issue (#193) — then pushes and opens a PR that closes the issue
    (auto-merging it when `--auto-merge` is on).
 10. Labels the issue `copilot-done` on success, or `copilot-failed` on failure
     (never retried automatically).
