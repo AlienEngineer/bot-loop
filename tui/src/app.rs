@@ -10,6 +10,7 @@ use crate::logs;
 use crate::models;
 use crate::reporter::{CloseReporter, ReportOutcome, ReportRequest, ReportStatus};
 use crate::runner::{self, LoopRunner, WorkerStatus, WorkerView};
+use crate::settings::{self, Settings};
 use crate::worker::{FetchOutcome, IssueFetcher};
 
 /// Default number of issues to request from `gh`.
@@ -219,6 +220,11 @@ pub struct App {
     messages_open: bool,
     /// Selection within the messages popup's list (#182).
     pub messages_state: ListState,
+    /// Where changed settings are persisted, or `None` when persistence is off
+    /// (unit tests, or before wiring). Set by [`App::load_persisted_settings`] so
+    /// the model, auto-merge, quality-assurance, and close-summary choices are
+    /// restored on the next start (#195).
+    settings_path: Option<PathBuf>,
 }
 
 impl App {
@@ -284,6 +290,7 @@ impl App {
             messages: Vec::new(),
             messages_open: false,
             messages_state: ListState::default(),
+            settings_path: None,
         }
     }
 
@@ -296,6 +303,52 @@ impl App {
         let message = message.into();
         self.record_message(message.clone());
         self.status = Some(message);
+    }
+
+    /// A snapshot of the persistable settings from the current state (#195): the
+    /// model, auto-merge, quality-assurance, and close-summary choices.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            model: self.selected_model.clone(),
+            auto_merge: self.auto_merge,
+            quality_assurance: self.quality_assurance,
+            report_on_close: self.report_on_close,
+        }
+    }
+
+    /// Apply a set of loaded settings over the current state (#195). Used when
+    /// restoring the user's last choices on start.
+    pub fn apply_settings(&mut self, settings: Settings) {
+        self.selected_model = settings.model;
+        self.auto_merge = settings.auto_merge;
+        self.quality_assurance = settings.quality_assurance;
+        self.report_on_close = settings.report_on_close;
+    }
+
+    /// Restore the persisted settings from the repository's ignored settings file
+    /// and enable persistence so later changes are written back (#195). A missing
+    /// or corrupt file leaves the built-in defaults untouched.
+    pub fn load_persisted_settings(&mut self) {
+        let path = settings::settings_path(&self.repo_root);
+        self.load_persisted_settings_at(path);
+    }
+
+    /// [`load_persisted_settings`](Self::load_persisted_settings) against an
+    /// explicit path, so the restore/persist behaviour can be tested without
+    /// touching the real repository.
+    pub fn load_persisted_settings_at(&mut self, path: PathBuf) {
+        if let Some(settings) = settings::load(&path) {
+            self.apply_settings(settings);
+        }
+        self.settings_path = Some(path);
+    }
+
+    /// Write the current settings to disk when persistence is enabled (#195).
+    /// Best-effort: a write failure is ignored so it never disrupts the UI.
+    fn persist_settings(&self) {
+        if let Some(path) = &self.settings_path {
+            let _ = settings::save(path, &self.settings());
+        }
     }
 
     /// Append a message to the bounded history, oldest first, dropping the oldest
@@ -799,6 +852,7 @@ impl App {
     pub fn toggle_report_on_close(&mut self) {
         self.report_on_close = !self.report_on_close;
         let state = if self.report_on_close { "on" } else { "off" };
+        self.persist_settings();
         self.set_status(format!("Close summary {state}."));
     }
 
@@ -1100,6 +1154,7 @@ impl App {
     pub fn toggle_auto_merge(&mut self) {
         self.auto_merge = !self.auto_merge;
         let state = if self.auto_merge { "on" } else { "off" };
+        self.persist_settings();
         let message = if self.runner.is_running() {
             format!("Auto-merge {state} (applies when the loop restarts).")
         } else {
@@ -1121,6 +1176,7 @@ impl App {
     pub fn toggle_quality_assurance(&mut self) {
         self.quality_assurance = !self.quality_assurance;
         let state = if self.quality_assurance { "on" } else { "off" };
+        self.persist_settings();
         let message = if self.runner.is_running() {
             format!("Quality assurance {state} (applies when the loop restarts).")
         } else {
@@ -1189,6 +1245,7 @@ impl App {
             Some(model.clone())
         };
         self.model_picker_open = false;
+        self.persist_settings();
 
         let label = self.current_model_label().to_string();
         let message = if self.runner.is_running() {
@@ -2686,6 +2743,76 @@ mod tests {
         app.toggle_auto_merge();
         assert!(!app.auto_merge());
         assert_eq!(app.status.as_deref(), Some("Auto-merge off."));
+    }
+
+    /// A unique settings-file path in the temp dir for a persistence test,
+    /// without a temp-file crate: process id plus a per-test counter.
+    fn temp_settings_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "copilot-loop-app-settings-{}-{}-{}",
+            std::process::id(),
+            tag,
+            n
+        ))
+    }
+
+    #[test]
+    fn changed_settings_are_restored_on_the_next_start() {
+        // A user changes every setting in one session, then reopens the TUI: the
+        // model, auto-merge, quality-assurance, and close-summary choices all come
+        // back, so they never have to reconfigure the loop each run (#195).
+        let path = temp_settings_path("restore");
+
+        let mut first = app_with(0);
+        first.load_persisted_settings_at(path.clone());
+        let chosen = first.models[1].clone(); // the first non-auto model
+        first.open_model_picker();
+        first.model_next(); // highlight that model
+        first.confirm_model();
+        first.toggle_auto_merge(); // on
+        first.toggle_quality_assurance(); // off
+        first.toggle_report_on_close(); // off
+
+        let mut second = app_with(0);
+        second.load_persisted_settings_at(path);
+
+        assert_eq!(second.selected_model(), Some(chosen.as_str()));
+        assert!(second.auto_merge());
+        assert!(!second.quality_assurance());
+        assert!(!second.report_on_close());
+    }
+
+    #[test]
+    fn a_fresh_start_with_no_saved_settings_keeps_the_defaults() {
+        // No file yet: the built-in defaults stand, and persistence is armed so
+        // the first change is written for next time (#195).
+        let path = temp_settings_path("defaults");
+        let mut app = app_with(0);
+        app.load_persisted_settings_at(path.clone());
+
+        assert_eq!(app.selected_model(), None);
+        assert!(!app.auto_merge());
+        assert!(app.quality_assurance());
+        assert!(app.report_on_close());
+        assert!(!path.exists());
+
+        app.toggle_auto_merge();
+        assert!(path.exists(), "a change should be persisted");
+    }
+
+    #[test]
+    fn settings_are_not_written_when_persistence_is_off() {
+        // The default app (no path wired, as in the rest of the tests) must never
+        // touch the filesystem when a setting changes.
+        let mut app = app_with(0);
+        app.toggle_auto_merge();
+        app.toggle_quality_assurance();
+        // No panic and no path means nothing was written; the state still updated.
+        assert!(app.auto_merge());
+        assert!(!app.quality_assurance());
     }
 
     #[test]
