@@ -260,6 +260,27 @@ whole step off with `SYNC_REMOTE=0`.
 This runs for every loop instance, including the ones the TUI starts, since the
 TUI drives the same `copilot-loop.sh`.
 
+### AGENTS.md bootstrap
+
+Every issue runs in a fresh Copilot session with no memory, so without repo-level
+context the agent re-discovers the layout, build/test commands and conventions on
+**every** run — repeated input-token cost across the whole backlog. To front-load
+that context, the first time the loop starts against a repo that has **no**
+`AGENTS.md` and **no** `.github/copilot-instructions.md`, it runs a single
+read-only Copilot pass that writes a **short** `AGENTS.md` (architecture, where
+things live, build/test/lint commands, conventions) and opens it as its own PR.
+Copilot CLI auto-loads `AGENTS.md` into every later run, so future runs — and
+humans — start with that context instead of rediscovering it.
+
+The file is kept deliberately short: it is loaded into every run, so bloat becomes
+a fixed per-run cost. If the repo already has either file, the step does nothing,
+and once the bootstrap branch is on the remote it is never opened twice. Because it
+runs once per repo and pays off on every later run, it uses a capable mid model by
+default (`--agents-model` / `AGENTS_MODEL`, default `claude-sonnet`; set to `off`
+to disable). The whole step is time-boxed by `--copilot-timeout` and fully
+failure-safe — a failed or empty generation is logged and skipped, never blocking
+issue work.
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
@@ -276,6 +297,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--commit-model <model>` | `COMMIT_MODEL` | Model that writes the commit message |
 | `--triage-model <model>` | `TRIAGE_MODEL` | Cheap model that classifies each issue |
 | `--triage-map <map>` | `TRIAGE_MAP` | `class=model` pairs mapping difficulty to model |
+| `--agents-model <model>` | `AGENTS_MODEL` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap) (default: `claude-sonnet`; `off` disables) |
 | `--issues-dir <dir>` | `ISSUES_DIR` | Folder scanned for issue markdown files |
 | `--quiet` | `QUIET` | Log only to files, do not stream to stdout |
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Per-issue worktrees (default: on) |
@@ -439,6 +461,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--commit-model <model>` | `COMMIT_MODEL` | `off` | Model that writes the commit message from the staged diff. `off` uses a deterministic `Resolve #<n>: <title>` message. |
 | `--triage-model <model>` | `TRIAGE_MODEL` | `off` | Cheap model that classifies each issue as trivial/normal/complex before coding, so the coding model can be chosen per difficulty. `off` disables triage. |
 | `--triage-map <map>` | `TRIAGE_MAP` | unset | Comma-separated `class=model` pairs mapping a triage class to the coding model, e.g. `trivial=gpt-5-mini,complex=claude-opus-4.5`. An unmapped class falls back to `--model`. |
+| `--agents-model <model>` | `AGENTS_MODEL` | `claude-sonnet` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap). Runs once per repo (high-leverage), so it defaults to a capable mid model rather than the cheapest. `off` disables the bootstrap. |
 | `--issues-dir <dir>` | `ISSUES_DIR` | `<repo>/issues` | Folder scanned for issue markdown files. |
 | `--quiet` | `QUIET` | off | Only write Copilot's output to the per-run log files; do not stream it to stdout. |
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | on | Give every issue its own git worktree (never touch the shared checkout), or work in the current checkout instead. |

@@ -137,6 +137,11 @@
 #                            unmapped class falls back to --model. Defaults to
 #                            "trivial=<triage-model>" when triage is on and this
 #                            is unset                                (default: unset)
+#   --agents-model <model>   Model for the one-time AGENTS.md bootstrap: when the
+#                            repo has no AGENTS.md / copilot-instructions.md a
+#                            read-only pass writes a short AGENTS.md and opens it as
+#                            a PR. Runs once, so it defaults to a capable mid model;
+#                            "off" disables it                 (default: claude-sonnet)
 #   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
 #   --quiet                  Do not stream Copilot's output to stdout; write it
 #                            only to the per-run log files (the original
@@ -166,7 +171,7 @@
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
-#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
+#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, AGENTS_MODEL, ISSUES_DIR, QUIET, USE_WORKTREES,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
@@ -243,6 +248,14 @@ TRIAGE_MODEL="${TRIAGE_MODEL:-}"
 # this is unset it defaults to routing trivial issues to TRIAGE_MODEL so turning
 # triage on lowers cost with zero extra configuration.
 TRIAGE_MAP="${TRIAGE_MAP:-}"
+# Model used for the one-time, per-repo AGENTS.md bootstrap: when the repo has no
+# AGENTS.md nor .github/copilot-instructions.md, a single read-only Copilot pass
+# writes a short AGENTS.md (auto-loaded into every later run) and opens it as a
+# PR. This runs once and is high-leverage, so it defaults to a capable mid model
+# rather than the cheapest one. Read raw here; the default is filled after
+# argument parsing so --agents-model can override it. "off"/"none"/"0" disables
+# the bootstrap entirely.
+AGENTS_MODEL="${AGENTS_MODEL:-}"
 ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
 # Set QUIET=1 (or pass --quiet) to keep the original log-file-only behaviour.
@@ -454,6 +467,12 @@ work:
                            unmapped class falls back to --model; defaults to
                            "trivial=<triage-model>" when triage is on and this is
                            unset                                    (default: unset)
+  --agents-model <model>   Model for the one-time AGENTS.md bootstrap. When the
+                           repo has no AGENTS.md / copilot-instructions.md, a
+                           read-only pass writes a short AGENTS.md and opens it as
+                           a PR before issues run. Runs once so it defaults to a
+                           capable mid model; "off" disables it
+                                                              (default: claude-sonnet)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
   --quiet                  Do not stream Copilot's output to stdout; write it
                            only to the per-run log files (the original
@@ -489,7 +508,7 @@ work:
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
-  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, ISSUES_DIR, QUIET, USE_WORKTREES,
+  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, AGENTS_MODEL, ISSUES_DIR, QUIET, USE_WORKTREES,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 EOF
 }
@@ -832,6 +851,8 @@ while [ $# -gt 0 ]; do
     --triage-model=*)  TRIAGE_MODEL="${1#*=}" ;;
     --triage-map)      need_arg $# "$1"; TRIAGE_MAP="$2"; shift ;;
     --triage-map=*)    TRIAGE_MAP="${1#*=}" ;;
+    --agents-model)    need_arg $# "$1"; AGENTS_MODEL="$2"; shift ;;
+    --agents-model=*)  AGENTS_MODEL="${1#*=}" ;;
     --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
     --issues-dir=*)    ISSUES_DIR="${1#*=}" ;;
     --quiet)           QUIET=1 ;;
@@ -901,6 +922,13 @@ TRIAGE_MAP="${TRIAGE_MAP:-}"
 if [ -n "$TRIAGE_MODEL" ] && [ -z "$TRIAGE_MAP" ]; then
   TRIAGE_MAP="trivial=${TRIAGE_MODEL}"
 fi
+
+# AGENTS.md bootstrap model. Defaults to a capable mid model because it runs once
+# per repo and every later run benefits from a good AGENTS.md, so this is not the
+# place to save on model quality. "off"/"none"/"0" (and other disable spellings)
+# turn the bootstrap off; any other value is used verbatim as the --model.
+AGENTS_MODEL="${AGENTS_MODEL:-claude-sonnet}"
+case "$AGENTS_MODEL" in off|none|no|0|false) AGENTS_MODEL="" ;; esac
 
 # Auto-merge each PR instead of leaving it for review. Normalise the various
 # truthy/falsy spellings to 1/0; anything unset or unrecognised means off.
@@ -1796,6 +1824,163 @@ _fail_issue() {
   gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
   cleanup_workspace "$branch"
 }
+
+# --- Core: bootstrap a repo-level AGENTS.md ----------------------------------
+# A fresh Copilot session has no memory, so without a repo-level AGENTS.md every
+# run re-discovers the layout, build/test commands and conventions — repeated
+# input-token cost across the whole backlog. Once per repo, when neither AGENTS.md
+# nor .github/copilot-instructions.md exists, a single read-only Copilot pass
+# writes a SHORT AGENTS.md (Copilot CLI auto-loads it into every later run) and
+# opens it as its own PR, so future runs — and humans — start with that context.
+# The generation is time-boxed (via run_copilot/COPILOT_TIMEOUT) and fully
+# failure-safe: any problem is logged and swallowed so it can never block issue
+# work.
+# >>> agents-md helpers >>>
+# True (rc 0) when the AGENTS.md bootstrap is disabled: an empty model or one of
+# the explicit off spellings (so --agents-model off turns it off). Pure.
+agents_md_disabled() {
+  case "${1:-}" in
+    ''|off|none|no|0|false) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Generate AGENTS.md when the repo has none. Never returns non-zero and never
+# leaves an uncommitted file behind: it either opens a PR with the new AGENTS.md
+# or does nothing. Reads AGENTS_MODEL / DEFAULT_BRANCH / REPO_DIR / BRANCH_PREFIX
+# and the workspace + run_copilot helpers, exactly like process_issue.
+generate_agents_md() {
+  # Opt-out (or no model configured): do nothing.
+  agents_md_disabled "$AGENTS_MODEL" && return 0
+
+  # Work from the latest default branch without checking it out. Fetch first so
+  # the presence check and the new branch both see current state; fall back to
+  # HEAD/FETCH_HEAD when origin/<default> cannot be resolved (e.g. a worktree
+  # with no fetch refspec).
+  git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+  local ref="origin/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || ref="HEAD"
+
+  # Skip entirely when the repo already ships agent context — either file is
+  # auto-loaded by Copilot CLI, so generating another would only add cost.
+  if git -C "$REPO_DIR" cat-file -e "${ref}:AGENTS.md" 2>/dev/null \
+     || git -C "$REPO_DIR" cat-file -e "${ref}:.github/copilot-instructions.md" 2>/dev/null; then
+    log "AGENTS.md: repo already has AGENTS.md or copilot-instructions.md; skipping bootstrap"
+    return 0
+  fi
+
+  local branch="${BRANCH_PREFIX}agents-md"
+
+  # Idempotent across passes and restarts: if the bootstrap branch is already on
+  # origin, an earlier run opened its PR and it is just waiting to merge. Don't
+  # open a duplicate.
+  if [ -n "$(git -C "$REPO_DIR" ls-remote --heads origin "$branch" 2>/dev/null)" ]; then
+    log "AGENTS.md: bootstrap branch $branch already on origin (PR open); skipping"
+    return 0
+  fi
+
+  local log_file
+  log_file="$LOG_DIR/agents-md-$(date '+%Y%m%d-%H%M%S').log"
+  CURRENT_RUN_LOG="$log_file"
+  log "AGENTS.md: none found; generating a concise one with ${AGENTS_MODEL} before working issues"
+
+  local start="origin/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
+  if ! prepare_workspace "$branch" "$start"; then
+    log "AGENTS.md: could not create work branch $branch; skipping bootstrap"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+
+  local prompt
+  prompt="$(cat <<'EOF'
+You are bootstrapping this repository for autonomous coding agents.
+
+Inspect the repository (read-only) and write a single, concise AGENTS.md file at
+its root. AGENTS.md is auto-loaded into EVERY future agent run, so keep it SHORT:
+aim for well under ~150 lines. Bloat here becomes a fixed per-run cost, so include
+only high-signal, durable facts:
+  - what the project is and its high-level architecture,
+  - where the important code lives (key directories and files),
+  - the exact build, test, and lint/format commands,
+  - project-specific conventions an agent must follow.
+
+Omit anything obvious, transient, or trivially rediscovered, and never include
+secrets. Only create/write the AGENTS.md file — do NOT modify any other file, and
+do NOT run git or gh (no commits, branches, or PRs); that is handled for you.
+EOF
+)"
+
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
+  copilot_args+=(--model "$AGENTS_MODEL")
+
+  log "AGENTS.md: running copilot (log: $log_file)"
+  if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+    log "AGENTS.md: workspace '$WORKSPACE_DIR' vanished; skipping bootstrap"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+  run_copilot "$log_file" "${copilot_args[@]}"
+  local copilot_rc=$COPILOT_RC
+  cd "$REPO_DIR" 2>/dev/null || true
+  log "AGENTS.md: copilot exited with code $copilot_rc"
+
+  # A timed-out run (COPILOT_TIMEOUT exceeded) or one that produced no AGENTS.md
+  # is not a failure of the loop — just skip so issue work is never blocked.
+  if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+    log "AGENTS.md: generation timed out after ${COPILOT_TIMEOUT}; skipping bootstrap"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+  if [ ! -s "$WORKSPACE_DIR/AGENTS.md" ]; then
+    log "AGENTS.md: copilot produced no AGENTS.md; skipping bootstrap"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+
+  # Commit only the AGENTS.md the run was asked for, then push and open a PR. Any
+  # failure is logged and swallowed so the bootstrap can never block issue work.
+  git -C "$WORKSPACE_DIR" add AGENTS.md >/dev/null 2>&1
+  if git -C "$WORKSPACE_DIR" diff --cached --quiet 2>/dev/null; then
+    log "AGENTS.md: nothing staged after generation; skipping bootstrap"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+  if ! git -C "$WORKSPACE_DIR" commit -m "Add AGENTS.md to front-load repo context for copilot-loop" >>"$log_file" 2>&1; then
+    log "AGENTS.md: git commit failed; skipping bootstrap"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+  if ! git -C "$WORKSPACE_DIR" push -u origin "$branch" >>"$log_file" 2>&1; then
+    log "AGENTS.md: git push failed; skipping bootstrap"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+  local pr_url
+  pr_url="$(gh pr create --base "$DEFAULT_BRANCH" --head "$branch" \
+              --title "Add AGENTS.md to cut per-run exploration cost" \
+              --body "$(printf 'Auto-generated by copilot-loop: a concise AGENTS.md so every future run — and humans — start with the repo layout, build/test/lint commands and conventions instead of re-discovering them each run.\n\nGenerated with model: %s.' "$AGENTS_MODEL")" 2>>"$log_file")"
+  if [ -z "$pr_url" ]; then
+    log "AGENTS.md: gh pr create failed; branch pushed but no PR opened"
+    cleanup_workspace "$branch"
+    CURRENT_RUN_LOG=""
+    return 0
+  fi
+  try_auto_merge "$pr_url" "AGENTS.md" "$log_file"
+  # Best-effort cost tracking on the bootstrap PR, mirroring the per-issue report.
+  _report_usage pr "$pr_url" "$log_file" "$AGENTS_MODEL" 2>/dev/null || true
+  log "AGENTS.md: bootstrap PR opened -> $pr_url"
+  cleanup_workspace "$branch"
+  CURRENT_RUN_LOG=""
+  return 0
+}
+# <<< agents-md helpers <<<
 
 # --- Issue files: create GitHub issues from markdown in issues/ --------------
 # Each *.md file in ISSUES_DIR becomes one GitHub issue: the first H1 line is
@@ -2906,6 +3091,13 @@ EOF
   return 0
 }
 # <<< sync-default helpers <<<
+
+# --- AGENTS.md bootstrap -----------------------------------------------------
+# One-time, per-repo: when the repo has no AGENTS.md / copilot-instructions.md,
+# generate a concise AGENTS.md and open it as a PR before working any issue, so
+# every later run starts with repo context instead of rediscovering it. Skips
+# when one already exists; time-boxed and failure-safe (never blocks the loop).
+generate_agents_md || true
 
 # --- Main loop ---------------------------------------------------------------
 while true; do
