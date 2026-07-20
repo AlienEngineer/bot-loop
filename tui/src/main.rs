@@ -217,6 +217,7 @@ fn handle_leader_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('L') => app.stop_all_workers(),
         KeyCode::Char('b') => app.open_bots(),
         KeyCode::Char('a') => app.toggle_auto_merge(),
+        KeyCode::Char('q') => app.toggle_quality_assurance(),
         KeyCode::Char('s') => app.toggle_report_on_close(),
         KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('o') => app.toggle_output(),
