@@ -140,6 +140,13 @@
 #                            unmapped class falls back to --model. Defaults to
 #                            "trivial=<triage-model>" when triage is on and this
 #                            is unset                                (default: unset)
+#   --triage-timeout-map <m> class=factor pairs (comma-separated) scaling the
+#                            --copilot-timeout by triage difficulty, factor a
+#                            percent of the baseline ("33%") or an absolute
+#                            duration ("10m"); normal/unmapped keep the baseline
+#                            and a disabled timeout stays disabled. Defaults to
+#                            "trivial=33%,complex=200%" when triage is on;
+#                            "off" keeps a flat timeout                (default: unset)
 #   --agents-model <model>   Model for the one-time AGENTS.md bootstrap: when the
 #                            repo has no AGENTS.md / copilot-instructions.md a
 #                            read-only pass writes a short AGENTS.md and opens it as
@@ -174,7 +181,8 @@
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
-#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, AGENTS_MODEL, ISSUES_DIR, QUIET, USE_WORKTREES,
+#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
+#   QUIET, USE_WORKTREES,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
@@ -255,7 +263,14 @@ TRIAGE_MODEL="${TRIAGE_MODEL:-}"
 # this is unset it defaults to routing trivial issues to TRIAGE_MODEL so turning
 # triage on lowers cost with zero extra configuration.
 TRIAGE_MAP="${TRIAGE_MAP:-}"
-# Model used for the one-time, per-repo AGENTS.md bootstrap: when the repo has no
+# Scales the per-run COPILOT_TIMEOUT by triage difficulty (issue #190), as
+# comma-separated "class=factor" pairs where factor is a percentage of the
+# baseline ("33%" or bare "33") or an absolute duration ("10m"). A "normal" or
+# unlisted class keeps the baseline COPILOT_TIMEOUT; a disabled timeout stays
+# disabled. Read raw here; when triage is enabled but this is unset it defaults
+# to "trivial=33%,complex=200%" so a stuck trivial issue is killed sooner and a
+# complex one gets more time. "off"/"none"/"0" keeps a flat timeout across classes.
+TRIAGE_TIMEOUT_MAP="${TRIAGE_TIMEOUT_MAP:-}"
 # AGENTS.md nor .github/copilot-instructions.md, a single read-only Copilot pass
 # writes a short AGENTS.md (auto-loaded into every later run) and opens it as a
 # PR. This runs once and is high-leverage, so it defaults to a capable mid model
@@ -476,6 +491,14 @@ work:
                            unmapped class falls back to --model; defaults to
                            "trivial=<triage-model>" when triage is on and this is
                            unset                                    (default: unset)
+  --triage-timeout-map <m> Comma-separated class=factor pairs scaling the
+                           --copilot-timeout by triage difficulty, so a stuck
+                           trivial issue is killed sooner and a complex one gets
+                           more time. Factor is a percent of the baseline ("33%")
+                           or an absolute duration ("10m"); "normal"/unmapped keep
+                           the baseline and a disabled timeout stays disabled.
+                           Defaults to "trivial=33%,complex=200%" when triage is
+                           on; "off" keeps a flat timeout            (default: unset)
   --agents-model <model>   Model for the one-time AGENTS.md bootstrap. When the
                            repo has no AGENTS.md / copilot-instructions.md, a
                            read-only pass writes a short AGENTS.md and opens it as
@@ -517,7 +540,8 @@ work:
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
-  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, AGENTS_MODEL, ISSUES_DIR, QUIET, USE_WORKTREES,
+  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
+  QUIET, USE_WORKTREES,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
 EOF
 }
@@ -651,6 +675,76 @@ normalize_copilot_timeout() {
 copilot_run_timed_out() {
   [ -n "${1:-}" ] || return 1
   [ "${2:-}" = "124" ]
+}
+
+# Convert a normalized COPILOT_TIMEOUT spec (bare integer seconds, or an integer
+# with a single s/m/h/d suffix) to whole seconds. Echoes the seconds, or nothing
+# when the spec is not a recognised duration. Pure: reads only $1.
+_copilot_timeout_to_secs() {
+  local spec num unit
+  spec="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$spec" in ''|*[!0-9smhd]*) return 0 ;; esac
+  num="${spec%[smhd]}"
+  case "$num" in ''|*[!0-9]*) return 0 ;; esac
+  unit="${spec#"$num"}"
+  case "$unit" in
+    ''|s) printf '%s' "$((10#$num))" ;;
+    m)    printf '%s' "$((10#$num * 60))" ;;
+    h)    printf '%s' "$((10#$num * 3600))" ;;
+    d)    printf '%s' "$((10#$num * 86400))" ;;
+  esac
+}
+
+# Format a whole-seconds count as a timeout(1)-valid, readable spec: whole minutes
+# ("45m") when evenly divisible by 60, otherwise seconds ("594s"). Pure: reads $1.
+_copilot_timeout_fmt_secs() {
+  local s="${1:-0}"
+  if [ "$s" -ge 60 ] && [ "$((s % 60))" -eq 0 ]; then
+    printf '%sm' "$((s / 60))"
+  else
+    printf '%ss' "$s"
+  fi
+}
+
+# Scale a baseline COPILOT_TIMEOUT spec ($1) by a per-difficulty factor ($2) so a
+# trivial issue is killed sooner and a complex one gets more time (issue #190).
+# The factor is either a percentage of the baseline (a bare integer "33" or "33%")
+# or an absolute timeout(1) duration ("10m", "45m", "1800s"). Echoes the resulting
+# timeout(1) spec:
+#   - baseline empty (timeout disabled) -> empty, so a disabled timeout stays off
+#     regardless of triage ("0"/"off" always wins);
+#   - factor empty, "100"/"100%", or unparseable -> the baseline unchanged;
+#   - percentage -> baseline_seconds * pct / 100, clamped to >=1s and formatted;
+#   - absolute duration -> that duration, normalised.
+# Pure: reads $1 (baseline) and $2 (factor) only; depends only on the helpers in
+# this block. Never fails: an unusable factor falls back to the baseline.
+scale_copilot_timeout() {
+  local base="$1" factor pct base_secs secs abs
+  factor="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  # A disabled baseline stays disabled: triage can never re-enable a timeout the
+  # user turned off entirely.
+  [ -n "$base" ] || return 0
+  # No factor configured for this class -> keep the baseline.
+  [ -n "$factor" ] || { printf '%s' "$base"; return 0; }
+
+  case "$factor" in
+    *%)      pct="${factor%\%}" ;;                 # explicit percentage: "33%"
+    *[smhd]) # ends in a duration unit -> treat as an absolute override
+             abs="$(normalize_copilot_timeout "$factor")"
+             printf '%s' "${abs:-$base}"; return 0 ;;
+    *)       pct="$factor" ;;                      # bare integer -> percentage
+  esac
+
+  # Validate the percentage; anything non-numeric or 0/100 keeps the baseline.
+  case "$pct" in ''|*[!0-9]*) printf '%s' "$base"; return 0 ;; esac
+  pct="$((10#$pct))"
+  { [ "$pct" -eq 0 ] || [ "$pct" -eq 100 ]; } && { printf '%s' "$base"; return 0; }
+
+  base_secs="$(_copilot_timeout_to_secs "$base")"
+  case "$base_secs" in ''|*[!0-9]*) printf '%s' "$base"; return 0 ;; esac
+  secs="$(( base_secs * pct / 100 ))"
+  [ "$secs" -lt 1 ] && secs=1
+  _copilot_timeout_fmt_secs "$secs"
 }
 # <<< copilot-timeout helpers <<<
 
@@ -959,6 +1053,8 @@ while [ $# -gt 0 ]; do
     --triage-model=*)  TRIAGE_MODEL="${1#*=}" ;;
     --triage-map)      need_arg $# "$1"; TRIAGE_MAP="$2"; shift ;;
     --triage-map=*)    TRIAGE_MAP="${1#*=}" ;;
+    --triage-timeout-map)   need_arg $# "$1"; TRIAGE_TIMEOUT_MAP="$2"; shift ;;
+    --triage-timeout-map=*) TRIAGE_TIMEOUT_MAP="${1#*=}" ;;
     --agents-model)    need_arg $# "$1"; AGENTS_MODEL="$2"; shift ;;
     --agents-model=*)  AGENTS_MODEL="${1#*=}" ;;
     --issues-dir)      need_arg $# "$1"; ISSUES_DIR="$2"; shift ;;
@@ -1030,6 +1126,20 @@ TRIAGE_MAP="${TRIAGE_MAP:-}"
 if [ -n "$TRIAGE_MODEL" ] && [ -z "$TRIAGE_MAP" ]; then
   TRIAGE_MAP="trivial=${TRIAGE_MODEL}"
 fi
+
+# Per-difficulty run-timeout scaling (#190): a class->factor map scales the
+# baseline COPILOT_TIMEOUT so a stuck trivial issue is killed sooner and a complex
+# one gets more time. Factors are a percentage of the baseline ("33%"/"33") or an
+# absolute duration ("10m"); "normal"/unlisted classes keep the baseline, and a
+# disabled COPILOT_TIMEOUT stays disabled. When triage is on but no map was given,
+# default to trivial=33%,complex=200% so enabling triage caps easy issues and
+# frees hard ones with zero extra config. "off"/"none"/"0" keeps a flat timeout.
+# Only applied when triage produced a class, so triage off leaves the flat timeout.
+TRIAGE_TIMEOUT_MAP="${TRIAGE_TIMEOUT_MAP:-}"
+if [ -n "$TRIAGE_MODEL" ] && [ -z "$TRIAGE_TIMEOUT_MAP" ]; then
+  TRIAGE_TIMEOUT_MAP="trivial=33%,complex=200%"
+fi
+case "$TRIAGE_TIMEOUT_MAP" in off|none|0|disable|disabled) TRIAGE_TIMEOUT_MAP="" ;; esac
 
 # AGENTS.md bootstrap model. Defaults to a capable mid model because it runs once
 # per repo and every later run benefits from a good AGENTS.md, so this is not the
@@ -1898,6 +2008,22 @@ EOF
     else
       log "issue #$num: triage inconclusive -> default model ${COPILOT_MODEL:-auto}"
     fi
+  fi
+
+  # Scale the run timeout by triage difficulty (#190): a trivial issue is killed
+  # sooner and a complex one gets more time, while "normal"/unknown keep the
+  # baseline --copilot-timeout and a disabled timeout stays disabled. Shadow
+  # COPILOT_TIMEOUT for this run so run_copilot's guard and the timeout
+  # check/message below all use the per-issue value (bash dynamic scope carries
+  # the local into run_copilot); the global baseline is restored on return.
+  local COPILOT_TIMEOUT="$COPILOT_TIMEOUT"
+  if [ -n "$triage_class" ] && [ -n "$TRIAGE_TIMEOUT_MAP" ]; then
+    local scaled_timeout
+    scaled_timeout="$(scale_copilot_timeout "$COPILOT_TIMEOUT" "$(parse_triage_map "$TRIAGE_TIMEOUT_MAP" "$triage_class")")"
+    if [ "$scaled_timeout" != "$COPILOT_TIMEOUT" ]; then
+      log "issue #$num: run timeout for '$triage_class' -> ${scaled_timeout:-off} (baseline ${COPILOT_TIMEOUT:-off})"
+    fi
+    COPILOT_TIMEOUT="$scaled_timeout"
   fi
 
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)

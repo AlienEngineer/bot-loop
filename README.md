@@ -298,6 +298,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--commit-model <model>` | `COMMIT_MODEL` | Model that writes the commit message |
 | `--triage-model <model>` | `TRIAGE_MODEL` | Cheap model that classifies each issue and asks the author to clarify vague ones |
 | `--triage-map <map>` | `TRIAGE_MAP` | `class=model` pairs mapping difficulty to model |
+| `--triage-timeout-map <m>` | `TRIAGE_TIMEOUT_MAP` | `class=factor` pairs scaling `--copilot-timeout` by difficulty (percent `33%` or duration `10m`); default `trivial=33%,complex=200%` when triage is on |
 | `--agents-model <model>` | `AGENTS_MODEL` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap) (default: `claude-sonnet-4.5`; `off` disables) |
 | `--issues-dir <dir>` | `ISSUES_DIR` | Folder scanned for issue markdown files |
 | `--quiet` | `QUIET` | Log only to files, do not stream to stdout |
@@ -467,6 +468,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--commit-model <model>` | `COMMIT_MODEL` | `off` | Model that writes the commit message from the staged diff. `off` uses a deterministic `Resolve #<n>: <title>` message. |
 | `--triage-model <model>` | `TRIAGE_MODEL` | `off` | Cheap model that classifies each issue as trivial/normal/complex before coding, so the coding model can be chosen per difficulty. The same model also checks whether the issue is specified well enough: a genuinely vague one is asked a clarifying question (labelled `needs-info`) and gets no coding run — asked at most once and biased toward proceeding. `off` disables triage. |
 | `--triage-map <map>` | `TRIAGE_MAP` | unset | Comma-separated `class=model` pairs mapping a triage class to the coding model, e.g. `trivial=gpt-5-mini,complex=claude-opus-4.5`. An unmapped class falls back to `--model`. |
+| `--triage-timeout-map <m>` | `TRIAGE_TIMEOUT_MAP` | unset | Comma-separated `class=factor` pairs scaling `--copilot-timeout` by triage difficulty, so a stuck trivial issue is killed sooner and a complex one gets more time. The factor is a percentage of the baseline (`33%`, or bare `33`) or an absolute duration (`10m`). `normal` and any unmapped class keep the baseline, and a disabled `--copilot-timeout` stays disabled. Defaults to `trivial=33%,complex=200%` when triage is on; `off`/`none`/`0` keeps a flat timeout across classes. Only applied when triage produced a class, so with triage off the flat `--copilot-timeout` applies as before. |
 | `--agents-model <model>` | `AGENTS_MODEL` | `claude-sonnet-4.5` | Model for the one-time [AGENTS.md bootstrap](#agentsmd-bootstrap). Runs once per repo (high-leverage), so it defaults to a capable mid model rather than the cheapest. `off` disables the bootstrap. |
 | `--issues-dir <dir>` | `ISSUES_DIR` | `<repo>/issues` | Folder scanned for issue markdown files. |
 | `--quiet` | `QUIET` | off | Only write Copilot's output to the per-run log files; do not stream it to stdout. |
