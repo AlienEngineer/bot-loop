@@ -592,21 +592,31 @@ parse_usage_stats() {
     printf '%s\n' "$tokens"
   fi
 }
+
+# Build the header line for a usage comment, always naming the model used so
+# every issue/PR records which model resolved it (#208). An empty model means
+# Copilot's default was used, reported as "auto" (mirrors the TUI's label).
+# Pure: no I/O, echoes the header on stdout.
+_usage_header() {
+  local model="${1:-}"
+  [ -n "$model" ] || model="auto"
+  printf '**copilot-loop usage** (model: %s)' "$model"
+}
 # <<< usage helpers <<<
 
 # Post the per-run cost/usage summary Copilot printed (parsed out of $log_file)
 # as a comment on the issue or PR, tagged with USAGE_MARKER so it is easy to spot
-# and filter in the thread. Skips silently when the log held no usage stats, and
-# never fails the loop (every failure is swallowed) so cost tracking can never
-# block or break a run.
+# and filter in the thread. The header always records which model resolved the
+# run ("auto" when none was pinned, #208). Skips silently when the log held no
+# usage stats, and never fails the loop (every failure is swallowed) so cost
+# tracking can never block or break a run.
 # Usage: _report_usage <issue|pr> <num> <log_file> <model>
 _report_usage() {
   local kind="$1" num="$2" log_file="$3" model="${4:-}" summary header body
   [ -f "$log_file" ] || return 0
   summary="$(parse_usage_stats <"$log_file" 2>/dev/null)"
   [ -n "$summary" ] || return 0
-  header="**copilot-loop usage**"
-  [ -n "$model" ] && header="$header (model: $model)"
+  header="$(_usage_header "$model")"
   # shellcheck disable=SC2016  # backticks/%s are literal printf format, not expansions
   body="$(printf '%s\n\n```\n%s\n```\n\n%s' "$header" "$summary" "$USAGE_MARKER")"
   case "$kind" in

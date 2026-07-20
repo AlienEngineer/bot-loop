@@ -393,7 +393,10 @@ After every Copilot run the loop posts what that prompt cost as a comment on the
 issue (or PR, for conflict resolution). The comment carries the `AI Credits` and
 `Tokens` summary Copilot prints at the end of a run, taken from the run's log,
 and is tagged with a hidden `<!-- copilot-loop:usage -->` marker so the cost
-comments are easy to spot and filter in the thread:
+comments are easy to spot and filter in the thread. The comment header also
+records which model resolved the run — e.g.
+`**copilot-loop usage** (model: claude-opus-4.5)` — showing `auto` when no model
+is pinned, so you can see what each issue was solved with:
 
 ```
 $ bot-loop-bash

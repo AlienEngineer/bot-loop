@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# Unit tests for parse_usage_stats in copilot-loop.sh. The helper is extracted
-# verbatim from the script (between the "usage helpers" markers) and sourced
-# here, so the real parsing code is exercised. It reads Copilot's captured run
-# output on stdin and echoes the per-run cost summary (the last "AI Credits" /
-# "Premium requests" line and the last "Tokens" line) that _report_usage posts
-# as a comment on the issue/PR, so every prompt's cost is tracked.
+# Unit tests for parse_usage_stats and _usage_header in copilot-loop.sh. The
+# helpers are extracted verbatim from the script (between the "usage helpers"
+# markers) and sourced here, so the real code is exercised. parse_usage_stats
+# reads Copilot's captured run output on stdin and echoes the per-run cost
+# summary (the last "AI Credits" / "Premium requests" line and the last "Tokens"
+# line); _usage_header builds the comment header that names which model resolved
+# the run. Together they form the usage comment _report_usage posts on the
+# issue/PR, so every prompt's cost and model are tracked.
 #
 # Run: tests/usage-report.test.sh
 set -uo pipefail
@@ -95,6 +97,14 @@ assert_eq "CRLF stripped" "$(printf '%s' "$crlf" | parse_usage_stats)" "$want_cr
 indented="$(printf '    AI Credits 7.7 (4s)\n    Tokens     \xe2\x86\x91 2k \xe2\x80\xa2 \xe2\x86\x93 9\n')"
 want_indented="$(printf 'AI Credits 7.7 (4s)\nTokens     \xe2\x86\x91 2k \xe2\x80\xa2 \xe2\x86\x93 9')"
 assert_eq "leading indent trimmed" "$(printf '%s' "$indented" | parse_usage_stats)" "$want_indented"
+
+# --- _usage_header: the model that resolved the run is always recorded (#208) --
+assert_eq "explicit model in header" \
+  "$(_usage_header 'claude-opus-4.5')" "**copilot-loop usage** (model: claude-opus-4.5)"
+assert_eq "empty model -> auto" \
+  "$(_usage_header '')" "**copilot-loop usage** (model: auto)"
+assert_eq "missing model arg -> auto" \
+  "$(_usage_header)" "**copilot-loop usage** (model: auto)"
 
 if [ "$fail" -eq 0 ]; then
   echo "All usage-report tests passed."
