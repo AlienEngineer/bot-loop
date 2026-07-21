@@ -5,9 +5,9 @@ class BotLoop < Formula
   # every push to main by .github/workflows/release.yml, which also mirrors this
   # file to the alienengineer/homebrew-bot-loop tap that
   # `brew tap alienengineer/bot-loop` installs from.
-  url "https://github.com/AlienEngineer/bot-loop/releases/download/v0.1.25/bot-loop-macos.tar.gz"
-  sha256 "08d45c8b0226ce2ddaab7225d978a84855558d85213a68d9a81af1b8a2917330"
-  version "0.1.25"
+  url "https://github.com/AlienEngineer/bot-loop/releases/download/v0.1.26/bot-loop-macos.tar.gz"
+  sha256 "361ab6c9873f64e319987eb46b4274ad121b472bdc9346c8c5803ecea4e63560"
+  version "0.1.26"
 
   depends_on "gh"
   depends_on "git"
