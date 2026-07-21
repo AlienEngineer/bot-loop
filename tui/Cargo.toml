@@ -1,6 +1,6 @@
 [package]
 name = "copilot-loop-tui"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2024"
 description = "Terminal UI (ratatui) that lists GitHub issues for copilot-loop"
 
