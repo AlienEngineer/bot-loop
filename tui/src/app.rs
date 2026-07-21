@@ -1067,7 +1067,9 @@ impl App {
     /// Stop every background worker as the TUI closes, so quitting never leaves
     /// detached `copilot-loop.sh` loops running (#209). Called once on exit;
     /// unlike [`stop_all_workers`](Self::stop_all_workers) it sets no status
-    /// because the UI is already gone.
+    /// because the UI is already gone. The runner also stops its workers when
+    /// dropped, so an abnormal exit that skips this call (e.g. a panic) still
+    /// kills the bots (#219).
     pub fn shutdown(&mut self) {
         self.runner.stop_all();
     }
@@ -2807,6 +2809,75 @@ mod tests {
         // Closing the TUI stops it, leaving nothing running behind (#209).
         app.shutdown();
         assert_eq!(app.workers_running(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether `pid` still exists, via `kill(pid, 0)` — no signal is delivered
+    /// and it fails with `ESRCH` once the process is gone and reaped (#219).
+    #[cfg(unix)]
+    fn worker_process_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks existence/permission; it delivers nothing
+        // and touches no memory of ours.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Poll until `pid` is gone, or give up after ~5s so a wedged test fails
+    /// loudly rather than hanging.
+    #[cfg(unix)]
+    fn wait_until_worker_gone(pid: u32) -> bool {
+        for _ in 0..250 {
+            if !worker_process_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_tui_without_a_shutdown_still_kills_running_workers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Stand in for `copilot-loop.sh` with a script that just sleeps, so the
+        // TUI starts a real detached worker for the repo it targets.
+        let dir = std::env::temp_dir().join(format!("copilot-dropexit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join(runner::LOOP_SCRIPT_NAME);
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = App::new(Vec::new());
+        app.set_repo_root(dir.clone());
+
+        // The user starts a worker; writing then exec'ing a script in a
+        // multithreaded test can momentarily fail with ETXTBSY, so retry briefly
+        // until one is actually running, and capture its pid.
+        let mut pid = 0;
+        for _ in 0..50 {
+            app.start_worker();
+            app.refresh_bots();
+            if let Some(view) = app
+                .bots()
+                .iter()
+                .find(|v| v.status == WorkerStatus::Running)
+            {
+                pid = view.pid;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(pid != 0, "a worker should start; status: {:?}", app.status);
+
+        // Drop the TUI *without* calling shutdown(), mimicking a crash or panic
+        // that unwinds out of the UI loop. The bot must still be killed — exiting
+        // must never leave a detached `copilot-loop.sh` running (#219).
+        drop(app);
+        assert!(
+            wait_until_worker_gone(pid),
+            "worker pid {pid} should be dead after the TUI is dropped without a shutdown"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

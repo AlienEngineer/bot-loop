@@ -76,6 +76,8 @@ fn main() -> Result<()> {
     // Closing the TUI stops every worker it started so no detached
     // `copilot-loop.sh` loop is left running (#209). Runs on every exit path —
     // the quit prompt, Ctrl-c, or a run error — since all return through here.
+    // A panic unwinding past this instead is caught by the runner's `Drop`,
+    // which stops the workers too, so no exit leaks a bot (#219).
     app.shutdown();
     result
 }
