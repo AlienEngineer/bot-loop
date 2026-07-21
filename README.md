@@ -298,6 +298,30 @@ to disable). The whole step is time-boxed by `--copilot-timeout` and fully
 failure-safe — a failed or empty generation is logged and skipped, never blocking
 issue work.
 
+### Self-improving loop (auto-fix)
+
+The loop isolates each unit of work (an issue, a plan, a PR fix) in a subshell so
+an *unexpected* crash — a bug in the loop itself, such as a `set -u` unbound
+variable — fails only that unit instead of silently killing the whole loop. When
+that happens the loop now also **reports the crash upstream so it can be fixed**,
+instead of just logging it and moving on (issue #218). It routes the report by
+whether you can push to the loop's own repo (`BOT_LOOP_REPO`, default
+`AlienEngineer/bot-loop`):
+
+- **You can push** → it files a trigger-labelled (`ready`) fix issue on that repo,
+  with the captured error as a ready-to-work task, so a loop running against
+  bot-loop resolves it into a PR.
+- **You cannot push** → it writes a local crash report under
+  `.copilot-loop/auto-fix/` and, when a mailer (`mail`/`sendmail`) is available,
+  emails it to the maintainer (`BOT_LOOP_EMAIL`, default
+  `aimirim.software@gmail.com`), asking you to forward it.
+
+When the error output could not be captured, a generic "the loop crashed and
+needs fixing" message is used instead. Each distinct crash is reported once (not
+on every pass), and the whole step is best-effort: it runs outside the crash
+isolation and can never itself break the loop. On by default; pass `--no-auto-fix`
+(or `AUTO_FIX=0`) to only log crashes.
+
 ## Flags and environment variables
 
 Every option can be set as a command-line flag or via the matching environment
@@ -323,6 +347,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Per-issue worktrees (default: on) |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | Merge each PR automatically |
 | `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | Ask Copilot to add user-perspective tests for each issue (default: on; `--qa`/`--no-qa` aliases) |
+| `--auto-fix` / `--no-auto-fix` | `AUTO_FIX` | Report the loop's own crashes to the bot-loop repo so it can [self-improve](#self-improving-loop-auto-fix) (default: on) |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge`, `squash`, or `rebase` |
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | Sweep merged branches/worktrees each pass (default: on) |
 | `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | Delete a merged issue's remote branch (default: auto) |
@@ -330,7 +355,9 @@ variable; when both are given, the flag wins. The commonly used ones:
 Env-only settings: `SELF_UPDATE` (set to `0` to stop the loop pulling and
 re-execing itself when the script changes upstream) and `SYNC_REMOTE` (set to
 `0` to stop the loop syncing the local default branch with the remote before each
-pass).
+pass). The [auto-fix](#self-improving-loop-auto-fix) target is env-only too:
+`BOT_LOOP_REPO` (default `AlienEngineer/bot-loop`) and `BOT_LOOP_EMAIL` (default
+`aimirim.software@gmail.com`).
 
 Run `./copilot-loop.sh --help`, or read the header of
 [`copilot-loop.sh`](./copilot-loop.sh), for the complete and authoritative list.
@@ -498,6 +525,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | on | Give every issue its own git worktree (never touch the shared checkout), or work in the current checkout instead. |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | off | Merge every PR automatically (GitHub auto-merge when the repo allows it, otherwise an immediate merge), or leave PRs open for manual review. |
 | `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | on | Ask Copilot to add tests for each issue, written from the user's perspective. Aliases: `--qa` / `--no-qa`. Turn off to save cost. |
+| `--auto-fix` / `--no-auto-fix` | `AUTO_FIX` | on | When the loop itself crashes, report the crash to the [bot-loop repo](#self-improving-loop-auto-fix) so it can be fixed: file a trigger-labelled fix issue there when you can push (the loop resolves it into a PR), otherwise write a local crash report and email the maintainer. `--no-auto-fix` only logs crashes. |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge` | Merge method used for auto-merge: `merge`, `squash`, or `rebase`. |
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | on | Sweep merged issue branches and worktrees each pass, or leave them in place. |
 | `--delete-remote-branch` / `--no-delete-remote-branch` | `DELETE_REMOTE_BRANCH` | auto | Delete a merged issue's remote branch. `auto` deletes only when the repo does not already delete head branches on merge. |
@@ -510,3 +538,7 @@ Env-only settings:
   re-execing itself when the script changes upstream.
 - **`SYNC_REMOTE`** (default on) — set to `0` to stop the loop syncing the local
   default branch with the remote before each pass.
+- **`BOT_LOOP_REPO`** (default `AlienEngineer/bot-loop`) — the loop's own repo
+  that [auto-fix](#self-improving-loop-auto-fix) files crash reports against.
+- **`BOT_LOOP_EMAIL`** (default `aimirim.software@gmail.com`) — maintainer address
+  the auto-fix report path emails when you cannot push to `BOT_LOOP_REPO`.
