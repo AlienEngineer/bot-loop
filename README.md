@@ -336,6 +336,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--model <model>` | `COPILOT_MODEL` | Model passed to `copilot --model` |
 | `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | Wall-clock limit for each Copilot run so a stuck run cannot block the loop; seconds or an `s`/`m`/`h`/`d` suffix (`30m`), `0`/`off` disables (default: `30m`) |
 | `--commit-model <model>` | `COMMIT_MODEL` | Model that writes the commit message |
+| `--summary-model <model>` | `SUMMARY_MODEL` | Light model that writes the per-issue close summary (default: `gpt-5-mini`; `auto`/`off` lets Copilot pick) |
 | `--triage-model <model>` | `TRIAGE_MODEL` | Cheap model that classifies each issue and asks the author to clarify vague ones |
 | `--triage-map <map>` | `TRIAGE_MAP` | `class=model` pairs mapping difficulty to model |
 | `--cost-saver` | `COST_SAVER` | Preset that turns on smart model routing with built-in defaults (cheap classifier; trivial→cheap, normal→mid, complex→`--model` or a strong default). An explicit `--triage-model`/`--triage-map` overrides it |
@@ -347,6 +348,7 @@ variable; when both are given, the flag wins. The commonly used ones:
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | Per-issue worktrees (default: on) |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | Merge each PR automatically |
 | `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | Ask Copilot to add user-perspective tests for each issue (default: on; `--qa`/`--no-qa` aliases) |
+| `--summary` / `--no-summary` | `REPORT_SUMMARY` | Post a light-model summary of what was done on each resolved issue (default: on) |
 | `--auto-fix` / `--no-auto-fix` | `AUTO_FIX` | Report the loop's own crashes to the bot-loop repo so it can [self-improve](#self-improving-loop-auto-fix) (default: on) |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge`, `squash`, or `rebase` |
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | Sweep merged branches/worktrees each pass (default: on) |
@@ -447,6 +449,32 @@ $ bot-loop-bash
 2026-07-20 09:47:41 | issue #98: DONE -> https://github.com/AlienEngineer/bot-loop/pull/171
 ```
 
+## Close summaries
+
+When the loop resolves an issue and opens its PR, it also posts a short summary
+of **what was done** as a comment on the issue, so the thread records the outcome
+even after GitHub closes the issue on merge. A *light* model (`--summary-model`,
+`gpt-5-mini` by default, so the summary stays cheap) reads the run's session log
+and writes a few lines of Markdown — the key changes and the PR that was raised.
+The comment header names the model used, and it carries a hidden
+`<!-- copilot-loop:summary -->` marker so the summaries are easy to spot and
+filter in the thread:
+
+```
+🤖 **Closing summary** — what the loop did, per its session (model: `gpt-5-mini`).
+
+Added a `--summary` flag and a light-model summariser; the loop now posts this
+recap on each resolved issue. Opened PR #171.
+
+<!-- copilot-loop:summary -->
+```
+
+It is **on by default**; pass `--no-summary` (or set `REPORT_SUMMARY=0`) to turn
+it off and save the extra model call, or set `--summary-model auto`/`off` to let
+Copilot pick its default model instead of the cheap one. Only issues the loop
+actually worked get a summary — there is nothing to summarise otherwise. (This is
+the autonomous counterpart to the TUI's on-close summary, [#161](https://github.com/AlienEngineer/bot-loop/issues/161)/[#217](https://github.com/AlienEngineer/bot-loop/issues/217).)
+
 ## Getting Started
 
 Requires `git`, the authenticated GitHub CLI (`gh auth login`), and the
@@ -496,7 +524,9 @@ Each pass the loop:
    failing the issue (#193) — then pushes and opens a PR that closes the issue
    (auto-merging it when `--auto-merge` is on).
 10. Labels the issue `copilot-done` on success, or `copilot-failed` on failure
-    (never retried automatically).
+    (never retried automatically). On success it also posts a short summary of
+    what it did, written from the run's session log by a light model (unless
+    `--no-summary`).
 11. Sweeps merged branches and worktrees, then sleeps if there is no work (press
     `f` to wake it).
 
@@ -514,6 +544,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--model <model>` | `COPILOT_MODEL` | auto | Model passed to `copilot --model`. |
 | `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | `30m` | Wall-clock limit per Copilot run so a stuck run cannot block the loop. Seconds, or an `s`/`m`/`h`/`d` suffix (`1800`, `30m`, `2h`); `0`/`off` disables it. |
 | `--commit-model <model>` | `COMMIT_MODEL` | `off` | Model that writes the commit message from the staged diff. `off` uses a deterministic `Resolve #<n>: <title>` message. |
+| `--summary-model <model>` | `SUMMARY_MODEL` | `gpt-5-mini` | Light model that writes the per-issue [close summary](#close-summaries) from the run's session log. A cheap default keeps the summary inexpensive; `auto`/`off`/`none` lets Copilot pick its own default model instead. |
 | `--triage-model <model>` | `TRIAGE_MODEL` | `off` | Cheap model that classifies each issue as trivial/normal/complex before coding, so the coding model can be chosen per difficulty. The same model also checks whether the issue is specified well enough: a genuinely vague one is asked a clarifying question (labelled `needs-info`) and gets no coding run — asked at most once and biased toward proceeding. `off` disables triage. |
 | `--triage-map <map>` | `TRIAGE_MAP` | unset | Comma-separated `class=model` pairs mapping a triage class to the coding model, e.g. `trivial=gpt-5-mini,complex=claude-opus-4.5`. An unmapped class falls back to `--model`. |
 | `--cost-saver` | `COST_SAVER` | `off` | Cost-saver preset: enable smart model routing with sensible built-in defaults instead of hand-writing a triage map. Turns on triage with a cheap classifier and a default map — trivial runs on a cheap model (`gpt-5-mini`), normal on a mid model (`claude-sonnet-4.5`), and complex on your `--model` (or a strong default, `claude-opus-4.5`, when `--model` is unset) — so spend tracks difficulty. A convenience layer over triage: an explicit `--triage-model`/`--triage-map` always overrides the preset, and any triage failure falls back to the default model so the preset never blocks a run. |
@@ -525,6 +556,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--worktrees` / `--no-worktrees` | `USE_WORKTREES` | on | Give every issue its own git worktree (never touch the shared checkout), or work in the current checkout instead. |
 | `--auto-merge` / `--no-auto-merge` | `AUTO_MERGE` | off | Merge every PR automatically (GitHub auto-merge when the repo allows it, otherwise an immediate merge), or leave PRs open for manual review. |
 | `--quality-assurance` / `--no-quality-assurance` | `QUALITY_ASSURANCE` | on | Ask Copilot to add tests for each issue, written from the user's perspective. Aliases: `--qa` / `--no-qa`. Turn off to save cost. |
+| `--summary` / `--no-summary` | `REPORT_SUMMARY` | on | When the loop resolves an issue, post a short [summary](#close-summaries) of what was done as a comment on it, written from the run's session log by the light `--summary-model`. Turn off to save cost. |
 | `--auto-fix` / `--no-auto-fix` | `AUTO_FIX` | on | When the loop itself crashes, report the crash to the [bot-loop repo](#self-improving-loop-auto-fix) so it can be fixed: file a trigger-labelled fix issue there when you can push (the loop resolves it into a PR), otherwise write a local crash report and email the maintainer. `--no-auto-fix` only logs crashes. |
 | `--merge-method <method>` | `MERGE_METHOD` | `merge` | Merge method used for auto-merge: `merge`, `squash`, or `rebase`. |
 | `--cleanup-merged` / `--no-cleanup-merged` | `CLEANUP_MERGED` | on | Sweep merged issue branches and worktrees each pass, or leave them in place. |
