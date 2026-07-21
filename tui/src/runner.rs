@@ -388,6 +388,18 @@ impl LoopRunner {
     }
 }
 
+/// Stop every worker when the runner is dropped, so ending the TUI *always*
+/// kills the bots it started — even on an exit path that never reaches the
+/// explicit `App::shutdown`, such as a panic unwinding out of the UI loop
+/// (#219). Without this, a dropped [`Child`] leaves its detached process group
+/// running: `std::process::Child` does not kill on drop. `stop_all` is
+/// idempotent, so a normal exit that already called it makes this a no-op.
+impl Drop for LoopRunner {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
 /// Spawn `program` detached from the TUI: its own process group (so the whole
 /// tree can be signalled), stdin from `/dev/null`, and stdout/stderr appended to
 /// `log`. The dedicated process group lets [`stop_all`](LoopRunner::stop_all)
@@ -728,6 +740,28 @@ mod tests {
         panic!("worker #{id} never stopped");
     }
 
+    /// Whether `pid` still exists, via `kill(pid, 0)` — which delivers no signal
+    /// and fails with `ESRCH` once the process is gone and reaped (#219).
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 performs only the existence/permission check; it
+        // delivers nothing and touches no memory of ours.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Poll until `pid` is gone, or give up after ~5s so a wedged test fails
+    /// loudly rather than hanging.
+    #[cfg(unix)]
+    fn wait_until_process_gone(pid: u32) -> bool {
+        for _ in 0..250 {
+            if !process_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     #[cfg(unix)]
     #[test]
     fn detects_text_file_busy_in_an_error_chain() {
@@ -775,6 +809,37 @@ mod tests {
         let _ = fs::remove_file(&script);
         let _ = fs::remove_file(&log1);
         let _ = fs::remove_file(&log2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_runner_kills_its_workers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A sleeping stand-in for copilot-loop.sh, so a real detached worker runs.
+        let mut script = std::env::temp_dir();
+        script.push(format!("copilot-loop-drop-{}.sh", std::process::id()));
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = std::env::temp_dir();
+        let log = dir.join(format!("copilot-loop-drop-{}.log", std::process::id()));
+
+        let mut runner = LoopRunner::new();
+        let pid = start_worker(&mut runner, 1, &script, &dir, &log);
+        assert!(process_alive(pid), "worker should be running once started");
+
+        // Tearing the runner down — what happens when the TUI exits by *any*
+        // path, including a panic that never calls shutdown() — must stop the
+        // bot, not leak its detached process group (#219).
+        drop(runner);
+        assert!(
+            wait_until_process_gone(pid),
+            "worker pid {pid} should be dead once the runner is dropped"
+        );
+
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&log);
     }
 
     #[test]
