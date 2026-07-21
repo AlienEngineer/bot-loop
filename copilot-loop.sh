@@ -4099,7 +4099,9 @@ report_loop_error() {
 
   # Only mark the crash reported once something actually landed, so a transient
   # failure (e.g. gh hiccup) is retried on the next crash instead of suppressed.
-  [ "$ok" = 1 ] && : >"$marker" 2>/dev/null || true
+  if [ "$ok" = 1 ]; then
+    : >"$marker" 2>/dev/null || true
+  fi
   return 0
 }
 # <<< auto-fix helpers <<<
