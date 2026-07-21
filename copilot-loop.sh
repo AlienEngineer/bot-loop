@@ -174,6 +174,12 @@
 #                            Ask Copilot to add tests (from the user's perspective)
 #                            for the work it did on each issue; disable to save cost
 #                            (default: on). --qa / --no-qa are accepted aliases.
+#   --auto-fix / --no-auto-fix
+#                            When the loop itself crashes, report the crash to the
+#                            bot-loop repo so it can be self-improving: file a
+#                            trigger-labelled fix issue there when you can push,
+#                            otherwise write a report and email the maintainer
+#                            (default: on).
 #   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
 #                            (default: merge).
 #   --cleanup-merged / --no-cleanup-merged
@@ -190,7 +196,11 @@
 #   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
 #   QUIET, USE_WORKTREES,
 #   VERBOSE,
-#   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
+#   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH,
+#   AUTO_FIX
+# Plus BOT_LOOP_REPO / BOT_LOOP_EMAIL (env-only, no flag): the repo auto-fix files
+# loop-crash reports against (default AlienEngineer/bot-loop) and the maintainer
+# address it emails when you cannot push there (default aimirim.software@gmail.com).
 # Plus SELF_UPDATE (env-only, no flag): set to 0 to stop the loop pulling the
 # default branch and restarting when this script changes upstream (default:
 # auto, on when the script is tracked in the repo it operates on).
@@ -341,6 +351,19 @@ AUTO_MERGE="${AUTO_MERGE:-}"
 # each issue. On by default (issue #162); set QUALITY_ASSURANCE=0 (or pass
 # --no-quality-assurance) to turn it off and save the extra cost.
 QUALITY_ASSURANCE="${QUALITY_ASSURANCE:-}"
+# Self-improving loop (issue #218): when the loop ITSELF crashes — a guarded unit
+# (issue/plan/PR-fix) exits unexpectedly, i.e. a bug in the loop, not a handled
+# failure — report the crash upstream so it can be fixed. On by default; set
+# AUTO_FIX=0 (or pass --no-auto-fix) to only log crashes and never report them.
+AUTO_FIX="${AUTO_FIX:-}"
+# The loop's own upstream repo. auto-fix files a trigger-labelled fix issue here
+# when the user can push to it (the loop then fixes it into a PR); otherwise the
+# report the user is asked to forward names this repo. Override it for a fork.
+BOT_LOOP_REPO="${BOT_LOOP_REPO:-AlienEngineer/bot-loop}"
+# Maintainer contact for the auto-fix report path (user cannot push to
+# BOT_LOOP_REPO): the crash report names this address and the loop emails it when
+# a mailer (mail/sendmail) is available.
+BOT_LOOP_EMAIL="${BOT_LOOP_EMAIL:-aimirim.software@gmail.com}"
 # Merge method used when AUTO_MERGE is on: merge, squash or rebase.
 MERGE_METHOD="${MERGE_METHOD:-}"
 # Delete the remote head branch of an issue once its PR merges. Empty means
@@ -401,6 +424,10 @@ USAGE_MARKER="<!-- copilot-loop:usage -->"
 # execution pass can tell the issue was planned (and the plan approved) and hand
 # Copilot the approved plan to follow (mirrors QUESTION_MARKER).
 PLAN_MARKER="<!-- copilot-loop:plan -->"
+
+# Hidden marker on every auto-fix issue/report the loop files about its OWN
+# crashes (issue #218), so they are easy to recognise in a thread and de-dupe.
+AUTO_FIX_MARKER="<!-- copilot-loop:auto-fix -->"
 
 # --- Helpers -----------------------------------------------------------------
 # Emit a timestamped status line to stdout. When CURRENT_RUN_LOG is set (during a
@@ -582,6 +609,13 @@ work:
                            default). Alias: --qa.
   --no-quality-assurance   Skip the quality-assurance tests to save cost.
                            Alias: --no-qa.
+  --auto-fix               Self-improving loop: when the loop ITSELF crashes,
+                           report the crash to the bot-loop repo so it can be
+                           fixed. When you can push to that repo a trigger-
+                           labelled fix issue is filed (the loop resolves it into
+                           a PR); otherwise a local report is written and emailed
+                           to the maintainer. This is the default.
+  --no-auto-fix            Only log loop crashes; never report them upstream.
   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
                            (default: merge).
   --cleanup-merged         Sweep merged issue branches and worktrees each pass
@@ -600,7 +634,8 @@ Environment variables (equivalent to the flags above):
   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
   QUIET, USE_WORKTREES,
   VERBOSE,
-  AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
+  AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH,
+  AUTO_FIX, BOT_LOOP_REPO, BOT_LOOP_EMAIL
 EOF
 }
 
@@ -1193,6 +1228,8 @@ while [ $# -gt 0 ]; do
     --no-auto-merge)   AUTO_MERGE=0 ;;
     --quality-assurance|--qa)       QUALITY_ASSURANCE=1 ;;
     --no-quality-assurance|--no-qa) QUALITY_ASSURANCE=0 ;;
+    --auto-fix)        AUTO_FIX=1 ;;
+    --no-auto-fix)     AUTO_FIX=0 ;;
     --merge-method)    need_arg $# "$1"; MERGE_METHOD="$2"; shift ;;
     --merge-method=*)  MERGE_METHOD="${1#*=}" ;;
     --delete-remote-branch)    DELETE_REMOTE_BRANCH=1 ;;
@@ -1294,6 +1331,12 @@ esac
 # Quality assurance: ask Copilot to add user-perspective tests for the work.
 # On by default (issue #162); only the explicit falsy spellings turn it off.
 QUALITY_ASSURANCE="$(qa_enabled "$QUALITY_ASSURANCE")"
+# Loop auto-fix (issue #218): report the loop's own crashes upstream so it can
+# self-improve. On by default; only the explicit falsy spellings turn it off.
+case "$AUTO_FIX" in
+  0|false|no|off) AUTO_FIX=0 ;;
+  *)              AUTO_FIX=1 ;;
+esac
 # Merge method used by auto-merge. Default to a merge commit; reject anything
 # other than the three methods gh understands so a typo fails loudly at startup.
 MERGE_METHOD="${MERGE_METHOD:-merge}"
@@ -1327,6 +1370,9 @@ LOG_DIR="$WORK_DIR/logs"
 # working, or is absent between issues. The pid matches what the TUI records for
 # the worker it spawned (this script's $$), so it can label the issue row.
 WORKER_STATE_DIR="$WORK_DIR/workers"
+# Where auto-fix keeps its per-crash de-dup markers and any crash reports it
+# writes (issue #218), so a recurring loop crash is reported once, not every pass.
+AUTO_FIX_STATE_DIR="$WORK_DIR/auto-fix"
 
 # Record the issue this worker is currently working ($1 = issue number), so the
 # TUI can show this process's pid against that issue (#214). Best-effort: a write
@@ -1582,6 +1628,11 @@ if [ "$QUALITY_ASSURANCE" = 1 ]; then
   log "quality assurance: on — Copilot adds user-perspective tests per issue (pass --no-quality-assurance to disable)"
 else
   log "quality assurance: off — no tests requested (pass --quality-assurance to enable)"
+fi
+if [ "$AUTO_FIX" = 1 ]; then
+  log "auto-fix: on — loop crashes are reported to $BOT_LOOP_REPO so the loop can self-improve (pass --no-auto-fix to disable)"
+else
+  log "auto-fix: off — loop crashes are only logged (pass --auto-fix to enable)"
 fi
 if [ "$CLEANUP_MERGED" = 1 ]; then
   if [ "$DELETE_REMOTE_BRANCH" = 1 ]; then
@@ -3698,6 +3749,156 @@ EOF
 # when one already exists; time-boxed and failure-safe (never blocks the loop).
 generate_agents_md || true
 
+# --- Self-improving loop: auto-fix the loop's own crashes (issue #218) --------
+# When a guarded unit exits *unexpectedly* (a crash — a bug in the loop, not a
+# handled failure), report it upstream so the loop can be fixed instead of
+# quietly crashing forever. Two routes, decided by whether the operator can push
+# to the loop's own repo (BOT_LOOP_REPO):
+#   1. can push   -> file a trigger-labelled fix issue there; the loop then
+#                    resolves it into a PR ("ask Copilot to fix and open a PR").
+#   2. cannot push -> write a local crash report and email it to the maintainer
+#                    (BOT_LOOP_EMAIL), asking the operator to forward it.
+# When the error output could not be captured, a generic "the loop crashed, it
+# needs fixing" message is used. Reports are de-duplicated per crash signature so
+# a recurring crash is filed once, not every pass. report_loop_error() runs
+# OUTSIDE guard()'s subshell, so every step here is best-effort and can never
+# fail or crash the loop.
+# >>> auto-fix helpers >>>
+# Stable short signature for a crash, so the same crash is reported once (not
+# every pass, and not once per issue it hits). Keyed on the crash's identity —
+# normally its captured error text — so the SAME loop bug seen while running
+# different units de-duplicates to one report. Pure: hashes its arguments
+# (joined), echoing digits only. Args: <identity-text...>.
+_auto_fix_signature() {
+  printf '%s' "$*" | cksum | awk '{print $1}'
+}
+
+# True (rc 0) when the gh-authenticated user can push to $1 ("owner/repo") — has
+# push, maintain or admin on it — so the loop may open a fix issue there. False
+# on any error (not logged in for that host, repo not found, no access), which
+# routes auto-fix to the report path instead. Only side effect is the gh call.
+bot_loop_can_push() {
+  local repo="${1:-}" perm
+  [ -n "$repo" ] || return 1
+  perm="$(gh api "repos/$repo" --jq '.permissions.push // false' 2>/dev/null)"
+  [ "$perm" = "true" ]
+}
+
+# Build the Copilot-ready task text for a loop crash: names it a copilot-loop
+# self-crash, embeds the captured error (or a generic note when none was
+# captured), and asks for a root-cause fix. Pure: echoes the body on stdout.
+# Args: <label> <error-text>.
+_auto_fix_build_prompt() {
+  local label="${1:-the loop}" err="${2:-}"
+  printf 'copilot-loop (the autonomous loop in copilot-loop.sh) crashed while running "%s".\n\n' "$label"
+  if [ -n "$err" ]; then
+    printf 'It exited unexpectedly. Investigate the captured error below, find the\n'
+    printf 'root cause in the loop code, and fix it so the loop no longer crashes\n'
+    printf 'this way. Add a regression test under tests/ for the fix.\n\n'
+    # shellcheck disable=SC2016  # backticks/%s are literal printf format (a code fence), not expansions
+    printf 'Captured error:\n\n```\n%s\n```\n' "$err"
+  else
+    printf 'It exited unexpectedly but the error output could not be captured.\n'
+    printf 'Reproduce the crash, find the root cause in the loop code, and fix it so\n'
+    printf 'the loop no longer crashes this way. Add a regression test under tests/.\n'
+  fi
+}
+
+# Option 1 (operator can push): file a trigger-labelled fix issue on the loop's
+# own repo so the loop resolves it into a PR. Best-effort; logs the URL on
+# success or a warning on failure. Falls back to filing without the label when
+# the repo has no such label. Returns non-zero when nothing could be filed, so
+# the caller does not mark the crash reported and can retry later.
+# Args: <repo> <title> <body>.
+_auto_fix_file_issue() {
+  local repo="${1:-}" title="${2:-}" body="${3:-}" url
+  url="$(gh issue create --repo "$repo" --title "$title" --body "$body" \
+           --label "${TRIGGER_LABEL:-ready}" 2>/dev/null)" \
+    || url="$(gh issue create --repo "$repo" --title "$title" --body "$body" 2>/dev/null)"
+  if [ -n "$url" ]; then
+    log "auto-fix: filed a fix request on $repo -> $url"
+    return 0
+  fi
+  log "auto-fix: could not file a fix request on $repo (check 'gh' access); the crash is only logged"
+  return 1
+}
+
+# Option 2 (operator cannot push): write a crash report to disk and, when a
+# mailer is present, email it to the maintainer. Always leaves the report on disk
+# and logs where it is and who to forward it to. Returns 0 (the report always
+# lands locally). Args: <title> <body> <email> <report-dir>.
+_auto_fix_write_report() {
+  local title="${1:-}" body="${2:-}" email="${3:-}" dir="${4:-.}" file mailed=0
+  mkdir -p "$dir" 2>/dev/null || true
+  file="$dir/report-$(date '+%Y%m%d-%H%M%S').md"
+  {
+    printf '# %s\n\n' "$title"
+    printf '%s\n\n' "$body"
+    printf -- '---\n\n'
+    printf 'You are running copilot-loop but cannot push to %s, so this crash\n' "${BOT_LOOP_REPO:-the bot-loop repo}"
+    printf 'could not be filed there automatically. Please send this report to the\n'
+    printf 'bot-loop maintainer at %s so the loop can be fixed.\n' "${email:-the maintainer}"
+  } >"$file" 2>/dev/null || true
+
+  if [ -n "$email" ]; then
+    if command -v mail >/dev/null 2>&1; then
+      mail -s "$title" "$email" <"$file" >/dev/null 2>&1 && mailed=1
+    elif command -v sendmail >/dev/null 2>&1; then
+      { printf 'To: %s\nSubject: %s\n\n' "$email" "$title"; cat "$file"; } \
+        | sendmail -t >/dev/null 2>&1 && mailed=1
+    fi
+  fi
+
+  if [ "$mailed" = 1 ]; then
+    log "auto-fix: cannot push to ${BOT_LOOP_REPO:-bot-loop}; emailed a crash report to $email (copy: $file)"
+  else
+    log "auto-fix: cannot push to ${BOT_LOOP_REPO:-bot-loop}; wrote a crash report to $file — please send it to ${email:-the maintainer}"
+  fi
+  return 0
+}
+
+# Self-improving hook. Report a loop CRASH (a guarded unit that exited
+# unexpectedly) so the loop can be fixed: file a fix issue on BOT_LOOP_REPO when
+# the operator can push there, else write/email a report. De-duplicated per crash
+# signature so a recurring crash is reported once. Fully failure-safe — it runs
+# outside guard(), so it never returns non-zero or crashes the loop. No-op when
+# AUTO_FIX is off. Args: <label> <error-file>.
+report_loop_error() {
+  [ "${AUTO_FIX:-0}" = 1 ] || return 0
+  local label="${1:-the loop}" err_file="${2:-}" err="" sig marker state_dir ok=1
+
+  if [ -n "$err_file" ] && [ -s "$err_file" ]; then
+    err="$(grep -v '^[[:space:]]*$' "$err_file" 2>/dev/null | tail -n 40)"
+  fi
+
+  state_dir="${AUTO_FIX_STATE_DIR:-${WORK_DIR:-/tmp}/auto-fix}"
+  # De-duplicate on the crash's identity: the captured error when we have one (so
+  # the same bug across different issues is reported once), else the unit label.
+  sig="$(_auto_fix_signature "${err:-$label}")"
+  marker="$state_dir/reported-$sig"
+  mkdir -p "$state_dir" 2>/dev/null || true
+  if [ -e "$marker" ]; then
+    log "auto-fix: already reported this loop crash; skipping ($label)"
+    return 0
+  fi
+
+  local title body
+  title="loop auto-fix: crash while running \"$label\""
+  body="$(printf '%s\n\n%s\n' "$(_auto_fix_build_prompt "$label" "$err")" "${AUTO_FIX_MARKER:-}")"
+
+  if bot_loop_can_push "${BOT_LOOP_REPO:-}"; then
+    _auto_fix_file_issue "${BOT_LOOP_REPO:-}" "$title" "$body" || ok=0
+  else
+    _auto_fix_write_report "$title" "$body" "${BOT_LOOP_EMAIL:-}" "$state_dir" || ok=0
+  fi
+
+  # Only mark the crash reported once something actually landed, so a transient
+  # failure (e.g. gh hiccup) is retried on the next crash instead of suppressed.
+  [ "$ok" = 1 ] && : >"$marker" 2>/dev/null || true
+  return 0
+}
+# <<< auto-fix helpers <<<
+
 # EXIT-trap handler for guard()'s subshell. Runs when a guarded unit's subshell
 # exits: on an *abnormal* exit (a crash — _guard_clean never got set to 1) it
 # marks the crash for the parent and folds the captured stderr into the unit's
@@ -3750,6 +3951,12 @@ guard() {
   [ -s "$_GUARD_ERR" ] && cat "$_GUARD_ERR" >&2
   if [ -e "$_GUARD_CRASHED" ]; then
     log "$_label ended unexpectedly (exit $rc): $(grep -v '^[[:space:]]*$' "$_GUARD_ERR" 2>/dev/null | tail -n1)"
+    # Self-improving loop (issue #218): report this crash upstream so the loop
+    # can be fixed. Gated by `command -v` so unit tests that source guard() alone
+    # are unaffected, and by AUTO_FIX inside. Best-effort — never fails the loop.
+    if command -v report_loop_error >/dev/null 2>&1; then
+      report_loop_error "$_label" "$_GUARD_ERR" || true
+    fi
   fi
   rm -f "$_GUARD_ERR" "$_GUARD_CRASHED" 2>/dev/null || true
   return "$rc"
