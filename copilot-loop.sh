@@ -96,9 +96,12 @@
 #       push and open a PR that closes the issue. When --auto-merge is on the PR
 #       is set to merge automatically (GitHub auto-merge when the repo allows it,
 #       otherwise merged immediately) so no manual review is required.
-#   7. On success label the issue "copilot-done". On failure label it
-#      "copilot-failed" and stop — failures are never retried automatically. A
-#      later user reply on a failed issue resumes it for another attempt.
+#   7. On success label the issue "copilot-done", then post a short "what was
+#      done" summary comment on it, written from the run's session log by the
+#      light SUMMARY_MODEL (default on; --no-summary disables it). On failure
+#      label it "copilot-failed" and stop — failures are never retried
+#      automatically. A later user reply on a failed issue resumes it for another
+#      attempt.
 #   8. Sweep merged branches: each pass removes any local work branch and worktree
 #      whose PR has merged and, when the repo does not auto-delete on merge,
 #      deletes the merged remote branch too (CLEANUP_MERGED / DELETE_REMOTE_BRANCH).
@@ -130,6 +133,9 @@
 #   --commit-model <model>   Model used to write the commit message from the
 #                            staged diff; unset/"off" uses a deterministic
 #                            "Resolve #<n>: <title>" message        (default: off)
+#   --summary-model <model>  Light model that writes the "what was done" summary
+#                            posted on each resolved issue; "auto"/"off" lets
+#                            Copilot pick its default            (default: gpt-5-mini)
 #   --triage-model <model>   Cheap model that classifies each issue as
 #                            trivial/normal/complex before coding, so the coding
 #                            model can be chosen per difficulty; unset/"off"
@@ -174,6 +180,9 @@
 #                            Ask Copilot to add tests (from the user's perspective)
 #                            for the work it did on each issue; disable to save cost
 #                            (default: on). --qa / --no-qa are accepted aliases.
+#   --summary / --no-summary Post a "what was done" summary comment on each issue
+#                            the loop resolves, by the light SUMMARY_MODEL; disable
+#                            to save cost                          (default: on).
 #   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
 #                            (default: merge).
 #   --cleanup-merged / --no-cleanup-merged
@@ -188,6 +197,7 @@
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
 #   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
+#   SUMMARY_MODEL, REPORT_SUMMARY,
 #   QUIET, USE_WORKTREES,
 #   VERBOSE,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
@@ -255,6 +265,12 @@ COPILOT_TIMEOUT="${COPILOT_TIMEOUT:-}"
 # gpt-5-mini to have the message written from the diff, or "off" to force the
 # deterministic fallback.
 COMMIT_MODEL="${COMMIT_MODEL:-}"
+# Light model that writes the "what was done" summary posted on an issue once the
+# loop resolves it (issue #161/#217). Kept separate from the coding model so the
+# summary stays cheap. Empty defaults to a built-in light model (gpt-5-mini) so a
+# summary is posted with zero configuration; "off"/"none"/"0"/"auto" let Copilot
+# pick its default model instead. Read raw here; resolved after argument parsing.
+SUMMARY_MODEL="${SUMMARY_MODEL:-}"
 # Optional cheap model used to CLASSIFY each issue as trivial/normal/complex
 # before coding, so the expensive coding model is reserved for hard issues (the
 # COMMIT_MODEL idea applied to routing). The same model also gates genuinely
@@ -341,6 +357,11 @@ AUTO_MERGE="${AUTO_MERGE:-}"
 # each issue. On by default (issue #162); set QUALITY_ASSURANCE=0 (or pass
 # --no-quality-assurance) to turn it off and save the extra cost.
 QUALITY_ASSURANCE="${QUALITY_ASSURANCE:-}"
+# Post an auto-generated "what was done" summary comment on an issue once the loop
+# resolves it and opens its PR (issue #161/#217), written from the session log by
+# the light SUMMARY_MODEL. On by default; set REPORT_SUMMARY=0 (or pass
+# --no-summary) to turn it off and save the extra cost.
+REPORT_SUMMARY="${REPORT_SUMMARY:-}"
 # Merge method used when AUTO_MERGE is on: merge, squash or rebase.
 MERGE_METHOD="${MERGE_METHOD:-}"
 # Delete the remote head branch of an issue once its PR merges. Empty means
@@ -396,6 +417,11 @@ FAILURE_MARKER="<!-- copilot-loop:failed -->"
 # Hidden marker appended to every per-run cost/usage comment so they are easy to
 # recognise (and filter) in the thread (mirrors QUESTION_MARKER).
 USAGE_MARKER="<!-- copilot-loop:usage -->"
+
+# Hidden marker appended to the "what was done" summary comment the loop posts
+# when it resolves an issue (#161/#217), so the summary is easy to recognise (and
+# filter) in the thread and mirrors the TUI's own summary marker.
+SUMMARY_MARKER="<!-- copilot-loop:summary -->"
 
 # Hidden marker appended to the plan comment the loop posts in plan mode, so the
 # execution pass can tell the issue was planned (and the plan approved) and hand
@@ -524,6 +550,9 @@ work:
   --commit-model <model>   Model used to write the commit message from the
                            staged diff; unset/"off" uses a deterministic
                            "Resolve #<n>: <title>" message         (default: off)
+  --summary-model <model>  Light model that writes the "what was done" summary
+                           posted on each resolved issue; "auto"/"off" lets
+                           Copilot pick its default              (default: gpt-5-mini)
   --triage-model <model>   Cheap model that classifies each issue as
                            trivial/normal/complex before coding so the coding
                            model can be chosen per difficulty, and asks the
@@ -582,6 +611,10 @@ work:
                            default). Alias: --qa.
   --no-quality-assurance   Skip the quality-assurance tests to save cost.
                            Alias: --no-qa.
+  --summary                Post a "what was done" summary comment on each issue
+                           the loop resolves, by the light SUMMARY_MODEL (the
+                           default).
+  --no-summary             Skip the per-issue close summary to save cost.
   --merge-method <method>  Merge method for auto-merge: merge, squash or rebase
                            (default: merge).
   --cleanup-merged         Sweep merged issue branches and worktrees each pass
@@ -598,6 +631,7 @@ work:
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
+  SUMMARY_MODEL, REPORT_SUMMARY,
   QUIET, USE_WORKTREES,
   VERBOSE,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
@@ -662,6 +696,102 @@ _usage_header() {
 }
 # <<< usage helpers <<<
 
+# >>> summary helpers >>>
+# Pure helpers for the "what was done" summary the loop posts on an issue once it
+# resolves it (#161/#217). Extracted verbatim by tests/close-summary.test.sh
+# between these markers, so keep the marker comments intact. They mirror the TUI's
+# own summary code (tui/src/reporter.rs, tui/src/github.rs, tui/src/models.rs) so
+# both surfaces post the same kind of comment with the same defaults.
+
+# The built-in light model the summary uses when SUMMARY_MODEL is unset, so a
+# summary is posted cheaply with zero configuration (mirrors the TUI's
+# DEFAULT_SUMMARY_MODEL).
+DEFAULT_SUMMARY_MODEL="gpt-5-mini"
+
+# Decide whether the close summary is on from a raw config value. On by default
+# (issue #161 asked for it on by default), so only the explicit falsy spellings
+# turn it off; anything else -- including unset/empty -- is on. Echoes 1/0.
+summary_enabled() {
+  case "$1" in
+    0|false|no|off|disable|disabled) printf '0\n' ;;
+    *)                               printf '1\n' ;;
+  esac
+}
+
+# Resolve the light summary model from a raw SUMMARY_MODEL value. Empty falls back
+# to the built-in DEFAULT_SUMMARY_MODEL so the summary stays cheap by default;
+# "auto"/"off"/"none"/"0" (case-insensitive) echo nothing so Copilot picks its
+# own default; any other value is used verbatim (trimmed). Mirrors the TUI's
+# resolve_summary_model. Pure: echoes the model on stdout.
+resolve_summary_model() {
+  local raw trimmed lower
+  raw="${1:-}"
+  trimmed="$(printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  lower="$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    '')                 printf '%s' "$DEFAULT_SUMMARY_MODEL" ;;
+    auto|off|none|0)    : ;;
+    *)                  printf '%s' "$trimmed" ;;
+  esac
+}
+
+# Build the header line for the summary comment, naming which model wrote it so
+# every summary records its (cheap) model, "auto" when Copilot's default was used.
+# Mirrors the TUI's summary header. Pure: echoes the header on stdout.
+_summary_header() {
+  local model="${1:-}"
+  [ -n "$model" ] || model="auto"
+  # shellcheck disable=SC2016  # backticks/%s are literal printf format, not expansions
+  printf '🤖 **Closing summary** — what the loop did, per its session (model: `%s`).' "$model"
+}
+
+# Build the prompt asking the light model to summarize the work done on an issue
+# from its session-log tail. Mirrors the TUI's summary_prompt. Pure: reads its
+# arguments, echoes the prompt on stdout.
+build_summary_prompt() {
+  local num="$1" title="$2" context="$3"
+  cat <<EOF
+You are writing a closing comment for GitHub issue #${num} ("${title}").
+Below is the tail of the autonomous coding agent's session log for this issue — its own narration (branch, PR) interleaved with the Copilot transcript.
+From it, summarize what was actually done to resolve the issue: the key changes and the outcome (e.g. the PR that was raised or merged).
+Reply with ONLY the summary in GitHub-flavoured Markdown — a short paragraph or a few bullet points. No preamble, no headings, and do not wrap the whole reply in code fences.
+
+--- session log ---
+${context}
+EOF
+}
+
+# Tidy a model's summary reply (read on stdin) for posting: drop a leading/trailing
+# run of code-fence lines (models sometimes wrap the whole answer), trim blank
+# edges, and cap the length so a runaway reply cannot post a wall of text. Mirrors
+# the TUI's clean_summary. Pure: reads only stdin, writes only stdout.
+clean_summary() {
+  local text
+  text="$(cat)"
+  text="$(printf '%s' "$text" | awk '
+    { lines[NR] = $0 }
+    END {
+      s = 1; e = NR
+      while (s <= e) { t = lines[s]; sub(/^[[:space:]]+/, "", t); if (t ~ /^```/) s++; else break }
+      while (e >= s) { t = lines[e]; sub(/^[[:space:]]+/, "", t); if (t ~ /^```/) e--; else break }
+      while (s <= e && lines[s] ~ /^[[:space:]]*$/) s++
+      while (e >= s && lines[e] ~ /^[[:space:]]*$/) e--
+      for (i = s; i <= e; i++) print lines[i]
+    }')"
+  printf '%s' "${text:0:4000}"
+}
+
+# Assemble the summary comment body posted on the issue: the header naming the
+# model, the summary itself, and a hidden marker so the comment is easy to spot
+# and filter. The marker is passed in (the loop passes $SUMMARY_MARKER) so this
+# stays pure and self-contained. Pure: echoes the body on stdout.
+build_summary_comment() {
+  local summary="$1" model="$2" marker="$3" header
+  header="$(_summary_header "$model")"
+  printf '%s\n\n%s\n\n%s' "$header" "$summary" "$marker"
+}
+# <<< summary helpers <<<
+
 # Post the per-run cost/usage summary Copilot printed (parsed out of $log_file)
 # as a comment on the issue or PR, tagged with USAGE_MARKER so it is easy to spot
 # and filter in the thread. The header always records which model resolved the
@@ -683,6 +813,59 @@ _report_usage() {
   esac
   return 0
 }
+
+# >>> summary report helpers >>>
+# Ask the light SUMMARY_MODEL to write a short "what was done" summary for issue
+# $num from its session log ($log_file), mirroring the TUI's summarize_session.
+# Only a bounded, ANSI-stripped tail of the log is sent to the model (no tools, no
+# repo access), and the call is time-boxed so a hung model can never stall the
+# loop. Echoes the tidied summary, or nothing when the log is missing/empty or the
+# model fails so the caller simply posts no summary. Never fails.
+# Usage: build_issue_summary <num> <title> <log_file> <model>
+build_issue_summary() {
+  local num="$1" title="$2" log_file="$3" model="${4:-}" context prompt msg esc
+  [ -f "$log_file" ] || return 0
+
+  # Feed the model only the tail of the log (capped like the TUI's 16 KiB context),
+  # with colour/CSI escape sequences and stray control characters stripped so the
+  # transcript reads cleanly and no spinner noise wastes the prompt. The ESC byte
+  # is built with printf so the strip works on both GNU and BSD sed; the tr range
+  # removes any remaining control bytes (including a lone ESC) but keeps TAB/LF.
+  esc="$(printf '\033')"
+  context="$(tail -c 16384 "$log_file" 2>/dev/null \
+             | LC_ALL=C sed "s/${esc}\\[[0-9;?]*[A-Za-z]//g" \
+             | LC_ALL=C tr -d '\000-\010\013\014\016-\037')"
+  [ -n "${context//[[:space:]]/}" ] || return 0
+
+  prompt="$(build_summary_prompt "$num" "$title" "$context")"
+
+  # Light model, no color/logs, time-boxed; discard stderr so provider noise can
+  # never leak into the summary. An optional --model (empty means Copilot picks).
+  local -a args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  [ -n "$model" ] && args+=(--model "$model")
+  msg="$(_run_with_timeout 120 copilot "${args[@]}" 2>/dev/null | clean_summary)"
+
+  [ -n "$msg" ] && printf '%s' "$msg"
+  return 0
+}
+
+# Post the "what was done" summary on the issue the loop just resolved (#161/#217),
+# tagged with SUMMARY_MARKER so it is easy to spot and filter. Skips silently when
+# the feature is off (REPORT_SUMMARY=0) or the model produced nothing, and never
+# fails the loop (every failure is swallowed) so summarising can never block or
+# break a run — the issue is already resolved.
+# Usage: _report_summary <num> <title> <log_file> <model>
+_report_summary() {
+  local num="$1" title="$2" log_file="$3" model="${4:-}" summary body
+  [ "${REPORT_SUMMARY:-1}" = 1 ] || return 0
+  [ -f "$log_file" ] || return 0
+  summary="$(build_issue_summary "$num" "$title" "$log_file" "$model")"
+  [ -n "$summary" ] || return 0
+  body="$(build_summary_comment "$summary" "$model" "$SUMMARY_MARKER")"
+  gh issue comment "$num" --body "$body" >/dev/null 2>&1 || true
+  return 0
+}
+# <<< summary report helpers <<<
 
 # Run a command with a wall-clock limit when a timeout utility is available so a
 # hung helper (e.g. the commit-message model) can never stall the whole loop.
@@ -1173,6 +1356,10 @@ while [ $# -gt 0 ]; do
     --copilot-timeout=*) COPILOT_TIMEOUT="${1#*=}" ;;
     --commit-model)    need_arg $# "$1"; COMMIT_MODEL="$2"; shift ;;
     --commit-model=*)  COMMIT_MODEL="${1#*=}" ;;
+    --summary-model)   need_arg $# "$1"; SUMMARY_MODEL="$2"; shift ;;
+    --summary-model=*) SUMMARY_MODEL="${1#*=}" ;;
+    --summary)         REPORT_SUMMARY=1 ;;
+    --no-summary)      REPORT_SUMMARY=0 ;;
     --triage-model)    need_arg $# "$1"; TRIAGE_MODEL="$2"; shift ;;
     --triage-model=*)  TRIAGE_MODEL="${1#*=}" ;;
     --triage-map)      need_arg $# "$1"; TRIAGE_MAP="$2"; shift ;;
@@ -1229,6 +1416,15 @@ ISSUES_DIR="${ISSUES_DIR:-$REPO_DIR/issues}"
 # message.
 COMMIT_MODEL="${COMMIT_MODEL:-}"
 case "$COMMIT_MODEL" in off|none|0) COMMIT_MODEL="" ;; esac
+
+# Close summary: once the loop resolves an issue and opens its PR it posts a short
+# "what was done" summary comment on the issue (#161/#217), written from the
+# session log by the light SUMMARY_MODEL. On by default; --no-summary
+# (REPORT_SUMMARY=0) turns it off. SUMMARY_MODEL defaults to a cheap built-in
+# model so the summary is cheap with no config; "auto"/"off"/"none"/"0" let
+# Copilot pick its default model instead.
+REPORT_SUMMARY="$(summary_enabled "${REPORT_SUMMARY:-}")"
+SUMMARY_MODEL="$(resolve_summary_model "${SUMMARY_MODEL:-}")"
 
 # Wall-clock limit for each main Copilot run (issue resolve, PR conflict fix, PR
 # checks fix, default-branch sync) so a stuck run can never block the loop.
@@ -1582,6 +1778,11 @@ if [ "$QUALITY_ASSURANCE" = 1 ]; then
   log "quality assurance: on — Copilot adds user-perspective tests per issue (pass --no-quality-assurance to disable)"
 else
   log "quality assurance: off — no tests requested (pass --quality-assurance to enable)"
+fi
+if [ "$REPORT_SUMMARY" = 1 ]; then
+  log "close summary: on — a '${SUMMARY_MODEL:-auto}' summary of what was done is posted per resolved issue (pass --no-summary to disable)"
+else
+  log "close summary: off — no summary posted on resolved issues (pass --summary to enable)"
 fi
 if [ "$CLEANUP_MERGED" = 1 ]; then
   if [ "$DELETE_REMOTE_BRANCH" = 1 ]; then
@@ -2327,6 +2528,10 @@ EOF
     try_auto_merge "$pr_url" "$num" "$log_file"
     gh issue edit "$num" --add-label "$DONE_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
     log "issue #$num: DONE -> $pr_url"
+    # Post a short "what was done" summary on the issue, written from this run's
+    # session log by the light SUMMARY_MODEL (#161/#217). Best-effort and after the
+    # DONE label so the log already records the branch/PR; never blocks the loop.
+    _report_summary "$num" "$title" "$log_file" "$SUMMARY_MODEL"
     # If the PR already merged (auto-merge did an immediate merge) the remote
     # branch is dead weight; drop it now when configured. PRs that merge later
     # (GitHub native auto-merge, or a human merge) are handled by the periodic
