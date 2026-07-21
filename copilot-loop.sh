@@ -858,7 +858,7 @@ _report_usage() {
 # model fails so the caller simply posts no summary. Never fails.
 # Usage: build_issue_summary <num> <title> <log_file> <model>
 build_issue_summary() {
-  local num="$1" title="$2" log_file="$3" model="${4:-}" context prompt msg esc
+  local num="$1" title="$2" log_file="$3" model="${4:-}" context prompt msg esc dir
   [ -f "$log_file" ] || return 0
 
   # Feed the model only the tail of the log (capped like the TUI's 16 KiB context),
@@ -874,9 +874,18 @@ build_issue_summary() {
 
   prompt="$(build_summary_prompt "$num" "$title" "$context")"
 
-  # Light model, no color/logs, time-boxed; discard stderr so provider noise can
-  # never leak into the summary. An optional --model (empty means Copilot picks).
-  local -a args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
+  # Pin copilot to a real, allowed working directory, exactly like every other
+  # copilot call in the loop (triage, the coding run). Without `-C`/`--add-dir` a
+  # non-interactive run cannot get path permission, hangs until it is killed, and
+  # posts nothing -- which is why no summary was ever appearing (#229). Prefer the
+  # issue workspace; fall back to the log's directory, then the current dir.
+  dir="${WORKSPACE_DIR:-}"
+  { [ -n "$dir" ] && [ -d "$dir" ]; } || dir="$(dirname -- "$log_file")"
+  [ -d "$dir" ] || dir="$PWD"
+
+  # Light model, pinned to $dir, no color/logs, time-boxed; discard stderr so
+  # provider noise can never leak into the summary. An optional --model (empty means Copilot picks).
+  local -a args=(-p "$prompt" -C "$dir" --add-dir "$dir" --allow-all-tools --no-color --log-level none)
   [ -n "$model" ] && args+=(--model "$model")
   msg="$(_run_with_timeout 120 copilot "${args[@]}" 2>/dev/null | clean_summary)"
 
