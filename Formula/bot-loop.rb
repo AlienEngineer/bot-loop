@@ -38,7 +38,7 @@ class BotLoop < Formula
         gh auth login
 
       Commands installed:
-        bot-loop        the terminal UI (browse issues, start background workers)
+        bot-loop        the terminal UI (browse issues, start background bots)
         bot-loop-bash   the raw autonomous loop (run inside a target repo)
     EOS
   end

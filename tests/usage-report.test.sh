@@ -100,11 +100,11 @@ assert_eq "leading indent trimmed" "$(printf '%s' "$indented" | parse_usage_stat
 
 # --- _usage_header: the model that resolved the run is always recorded (#208) --
 assert_eq "explicit model in header" \
-  "$(_usage_header 'claude-opus-4.5')" "**copilot-loop usage** (model: claude-opus-4.5)"
+  "$(_usage_header 'claude-opus-4.5')" "**bot-loop usage** (model: claude-opus-4.5)"
 assert_eq "empty model -> auto" \
-  "$(_usage_header '')" "**copilot-loop usage** (model: auto)"
+  "$(_usage_header '')" "**bot-loop usage** (model: auto)"
 assert_eq "missing model arg -> auto" \
-  "$(_usage_header)" "**copilot-loop usage** (model: auto)"
+  "$(_usage_header)" "**bot-loop usage** (model: auto)"
 
 if [ "$fail" -eq 0 ]; then
   echo "All usage-report tests passed."

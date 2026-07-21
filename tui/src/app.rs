@@ -1038,7 +1038,7 @@ impl App {
                 }
                 let count = self.runner.running_count();
                 self.set_status(format!(
-                    "Worker started (pid {pid}, model {}, auto-merge {}, QA {}). {count} running. Log: {}",
+                    "Bot started (pid {pid}, model {}, auto-merge {}, QA {}). {count} running. Log: {}",
                     self.current_model_label(),
                     if self.auto_merge { "on" } else { "off" },
                     if self.quality_assurance { "on" } else { "off" },
@@ -1054,12 +1054,12 @@ impl App {
     pub fn stop_all_workers(&mut self) {
         let count = self.runner.running_count();
         if count == 0 {
-            self.set_status("No workers running.".to_string());
+            self.set_status("No bots running.".to_string());
             return;
         }
         self.runner.stop_all();
         self.set_status(format!(
-            "Stopped {count} worker{}.",
+            "Stopped {count} bot{}.",
             if count == 1 { "" } else { "s" }
         ));
     }
@@ -1440,7 +1440,7 @@ impl App {
 
         let label = self.current_model_label().to_string();
         let message = if self.runner.is_running() {
-            format!("Model set to {label} (applies to workers started next).")
+            format!("Model set to {label} (applies to bots started next).")
         } else {
             format!("Model set to {label}.")
         };
@@ -1832,9 +1832,7 @@ impl App {
         };
         if !issue.needs_info() {
             let number = issue.number;
-            self.set_status(format!(
-                "#{number} has no pending Copilot question to answer."
-            ));
+            self.set_status(format!("#{number} has no pending bot question to answer."));
             return;
         }
         let number = issue.number;
@@ -2773,7 +2771,7 @@ mod tests {
         let mut app = app_with(1);
         app.stop_all_workers();
         // No worker was running, so nothing is stopped and the status says so.
-        assert_eq!(app.status.as_deref(), Some("No workers running."));
+        assert_eq!(app.status.as_deref(), Some("No bots running."));
     }
 
     #[cfg(unix)]
@@ -3563,9 +3561,8 @@ mod tests {
     /// comment, standing in for a `gh issue view` fetch of a blocked issue (#165).
     fn needs_info_issue(number: u64, question: &str) -> Issue {
         let marker = github::QUESTION_MARKER;
-        let body = format!(
-            "**copilot-loop needs more information to continue:**\n\n{question}\n\n{marker}"
-        );
+        let body =
+            format!("**bot-loop needs more information to continue:**\n\n{question}\n\n{marker}");
         let comment = serde_json::to_string(&body).unwrap();
         let json = format!(
             r#"{{"number":{number},"title":"t{number}","labels":[{{"name":"needs-info"}}],"comments":[{{"author":{{"login":"hubot"}},"body":{comment}}}]}}"#
