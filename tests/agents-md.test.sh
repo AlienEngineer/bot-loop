@@ -64,6 +64,7 @@ AUTO_MERGE=0
 WORKSPACE_DIR=""
 CURRENT_RUN_LOG=""
 BOOT_BRANCH="${BRANCH_PREFIX}agents-md"
+PR_OPEN=0              # how many open bootstrap PRs the gh fixture reports
 
 root="$(mktemp -d)"
 trap 'cd "$here" 2>/dev/null; rm -rf "$root"' EXIT
@@ -111,6 +112,12 @@ gh() {
   if [ "${1:-}" = "pr" ] && [ "${2:-}" = "create" ]; then
     printf 'https://example.test/pr/1\n'
   fi
+  # `gh pr list --head <branch> --state open --json number --jq length`: the
+  # bootstrap uses this to tell an open PR (skip) from a stale branch (regenerate).
+  # PR_OPEN controls how many open PRs the fixture reports.
+  if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
+    printf '%s\n' "${PR_OPEN:-0}"
+  fi
   return 0
 }
 
@@ -155,6 +162,7 @@ setup_repo() {
   GH_CALLS="$root/gh-calls";   : >"$GH_CALLS"
   COPILOT_MODE="write"
   WORKSPACE_DIR=""
+  PR_OPEN=0
   cd "$clone" 2>/dev/null || true
 }
 
@@ -220,13 +228,31 @@ assert_eq "bad model: AGENTS.md committed to the branch" \
   "$(origin_file "$BOOT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "1"
 assert_eq "bad model: a PR was opened"                "$(pr_creates)" "1"
 
-# --- idempotent: bootstrap branch already on origin (PR open) -> skip --------
+# --- idempotent: bootstrap branch on origin WITH an open PR -> skip -----------
+# A PR still waiting to merge must not be duplicated.
 setup_repo
-git -C "$clone" push -q origin "main:refs/heads/${BOOT_BRANCH}"   # simulate an earlier run's open PR
+git -C "$clone" push -q origin "main:refs/heads/${BOOT_BRANCH}"   # earlier run's branch
+PR_OPEN=1                                                          # ...and its PR is still open
 generate_agents_md; rc=$?
-assert_eq "existing PR: returns success"         "$rc" "0"
-assert_eq "existing PR: copilot NOT run"          "$(copilot_calls)" "0"
-assert_eq "existing PR: no new PR opened"         "$(pr_creates)" "0"
+assert_eq "open PR: returns success"          "$rc" "0"
+assert_eq "open PR: copilot NOT run"          "$(copilot_calls)" "0"
+assert_eq "open PR: no new PR opened"         "$(pr_creates)" "0"
+assert_eq "open PR: bootstrap branch kept on origin" "$(origin_branch "$BOOT_BRANCH")" "yes"
+
+# --- #227: stale bootstrap branch on origin, NO open PR -> regenerate ---------
+# The branch lingers (its PR was closed unmerged, or an earlier `gh pr create`
+# failed) but AGENTS.md is still missing, so the loop must create it, not skip
+# forever. This is the "not created when missing" regression.
+setup_repo
+git -C "$clone" push -q origin "main:refs/heads/${BOOT_BRANCH}"   # lingering branch
+PR_OPEN=0                                                          # ...but no open PR
+generate_agents_md; rc=$?
+assert_eq "stale branch: returns success"     "$rc" "0"
+assert_eq "stale branch: copilot run once"    "$(copilot_calls)" "1"
+assert_eq "stale branch: AGENTS.md committed to the branch" \
+  "$(origin_file "$BOOT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "1"
+assert_eq "stale branch: a PR was opened"     "$(pr_creates)" "1"
+assert_eq "stale branch: local bootstrap branch cleaned up" "$(local_branch "$BOOT_BRANCH")" "no"
 
 # --- disabled: AGENTS_MODEL off -> skip entirely -----------------------------
 setup_repo

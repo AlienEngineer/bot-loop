@@ -2645,6 +2645,21 @@ agents_md_disabled() {
   esac
 }
 
+# True (rc 0) when an OPEN pull request already exists for head <branch>. The
+# bootstrap keys its "already handled, don't duplicate" skip on this rather than on
+# the branch merely existing on origin (#227): a branch can linger with no open PR
+# after its PR was closed unmerged, or after an earlier `gh pr create` failed and
+# left just the branch — cases where AGENTS.md is still missing and must be
+# regenerated, not skipped forever. Conservative on error: if gh cannot answer
+# (auth/network hiccup) we report "open" so a transient failure never regenerates
+# and duplicates a PR; the next pass retries. Args: <branch>.
+bootstrap_pr_open() {
+  local branch="${1:-}" count
+  [ -n "$branch" ] || return 1
+  count="$(gh pr list --head "$branch" --state open --json number --jq 'length' 2>/dev/null)" || return 0
+  [ -n "$count" ] && [ "$count" != "0" ]
+}
+
 # Generate AGENTS.md when the repo has none. Never returns non-zero and never
 # leaves an uncommitted file behind: it either opens a PR with the new AGENTS.md
 # or does nothing. Reads AGENTS_MODEL / DEFAULT_BRANCH / REPO_DIR / BRANCH_PREFIX
@@ -2671,12 +2686,19 @@ generate_agents_md() {
 
   local branch="${BRANCH_PREFIX}agents-md"
 
-  # Idempotent across passes and restarts: if the bootstrap branch is already on
-  # origin, an earlier run opened its PR and it is just waiting to merge. Don't
-  # open a duplicate.
+  # Idempotent across passes and restarts, but keyed on an OPEN bootstrap PR — not
+  # merely the branch existing on origin — so the file is actually created when
+  # missing (#227). Only a PR still waiting to merge means "already handled"; a
+  # branch that lingers with no open PR (its PR was closed unmerged, or an earlier
+  # `gh pr create` failed leaving just the branch) is stale, the file is still
+  # absent, so drop the stale branch and regenerate instead of skipping forever.
   if [ -n "$(git -C "$REPO_DIR" ls-remote --heads origin "$branch" 2>/dev/null)" ]; then
-    log "AGENTS.md: bootstrap branch $branch already on origin (PR open); skipping"
-    return 0
+    if bootstrap_pr_open "$branch"; then
+      log "AGENTS.md: bootstrap PR for $branch already open; skipping"
+      return 0
+    fi
+    log "AGENTS.md: stale bootstrap branch $branch on origin (no open PR); regenerating"
+    git -C "$REPO_DIR" push origin --delete "$branch" >/dev/null 2>&1 || true
   fi
 
   local log_file
