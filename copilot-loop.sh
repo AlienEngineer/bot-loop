@@ -110,6 +110,13 @@
 #   9. If no issues are found, sleep and repeat. While sleeping, press 'f' to
 #      wake immediately and check for work.
 #
+#   On startup, before the first pass, any issue left "in-progress" by a bot that
+#   was killed mid-run is resumed: each coding run pins a known Copilot session id
+#   and drops a marker while Copilot is live, so a marker that survives means the
+#   run was interrupted. The loop then reopens that exact session with
+#   `copilot --resume` in the original workspace, continuing the work with full
+#   context instead of hanging until it is re-triggered (#233).
+#
 # Requirements: git, gh (authenticated), copilot.
 #
 # Usage:
@@ -1578,6 +1585,11 @@ WORKER_STATE_DIR="$WORK_DIR/workers"
 # Where auto-fix keeps its per-crash de-dup markers and any crash reports it
 # writes (issue #218), so a recurring loop crash is reported once, not every pass.
 AUTO_FIX_STATE_DIR="$WORK_DIR/auto-fix"
+# Where a run drops a marker while its Copilot session is live so an interrupted
+# run (bot killed mid-run) can be resumed on the next start instead of hanging
+# in-progress (#233). One file per issue, resume/issue-<num>.env, recording the
+# pinned Copilot session id, work branch, owning loop pid and log file.
+RESUME_DIR="$WORK_DIR/resume"
 
 # Record the issue this worker is currently working ($1 = issue number), so the
 # TUI can show this process's pid against that issue (#214). Best-effort: a write
@@ -1983,6 +1995,55 @@ cleanup_workspace() {
   git branch -D "$branch" >/dev/null 2>&1 || true
   WORKSPACE_DIR=""
 }
+
+# prepare_workspace_resume <branch>
+# Reopen the workspace an interrupted run left behind so its partial work and the
+# resumed Copilot session keep their context, rather than resetting the branch to
+# origin/<default> (which prepare_workspace would do, throwing the partial work
+# away). Reuses the surviving worktree as-is (re-locked under this pid); if only
+# the branch survived, checks it out into a fresh worktree at its own tip; if
+# neither survived, falls back to a fresh workspace from origin/<default> — the
+# resumed session still carries the conversation, so context is not lost. Sets
+# WORKSPACE_DIR; returns 1 only when even the fallback cannot create a workspace.
+prepare_workspace_resume() {
+  local branch="$1"
+  if [ "$USE_WORKTREES" = 1 ]; then
+    local wt; wt="$(_worktree_path "$branch")"
+    if git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      # Worktree survived the kill: re-lock it under our pid (so a concurrent
+      # cleanup pass sees a live owner) and reuse it exactly as it was left.
+      git -C "$REPO_DIR" worktree unlock "$wt" >/dev/null 2>&1 || true
+      git -C "$REPO_DIR" worktree lock --reason "copilot-loop: $branch resuming (pid $$)" "$wt" >/dev/null 2>&1 || true
+      WORKSPACE_DIR="$wt"
+      return 0
+    fi
+    # Worktree gone but the branch (with its commits) may remain: check it out
+    # into a fresh worktree at its own tip so committed work is preserved.
+    if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1; then
+      mkdir -p "$WORKTREE_BASE" 2>/dev/null || true
+      if git -C "$REPO_DIR" worktree add --force "$wt" "$branch" >/dev/null 2>&1; then
+        git -C "$REPO_DIR" worktree lock --reason "copilot-loop: $branch resuming (pid $$)" "$wt" >/dev/null 2>&1 || true
+        WORKSPACE_DIR="$wt"
+        return 0
+      fi
+    fi
+  else
+    # In-place mode: reuse the existing branch at its own tip if it survived.
+    if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1; then
+      git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
+      git -C "$REPO_DIR" clean -fd >/dev/null 2>&1 || true
+      if git -C "$REPO_DIR" switch "$branch" >/dev/null 2>&1; then
+        WORKSPACE_DIR="$REPO_DIR"
+        return 0
+      fi
+    fi
+  fi
+  # Nothing to reuse: start fresh from the latest default branch. The resumed
+  # Copilot session still carries the conversation, so context is not lost.
+  local start="origin/${DEFAULT_BRANCH}"
+  git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
+  prepare_workspace "$branch" "$start"
+}
 # <<< workspace helpers <<<
 
 # --- Core: enable auto-merge on a freshly opened PR --------------------------
@@ -2308,6 +2369,157 @@ EOF
 }
 # <<< rebase-conflict helpers <<<
 
+# >>> resume helpers >>>
+# When a bot is killed mid-run its issue is left labelled in-progress and its
+# Copilot session abandoned, so re-running it later starts from scratch and loses
+# all the context (#233). To avoid that, every coding run pins a known Copilot
+# session UUID (--session-id) and drops a marker under RESUME_DIR while Copilot is
+# live; the marker is removed the moment Copilot returns. A marker that survives
+# therefore means "Copilot was interrupted", and on the next start the loop
+# resumes that exact session with --resume in the original workspace instead of
+# re-doing the work. The helpers below are self-contained so they are unit-tested.
+
+# Generate a fresh lowercase UUID for a new Copilot session. Prefers uuidgen, then
+# the kernel uuid source, then a $RANDOM-based RFC-4122-shaped fallback, so a
+# session id is always produced even where uuidgen is unavailable.
+_new_session_id() {
+  local u=""
+  if command -v uuidgen >/dev/null 2>&1; then
+    u="$(uuidgen 2>/dev/null)"
+  elif [ -r /proc/sys/kernel/random/uuid ]; then
+    u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+  fi
+  if [ -z "$u" ]; then
+    printf -v u '%04x%04x-%04x-4%03x-%04x-%04x%04x%04x' \
+      "$((RANDOM))" "$((RANDOM))" "$((RANDOM))" "$((RANDOM & 0xfff))" \
+      "$(((RANDOM & 0x3fff) | 0x8000))" "$((RANDOM))" "$((RANDOM))" "$((RANDOM))"
+  fi
+  printf '%s' "$u" | tr '[:upper:]' '[:lower:]'
+}
+
+# Echo the single Copilot CLI arg that selects the session for a run: --resume=<id>
+# when continuing an interrupted session (mode 1), else --session-id=<id> to pin
+# the UUID of a new one. Emitted as one =-joined arg so Copilot never mistakes the
+# id for a prompt (--resume takes an optional value). Pure.
+copilot_session_arg() {
+  local mode="${1:-0}" id="${2:-}"
+  case "$mode" in
+    1) printf -- '--resume=%s' "$id" ;;
+    *) printf -- '--session-id=%s' "$id" ;;
+  esac
+}
+
+# Path of the resume marker for issue <num>.
+_resume_marker_path() {
+  printf '%s/issue-%s.env' "${RESUME_DIR:-${WORK_DIR:-.}/resume}" "$1"
+}
+
+# Drop a resume marker for issue <num> recording the Copilot session id, work
+# branch, owning loop pid and log file, so a later start can resume the session.
+# Best-effort: a write failure never affects the run.
+write_resume_marker() {
+  local num="$1" session_id="$2" branch="$3" log_file="${4:-}"
+  local dir; dir="${RESUME_DIR:-${WORK_DIR:-.}/resume}"
+  mkdir -p "$dir" 2>/dev/null || true
+  {
+    printf 'NUM=%s\n' "$num"
+    printf 'SESSION_ID=%s\n' "$session_id"
+    printf 'BRANCH=%s\n' "$branch"
+    printf 'PID=%s\n' "$$"
+    printf 'LOG=%s\n' "$log_file"
+  } >"$(_resume_marker_path "$num")" 2>/dev/null || true
+}
+
+# Remove issue <num>'s resume marker (Copilot returned, so the run is no longer
+# interrupted). Best-effort.
+clear_resume_marker() {
+  rm -f "$(_resume_marker_path "$1")" 2>/dev/null || true
+}
+
+# Echo one KEY=VALUE field from a resume marker file. Pure (reads only the file).
+resume_marker_field() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 0
+  sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n1
+}
+
+# Decide what to do with an interrupted-run marker at startup from two booleans:
+# whether the owning loop process is still alive, and whether the issue is still
+# labelled in-progress. Echoes: skip (a live peer still owns it), resume (owner
+# gone, issue still in-progress), or drop (owner gone, issue already moved on so
+# the marker is stale). Pure.
+resume_marker_action() {
+  local owner_alive="${1:-0}" in_progress="${2:-0}"
+  if [ "$owner_alive" = 1 ]; then printf 'skip'; return 0; fi
+  if [ "$in_progress" = 1 ]; then printf 'resume'; else printf 'drop'; fi
+}
+
+# True (rc 0) when issue <num> currently carries <label> on GitHub.
+issue_has_label() {
+  local num="$1" label="$2"
+  [ "$(gh issue view "$num" --json labels \
+        --jq 'any(.labels[]; .name == "'"$label"'")' 2>/dev/null)" = "true" ]
+}
+
+# Build the short prompt sent to a *resumed* Copilot session. The session already
+# holds the original issue prompt and the partial work, so this only tells Copilot
+# to pick up where it was interrupted and finish, keeping the same commit/push
+# guardrails and the needs-info question-file path. Pure.
+build_resume_prompt() {
+  local num="$1" title="$2" question_file="$3" qa_block="${4:-}"
+  cat <<EOF
+You were interrupted while resolving GitHub issue #${num} ("${title}") earlier in this same session, so your previous context and any partial changes in this repository are still here.
+Pick up where you left off and finish resolving the issue. First check what you have already done, then complete the remaining work. Run any build or test commands needed to verify your work. Do NOT run git commit, git push, create branches, or open pull requests — those steps are handled automatically outside this session. Only edit files and verify.
+${qa_block}
+If you are blocked and need more information or a decision from the user, do NOT guess. Write your question(s) for the user to this file and stop without making code changes:
+  ${question_file}
+Whatever you write there is posted as a comment on the issue; once the user replies you will be run again with their answer included above. Only do this when you genuinely cannot proceed without their input.
+EOF
+}
+
+# Resume every interrupted run found at startup. For each surviving resume marker,
+# resume the Copilot session in the issue's original workspace when its owning loop
+# process is gone and the issue is still in-progress; skip markers a live loop
+# still owns and discard stale ones. Runs once before the main loop so a killed
+# bot's work is continued instead of hanging in-progress (#233).
+resume_interrupted_issues() {
+  local dir; dir="${RESUME_DIR:-${WORK_DIR:-.}/resume}"
+  [ -d "$dir" ] || return 0
+  local f num session_id branch owner_pid owner_alive in_progress action
+  for f in "$dir"/issue-*.env; do
+    [ -e "$f" ] || continue
+    num="$(resume_marker_field "$f" NUM)"
+    session_id="$(resume_marker_field "$f" SESSION_ID)"
+    branch="$(resume_marker_field "$f" BRANCH)"
+    owner_pid="$(resume_marker_field "$f" PID)"
+    if [ -z "$num" ] || [ -z "$session_id" ]; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    owner_alive=0
+    if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
+      owner_alive=1
+    fi
+    in_progress=0
+    if issue_has_label "$num" "$INPROGRESS_LABEL"; then
+      in_progress=1
+    fi
+    action="$(resume_marker_action "$owner_alive" "$in_progress")"
+    case "$action" in
+      skip)
+        log "issue #$num: interrupted Copilot session $session_id still owned by live pid $owner_pid; leaving it" ;;
+      drop)
+        log "issue #$num: stale resume marker (issue no longer in-progress); discarding"
+        rm -f "$f" 2>/dev/null || true ;;
+      resume)
+        log "issue #$num: resuming interrupted Copilot session $session_id (was pid ${owner_pid:-unknown})"
+        RESUME_SESSION_ID="$session_id" RESUME_BRANCH="$branch" \
+          guard "issue #$num (resume)" process_issue "$num" || true ;;
+    esac
+  done
+}
+# <<< resume helpers <<<
+
 # Returns 0 on success (PR opened), 1 on failure.
 process_issue() {
   local num="$1"
@@ -2332,6 +2544,19 @@ process_issue() {
   # just Copilot's transcript (#126). Cleared at the top of the main loop.
   CURRENT_RUN_LOG="$log_file"
 
+  # Resume support (#233): pin a known Copilot session UUID for this run so an
+  # interrupted run can later be continued with --resume. In resume mode (driven
+  # by resume_interrupted_issues at startup) reuse the marker's session id and the
+  # original branch; otherwise mint a fresh session id for a brand-new session.
+  local resume_mode=0 session_id=""
+  if [ -n "${RESUME_SESSION_ID:-}" ]; then
+    resume_mode=1
+    session_id="$RESUME_SESSION_ID"
+    [ -n "${RESUME_BRANCH:-}" ] && branch="$RESUME_BRANCH"
+  else
+    session_id="$(_new_session_id)"
+  fi
+
   # Publish which issue this worker (pid) is on so the TUI can show its pid on
   # that issue's row (#214). Cleared at the top of the main loop.
   set_worker_issue "$num"
@@ -2346,13 +2571,23 @@ process_issue() {
   # Base the issue branch on the latest default branch WITHOUT checking the
   # default branch out (it may be checked out in another worktree, and the issue
   # requires we never work on main/master). Fetch first so origin/<default> is
-  # current, then create the branch/worktree straight from it.
+  # current, then create the branch/worktree straight from it. When resuming an
+  # interrupted run (#233) reopen its existing worktree/branch instead so its
+  # partial work survives; only fall back to a fresh branch if nothing remains.
   git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
-  local start="origin/${DEFAULT_BRANCH}"
-  git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
-  if ! prepare_workspace "$branch" "$start"; then
-    _fail_issue "$num" "$log_file" "could not create work branch $branch"
-    return 1
+  if [ "$resume_mode" = 1 ]; then
+    if ! prepare_workspace_resume "$branch"; then
+      _fail_issue "$num" "$log_file" "could not reopen work branch $branch to resume"
+      return 1
+    fi
+    log "issue #$num: resuming in workspace $WORKSPACE_DIR"
+  else
+    local start="origin/${DEFAULT_BRANCH}"
+    git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
+    if ! prepare_workspace "$branch" "$start"; then
+      _fail_issue "$num" "$log_file" "could not create work branch $branch"
+      return 1
+    fi
   fi
 
   # Copilot writes here when it needs to ask the user something instead of
@@ -2394,12 +2629,19 @@ process_issue() {
   # it is genuinely too vague, ask the author the clarifying question(s) via the
   # needs-info flow and stop here (no coding run); the issue resumes normally once
   # they reply. A no-op when triage is off, when we already asked this issue (ask
-  # at most once), or for an approved plan.
-  if maybe_ask_when_vague "$num" "$title" "$body" "$comments" "$question_file" "$log_file"; then
+  # at most once), or for an approved plan. Skipped when resuming an interrupted
+  # run (#233): the issue was already past this gate when it was first started.
+  if [ "$resume_mode" = 0 ] \
+     && maybe_ask_when_vague "$num" "$title" "$body" "$comments" "$question_file" "$log_file"; then
     return 0
   fi
 
   local prompt
+  if [ "$resume_mode" = 1 ]; then
+    # Resuming: the session already holds the original prompt and partial work, so
+    # send only a short "continue where you left off" instruction (#233).
+    prompt="$(build_resume_prompt "$num" "$title" "$question_file" "$qa_block")"
+  else
   prompt="$(cat <<EOF
 You are working in a git repository to resolve a GitHub issue.
 
@@ -2421,6 +2663,7 @@ replies you will be run again with their answer included above. Only do this
 when you genuinely cannot proceed without their input.
 EOF
 )"
+  fi
 
   # Run Copilot non-interactively, pinned to the issue's workspace: -C makes that
   # worktree Copilot's working directory and --add-dir keeps file access
@@ -2470,6 +2713,9 @@ EOF
   fi
 
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
+  # Pin a new session's UUID (--session-id) or continue an interrupted one
+  # (--resume) so a killed run can be resumed with its context intact (#233).
+  copilot_args+=("$(copilot_session_arg "$resume_mode" "$session_id")")
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
 
   log "issue #$num: running copilot (log: $log_file)"
@@ -2477,8 +2723,13 @@ EOF
     _fail_issue "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run (refusing to edit $REPO_DIR)"
     return 1
   fi
+  # Mark this run resumable while Copilot is live: if the bot is killed now the
+  # marker survives and the next start resumes this exact session (#233). It is
+  # cleared the instant Copilot returns, so only an interruption leaves it behind.
+  write_resume_marker "$num" "$session_id" "$branch" "$log_file"
   run_copilot "$log_file" "${copilot_args[@]}"
   local copilot_rc=$COPILOT_RC
+  clear_resume_marker "$num"
   cd "$REPO_DIR" 2>/dev/null || true
   log "issue #$num: copilot exited with code $copilot_rc"
 
@@ -4201,6 +4452,13 @@ guard() {
 }
 
 # --- Main loop ---------------------------------------------------------------
+# Before the first pass, resume any run a previously killed bot left interrupted:
+# an issue still labelled in-progress whose Copilot session was not finished is
+# continued with `copilot --resume` in its original workspace, so its work is not
+# lost and it no longer hangs until re-triggered (#233). Runs once, guarded so a
+# problem here never stops the loop from starting.
+resume_interrupted_issues || true
+
 while true; do
   # Each iteration's setup and queue-scanning logs belong to the loop itself, not
   # to any one run, so drop the per-run mirror before the next run claims it
