@@ -299,6 +299,14 @@ CURRENT_RUN_LOG=""
 # guessing (#214). Empty means an unexplained exit (e.g. an unbound-variable
 # error under `set -u`), which cleanup() flags with the exit code.
 SHUTDOWN_REASON=""
+# Scratch paths shared with the subshell EXIT trap inside guard() (see the main
+# loop). They must be plain globals, not locals: a `set -u` crash unwinds the
+# erroring frame's caller-locals before the trap runs, so a local would read back
+# as "unbound" there. Overwritten on every guarded call (the loop is serial).
+# shellcheck disable=SC2034  # consumed only inside guard()'s trap string
+_GUARD_ERR=""
+# shellcheck disable=SC2034  # consumed only inside guard()'s trap string
+_GUARD_CRASHED=""
 # Set SELF_UPDATE=0 to stop the loop pulling and restarting itself when this
 # script changes upstream. Left unset it is auto-enabled whenever the script is
 # a tracked file inside the repo it operates on.
@@ -2073,7 +2081,12 @@ EOF
   # cheap TRIAGE_MODEL and map the class to a coding model via TRIAGE_MAP; on any
   # failure, or a class with no mapping, fall back to the global COPILOT_MODEL so
   # triage can only ever lower cost, never break or block the run.
-  local coding_model="$COPILOT_MODEL" triage_class mapped_model
+  # Initialise triage_class/mapped_model to empty: when triage is off (the
+  # default, TRIAGE_MODEL unset) the block below is skipped, yet the run-timeout
+  # scaling further down still reads $triage_class. Under `set -u` an unset
+  # local there aborts the whole loop right after "working on branch" with a bare
+  # "unbound variable", which surfaced as the loop just "shutting down" (#216).
+  local coding_model="$COPILOT_MODEL" triage_class="" mapped_model=""
   if [ -n "$TRIAGE_MODEL" ]; then
     log "issue #$num: triaging with $TRIAGE_MODEL"
     triage_class="$(triage_issue "$num" "$title" "$body" "$log_file")"
@@ -3596,6 +3609,63 @@ EOF
 # when one already exists; time-boxed and failure-safe (never blocks the loop).
 generate_agents_md || true
 
+# EXIT-trap handler for guard()'s subshell. Runs when a guarded unit's subshell
+# exits: on an *abnormal* exit (a crash — _guard_clean never got set to 1) it
+# marks the crash for the parent and folds the captured stderr into the unit's
+# own run log, where the TUI shows it, so the operator sees *why* the run ended.
+# A normal return (any code) is left alone — the unit already reported itself.
+_guard_on_exit() {
+  local _g=$?
+  [ "${_guard_clean:-0}" -eq 1 ] && return 0
+  : > "$_GUARD_CRASHED" 2>/dev/null || true
+  if [ -n "${CURRENT_RUN_LOG:-}" ] && [ -s "$_GUARD_ERR" ]; then
+    {
+      printf '%s | run ended unexpectedly (exit %s); captured error:\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$_g"
+      sed 's/^/    /' "$_GUARD_ERR"
+    } >>"$CURRENT_RUN_LOG" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Run one unit of work (a whole issue, plan, or PR fix) isolated in a subshell so
+# an *unexpected* exit inside it cannot silently kill the loop. The `|| true`
+# guards on the calls below do NOT catch a `set -u` unbound-variable crash: that
+# aborts the shell rather than returning non-zero, so without this the loop just
+# printed "shutting down" mid-issue and stopped (#214, #216). The subshell also
+# captures the unit's own stderr; on an *abnormal* exit (a crash, not a normal
+# non-zero return) it folds the captured error into that run's log — where the
+# TUI shows it — so the operator sees *why* instead of a bare "shutting down".
+# Usage: guard "<label>" <function> [args...]. Always returns the unit's own exit
+# status; the loop then continues to the next pass regardless.
+guard() {
+  local _label="$1"; shift
+  local rc
+  _GUARD_ERR="$(mktemp 2>/dev/null || printf '%s/copilot-loop-guard.%s' "${WORK_DIR:-/tmp}" "$$")"
+  _GUARD_CRASHED="${_GUARD_ERR}.crashed"
+  rm -f "$_GUARD_CRASHED" 2>/dev/null || true
+  (
+    # A clean return (any code) sets this before exiting; a crash (set -u, an
+    # uncaught error) never reaches it, which is how _guard_on_exit tells the two
+    # apart and avoids crying "crash" over a failure the unit already reported.
+    _guard_clean=0
+    trap _guard_on_exit EXIT
+    "$@"
+    _guard_rc=$?
+    _guard_clean=1
+    exit "$_guard_rc"
+  ) 2>>"$_GUARD_ERR"
+  rc=$?
+  # Keep the unit's unredirected stderr visible on the terminal, as a direct call
+  # would, then summarise a crash (never a plain non-zero return) in the loop log.
+  [ -s "$_GUARD_ERR" ] && cat "$_GUARD_ERR" >&2
+  if [ -e "$_GUARD_CRASHED" ]; then
+    log "$_label ended unexpectedly (exit $rc): $(grep -v '^[[:space:]]*$' "$_GUARD_ERR" 2>/dev/null | tail -n1)"
+  fi
+  rm -f "$_GUARD_ERR" "$_GUARD_CRASHED" 2>/dev/null || true
+  return "$rc"
+}
+
 # --- Main loop ---------------------------------------------------------------
 while true; do
   # Each iteration's setup and queue-scanning logs belong to the loop itself, not
@@ -3641,7 +3711,7 @@ while true; do
   conflicted_pr="$(claim_next_conflicted_pr || true)"
   if [ -n "$conflicted_pr" ]; then
     log "PR #$conflicted_pr has conflicts, resolving before starting new tasks"
-    resolve_pr_conflicts "$conflicted_pr" || true
+    guard "PR #$conflicted_pr conflict resolution" resolve_pr_conflicts "$conflicted_pr" || true
     continue
   fi
 
@@ -3653,7 +3723,7 @@ while true; do
   failing_pr="$(claim_next_failing_pr || true)"
   if [ -n "$failing_pr" ]; then
     log "PR #$failing_pr has failing checks, fixing before starting new tasks"
-    resolve_pr_check_failures "$failing_pr" || true
+    guard "PR #$failing_pr check fix" resolve_pr_check_failures "$failing_pr" || true
     continue
   fi
 
@@ -3669,7 +3739,7 @@ while true; do
   next_issue="$(claim_next_reply_issue || true)"
   if [ -n "$next_issue" ]; then
     log "issue #$next_issue: user replied, resuming"
-    process_issue "$next_issue" || true
+    guard "issue #$next_issue" process_issue "$next_issue" || true
     continue
   fi
 
@@ -3681,7 +3751,7 @@ while true; do
   plan_target="$(claim_next_plan_issue || true)"
   if [ -n "$plan_target" ]; then
     log "issue #$plan_target: labelled '$PLAN_LABEL', drafting a plan for review"
-    plan_issue "$plan_target" || true
+    guard "plan for issue #$plan_target" plan_issue "$plan_target" || true
     continue
   fi
 
@@ -3707,5 +3777,5 @@ while true; do
     continue
   fi
 
-  process_issue "$next_issue" || true
+  guard "issue #$next_issue" process_issue "$next_issue" || true
 done
