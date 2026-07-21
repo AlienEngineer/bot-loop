@@ -101,6 +101,7 @@ Blocked by: #4                      # Alias for Wait for
 - `--commit-model` / `COMMIT_MODEL` — cheap model for commit messages
 - `--triage-model` / `TRIAGE_MODEL` — cheap model classifies issue complexity
 - `--triage-map` / `TRIAGE_MAP` — map difficulty class to model (e.g., `trivial=gpt-4o-mini,complex=claude-opus-4`)
+- `--cost-saver` / `COST_SAVER` — preset that enables triage with built-in defaults (trivial→cheap, normal→mid, complex→`--model`/strong); explicit `--triage-model`/`--triage-map` override it
 - `--agents-model` / `AGENTS_MODEL` — model for AGENTS.md bootstrap (default: `claude-sonnet-4.5`)
 
 **Quality assurance:** On by default. Copilot adds user-perspective tests. Disable: `--no-quality-assurance` / `--no-qa`

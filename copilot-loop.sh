@@ -140,6 +140,12 @@
 #                            unmapped class falls back to --model. Defaults to
 #                            "trivial=<triage-model>" when triage is on and this
 #                            is unset                                (default: unset)
+#   --cost-saver             Preset that enables smart model routing with built-in
+#                            defaults: a cheap model classifies each issue, then
+#                            trivial->cheap, normal->mid, complex->--model (or a
+#                            strong default). A convenience layer over triage; an
+#                            explicit --triage-model/--triage-map overrides it
+#                                                                     (default: off)
 #   --triage-timeout-map <m> class=factor pairs (comma-separated) scaling the
 #                            --copilot-timeout by triage difficulty, factor a
 #                            percent of the baseline ("33%") or an absolute
@@ -181,7 +187,7 @@
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
-#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
+#   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
 #   QUIET, USE_WORKTREES,
 #   VERBOSE,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
@@ -264,6 +270,14 @@ TRIAGE_MODEL="${TRIAGE_MODEL:-}"
 # this is unset it defaults to routing trivial issues to TRIAGE_MODEL so turning
 # triage on lowers cost with zero extra configuration.
 TRIAGE_MAP="${TRIAGE_MAP:-}"
+# Cost-saver preset (issue #186): a single switch that turns on smart model
+# routing with sensible built-in defaults, so most users stop overpaying by
+# running one (often expensive) model on every issue. When on it enables triage
+# with a cheap classifier and a default class->model map (trivial->cheap,
+# normal->mid, complex->the configured --model or a strong default). It is a
+# convenience layer over TRIAGE_MODEL/TRIAGE_MAP: an explicit --triage-model or
+# --triage-map always overrides it. Off by default; 1/true/yes/on turn it on.
+COST_SAVER="${COST_SAVER:-}"
 # Scales the per-run COPILOT_TIMEOUT by triage difficulty (issue #190), as
 # comma-separated "class=factor" pairs where factor is a percentage of the
 # baseline ("33%" or bare "33") or an absolute duration ("10m"). A "normal" or
@@ -514,6 +528,14 @@ work:
                            unmapped class falls back to --model; defaults to
                            "trivial=<triage-model>" when triage is on and this is
                            unset                                    (default: unset)
+  --cost-saver             Cost-saver preset: enable smart model routing with
+                           sensible built-in defaults instead of hand-writing a
+                           triage map. A cheap model classifies each issue, then
+                           trivial runs on that cheap model, normal on a mid
+                           model, and complex on --model (or a strong default) so
+                           spend tracks difficulty. Convenience layer over triage:
+                           an explicit --triage-model/--triage-map overrides it
+                                                                    (default: off)
   --triage-timeout-map <m> Comma-separated class=factor pairs scaling the
                            --copilot-timeout by triage difficulty, so a stuck
                            trivial issue is killed sooner and a complex one gets
@@ -567,7 +589,7 @@ work:
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
-  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
+  COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
   QUIET, USE_WORKTREES,
   VERBOSE,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH
@@ -873,6 +895,62 @@ parse_triage_map() {
 }
 # <<< triage helpers <<<
 
+# --- Cost-saver preset: one flag turns on smart model routing ----------------
+# cost_saver_enabled, cost_saver_triage_model and cost_saver_triage_map are pure
+# and covered by tests/cost-saver.test.sh (extracted between the markers), so
+# keep the marker comments intact.
+# >>> cost-saver helpers >>>
+# Built-in models the cost-saver preset routes to when the user supplies no
+# triage model/map of their own. Kept inside the marker block so the tests pin
+# the exact defaults a user gets from the preset alone.
+COST_SAVER_CHEAP_MODEL="gpt-5-mini"        # classify + trivial issues
+COST_SAVER_MID_MODEL="claude-sonnet-4.5"   # normal issues
+COST_SAVER_STRONG_MODEL="claude-opus-4.5"  # complex issues when --model is unset
+
+# Whether the cost-saver preset is switched on. Accepts the usual truthy
+# spellings; anything else (including unset/empty) is off. Reports via exit
+# status.
+cost_saver_enabled() {
+  case "${1:-}" in
+    1|true|yes|on) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# Resolve the triage model under the preset. The preset only fills in the cheap
+# default when it is on AND the user gave no --triage-model/TRIAGE_MODEL, so an
+# explicit triage model (or an explicit "off") always wins. Echoes the model.
+# Usage: cost_saver_triage_model <cost_saver> <current_triage_model>
+cost_saver_triage_model() {
+  local on="$1" current="$2"
+  if cost_saver_enabled "$on" && [ -z "$current" ]; then
+    printf '%s\n' "$COST_SAVER_CHEAP_MODEL"
+  else
+    printf '%s\n' "$current"
+  fi
+}
+
+# Resolve the triage map under the preset. Only fills in the built-in
+# trivial/normal/complex routing when the preset is on AND the user supplied
+# neither a --triage-map nor a --triage-model, so any explicit triage
+# configuration (a custom map, a custom classifier, or an explicit "off") always
+# wins: an explicit map is used verbatim, and an explicit model keeps the
+# existing "trivial=<model>" default instead of the preset's map. Complex routes
+# to the configured coding model when one is set, otherwise to a strong built-in
+# default, so hard issues escalate rather than dropping to "auto". Echoes the map.
+# Usage: cost_saver_triage_map <cost_saver> <current_map> <current_triage_model> <copilot_model>
+cost_saver_triage_map() {
+  local on="$1" current="$2" tmodel="$3" model="$4" complex
+  if cost_saver_enabled "$on" && [ -z "$current" ] && [ -z "$tmodel" ]; then
+    complex="${model:-$COST_SAVER_STRONG_MODEL}"
+    printf 'trivial=%s,normal=%s,complex=%s\n' \
+      "$COST_SAVER_CHEAP_MODEL" "$COST_SAVER_MID_MODEL" "$complex"
+  else
+    printf '%s\n' "$current"
+  fi
+}
+# <<< cost-saver helpers <<<
+
 # --- Vagueness triage: ask before coding an under-specified issue ------------
 # comments_have_question and parse_vague_question are pure and covered by
 # tests/vague-triage.test.sh (extracted between the markers), so keep the marker
@@ -1091,6 +1169,8 @@ while [ $# -gt 0 ]; do
     --triage-model=*)  TRIAGE_MODEL="${1#*=}" ;;
     --triage-map)      need_arg $# "$1"; TRIAGE_MAP="$2"; shift ;;
     --triage-map=*)    TRIAGE_MAP="${1#*=}" ;;
+    --cost-saver)      COST_SAVER=1 ;;
+    --no-cost-saver)   COST_SAVER=0 ;;
     --triage-timeout-map)   need_arg $# "$1"; TRIAGE_TIMEOUT_MAP="$2"; shift ;;
     --triage-timeout-map=*) TRIAGE_TIMEOUT_MAP="${1#*=}" ;;
     --agents-model)    need_arg $# "$1"; AGENTS_MODEL="$2"; shift ;;
@@ -1161,8 +1241,17 @@ fi
 # issues to the triage model itself so enabling triage lowers cost with zero
 # extra config; normal/complex then fall back to COPILOT_MODEL.
 TRIAGE_MODEL="${TRIAGE_MODEL:-}"
-case "$TRIAGE_MODEL" in off|none|0) TRIAGE_MODEL="" ;; esac
 TRIAGE_MAP="${TRIAGE_MAP:-}"
+# Cost-saver preset (#186): before normalising triage, let the preset fill in a
+# cheap triage model and a trivial/normal/complex default map when the user gave
+# none. Applied here -- ahead of the off-normalisation below and before the
+# empty-map default -- so an explicit --triage-model/--triage-map (or an explicit
+# --triage-model off) always overrides the preset, and the preset never blocks a
+# run: it only ever routes to cheaper models, falling back exactly as triage does.
+COST_SAVER="${COST_SAVER:-}"
+TRIAGE_MAP="$(cost_saver_triage_map "$COST_SAVER" "$TRIAGE_MAP" "$TRIAGE_MODEL" "$COPILOT_MODEL")"
+TRIAGE_MODEL="$(cost_saver_triage_model "$COST_SAVER" "$TRIAGE_MODEL")"
+case "$TRIAGE_MODEL" in off|none|0) TRIAGE_MODEL="" ;; esac
 if [ -n "$TRIAGE_MODEL" ] && [ -z "$TRIAGE_MAP" ]; then
   TRIAGE_MAP="trivial=${TRIAGE_MODEL}"
 fi
