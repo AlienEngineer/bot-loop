@@ -643,14 +643,21 @@ Reply with ONLY the summary in GitHub-flavoured Markdown — a short paragraph o
 }
 
 /// Build the `copilot` arguments for a summary run: the prompt, an optional
-/// `--model`, and the same quiet, no-tool-noise flags the loop's cheap helpers
-/// use. `None`/blank model omits `--model` so Copilot picks. Pure for testing.
-fn summarize_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+/// `--model`, a working-directory pin, and the same quiet, no-tool-noise flags
+/// the loop's cheap helpers use. `None`/blank model omits `--model` so Copilot
+/// picks. The `-C`/`--add-dir` pin is required: without it a non-interactive run
+/// cannot get path permission and hangs until it is killed, so no summary is ever
+/// posted (#229). Pure for testing.
+fn summarize_args(prompt: &str, model: Option<&str>, dir: &str) -> Vec<String> {
     let mut args = vec!["-p".to_string(), prompt.to_string()];
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(model.to_string());
     }
+    args.push("-C".to_string());
+    args.push(dir.to_string());
+    args.push("--add-dir".to_string());
+    args.push(dir.to_string());
     args.push("--allow-all-tools".to_string());
     args.push("--no-color".to_string());
     args.push("--log-level".to_string());
@@ -709,7 +716,13 @@ pub fn summarize_session(
     }
 
     let prompt = summary_prompt(number, title, context);
-    let args = summarize_args(&prompt, model);
+    // Pin the run to the TUI's working directory (the target repo) so copilot has
+    // an allowed path and does not hang waiting for permission it can never get in
+    // non-interactive mode (#229).
+    let dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".to_string());
+    let args = summarize_args(&prompt, model, &dir);
 
     let output = match timeout_program() {
         Some(t) => Command::new(t)
@@ -911,7 +924,7 @@ mod tests {
 
     #[test]
     fn summarize_args_include_the_model_and_quiet_flags() {
-        let with = summarize_args("do it", Some("gpt-5-mini"));
+        let with = summarize_args("do it", Some("gpt-5-mini"), "/repo");
         assert_eq!(with[0], "-p");
         assert_eq!(with[1], "do it");
         assert!(with.windows(2).any(|w| w == ["--model", "gpt-5-mini"]));
@@ -920,11 +933,20 @@ mod tests {
     }
 
     #[test]
+    fn summarize_args_pin_the_working_directory() {
+        // Without a `-C`/`--add-dir` pin the non-interactive run hangs waiting for
+        // path permission and posts nothing (#229), so both must name the dir.
+        let args = summarize_args("do it", None, "/repo");
+        assert!(args.windows(2).any(|w| w == ["-C", "/repo"]));
+        assert!(args.windows(2).any(|w| w == ["--add-dir", "/repo"]));
+    }
+
+    #[test]
     fn summarize_args_omit_the_model_when_auto() {
-        let auto = summarize_args("do it", None);
+        let auto = summarize_args("do it", None, "/repo");
         assert!(!auto.iter().any(|a| a == "--model"));
         // A blank model is treated the same as auto.
-        let blank = summarize_args("do it", Some("  "));
+        let blank = summarize_args("do it", Some("  "), "/repo");
         assert!(!blank.iter().any(|a| a == "--model"));
     }
 

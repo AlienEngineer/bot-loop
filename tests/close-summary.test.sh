@@ -117,10 +117,13 @@ SUMMARY_MARKER="<!-- copilot-loop:summary -->"
 
 MODEL_RAW=""                                   # what the "model" prints
 MODEL_CALLS_FILE="$(mktemp)"; : >"$MODEL_CALLS_FILE"
+MODEL_ARGS_FILE="$(mktemp)"; : >"$MODEL_ARGS_FILE"
 model_calls() { wc -l <"$MODEL_CALLS_FILE" | tr -d ' '; }
-# Stub the time-boxed model call: record it and print the canned summary. Runs in
-# the $(...) subshell of build_issue_summary, so record via a file.
-_run_with_timeout() { echo x >>"$MODEL_CALLS_FILE"; printf '%s' "$MODEL_RAW"; }
+model_args() { cat "$MODEL_ARGS_FILE"; }
+# Stub the time-boxed model call: record it (and the args it was handed, so the
+# copilot invocation is inspectable) and print the canned summary. Runs in the
+# $(...) subshell of build_issue_summary, so record via a file.
+_run_with_timeout() { echo x >>"$MODEL_CALLS_FILE"; printf '%s ' "$@" >>"$MODEL_ARGS_FILE"; printf '%s' "$MODEL_RAW"; }
 
 GH_BODY_FILE="$(mktemp)"; : >"$GH_BODY_FILE"
 posted_body() { cat "$GH_BODY_FILE"; }
@@ -137,7 +140,7 @@ gh() {
 }
 
 tmp="$(mktemp -d 2>/dev/null || mktemp -d -t closesummary)"
-trap 'rm -rf "$tmp" "$MODEL_CALLS_FILE" "$GH_BODY_FILE"' EXIT
+trap 'rm -rf "$tmp" "$MODEL_CALLS_FILE" "$MODEL_ARGS_FILE" "$GH_BODY_FILE"' EXIT
 
 # A realistic session log: loop narration (branch/PR) plus a colourful Copilot
 # line, so the ANSI/CSI strip is exercised on the way to the model.
@@ -193,6 +196,27 @@ MODEL_RAW=''
 : >"$GH_BODY_FILE"; : >"$MODEL_CALLS_FILE"
 _report_summary 9 "t" "$log" "gpt-5-mini"
 assert_eq "empty model reply: no comment posted" "$(posted_body)" ""
+
+# --- the copilot summary run is pinned to a real working directory (#229) ------
+# The summary never appeared because its copilot call was the only one missing the
+# `-C`/`--add-dir` pin, so non-interactively it could not get path permission and
+# hung, posting nothing. Assert the model is now invoked pinned to the workspace.
+REPORT_SUMMARY=1
+MODEL_RAW='Opened PR #9.'
+WORKSPACE_DIR="$tmp"
+: >"$GH_BODY_FILE"; : >"$MODEL_CALLS_FILE"; : >"$MODEL_ARGS_FILE"
+_report_summary 9 "t" "$log" "gpt-5-mini"
+assert_contains "summary run is pinned with -C <workspace>"       "$(model_args)" "-C $tmp"
+assert_contains "summary run allows the workspace with --add-dir" "$(model_args)" "--add-dir $tmp"
+unset WORKSPACE_DIR
+
+# --- with no workspace, the run still pins to a real dir (the log's dir) --------
+REPORT_SUMMARY=1
+MODEL_RAW='Opened PR #9.'
+: >"$GH_BODY_FILE"; : >"$MODEL_CALLS_FILE"; : >"$MODEL_ARGS_FILE"
+_report_summary 9 "t" "$log" "gpt-5-mini"
+assert_contains "summary run still pins a dir without a workspace" "$(model_args)" "-C $tmp"
+
 
 if [ "$fail" -eq 0 ]; then
   echo "All close-summary tests passed."
