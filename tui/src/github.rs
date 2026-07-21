@@ -413,7 +413,7 @@ fn create_label_args(label: &str) -> Vec<String> {
         "--color".to_string(),
         "0e8a16".to_string(),
         "--description".to_string(),
-        "Ready for the copilot loop to pick up".to_string(),
+        "Ready for the bot loop to pick up".to_string(),
     ]
 }
 
@@ -635,7 +635,7 @@ pub fn comment_issue(number: u64, body: &str) -> Result<()> {
 fn summary_prompt(number: u64, title: &str, context: &str) -> String {
     format!(
         "You are writing a closing comment for GitHub issue #{number} (\"{title}\").\n\
-Below is the tail of the autonomous coding agent's session log for this issue — its own narration (branch, PR) interleaved with the Copilot transcript.\n\
+Below is the tail of the autonomous coding agent's session log for this issue — its own narration (branch, PR) interleaved with the bot transcript.\n\
 From it, summarize what was actually done to resolve the issue: the key changes and the outcome (e.g. the PR that was raised or merged).\n\
 Reply with ONLY the summary in GitHub-flavoured Markdown — a short paragraph or a few bullet points. No preamble, no headings, and do not wrap the whole reply in code fences.\n\n\
 --- session log ---\n{context}"
@@ -881,7 +881,7 @@ mod tests {
                 "--color",
                 "0e8a16",
                 "--description",
-                "Ready for the copilot loop to pick up",
+                "Ready for the bot loop to pick up",
             ]
         );
     }
@@ -994,7 +994,7 @@ mod tests {
     /// A realistic usage comment body as `copilot-loop.sh` posts it (#145).
     fn usage_comment(credits: &str) -> String {
         format!(
-            "**copilot-loop usage** (model: claude-opus-4.5)\n\n```\nAI Credits {credits} (9m 0s)\nTokens     ↑ 3.4m (3.2m cached) • ↓ 39.2k\n```\n\n<!-- copilot-loop:usage -->"
+            "**bot-loop usage** (model: claude-opus-4.5)\n\n```\nAI Credits {credits} (9m 0s)\nTokens     ↑ 3.4m (3.2m cached) • ↓ 39.2k\n```\n\n<!-- copilot-loop:usage -->"
         )
     }
 
@@ -1074,7 +1074,7 @@ mod tests {
     /// a heading, the question, then the hidden marker (#165).
     fn question_comment(question: &str) -> String {
         format!(
-            "**copilot-loop needs more information to continue:**\n\n{question}\n\n{QUESTION_MARKER}"
+            "**bot-loop needs more information to continue:**\n\n{question}\n\n{QUESTION_MARKER}"
         )
     }
 

@@ -118,14 +118,14 @@
 # Options (each is also settable via the matching environment variable; when
 # both are given the command-line flag wins):
 #   --trigger-label <label>  Label that marks an issue as ready   (default: ready)
-#   --plan-label <label>     Label that puts an issue into plan mode: Copilot
+#   --plan-label <label>     Label that puts an issue into plan mode: the bot
 #                            drafts an implementation plan (no code changes) which
 #                            is posted for review, then the issue waits for the
 #                            trigger label to run the plan          (default: plan)
 #   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
 #   --repo-dir <dir>         Repository to operate in              (default: current git repo)
 #   --model <model>          Model passed to copilot --model       (default: unset/auto)
-#   --copilot-timeout <dur>  Wall-clock limit for each Copilot run (issue resolve,
+#   --copilot-timeout <dur>  Wall-clock limit for each bot run (issue resolve,
 #                            PR conflict/checks fix, default-branch sync) so a stuck
 #                            run cannot block the loop. Accepts seconds or an
 #                            s/m/h/d suffix (e.g. 1800, 30m, 2h); "0"/"off" disables
@@ -135,7 +135,7 @@
 #                            "Resolve #<n>: <title>" message        (default: off)
 #   --summary-model <model>  Light model that writes the "what was done" summary
 #                            posted on each resolved issue; "auto"/"off" lets
-#                            Copilot pick its default            (default: gpt-5-mini)
+#                            the bot pick its default            (default: gpt-5-mini)
 #   --triage-model <model>   Cheap model that classifies each issue as
 #                            trivial/normal/complex before coding, so the coding
 #                            model can be chosen per difficulty; unset/"off"
@@ -165,9 +165,9 @@
 #                            a PR. Runs once, so it defaults to a capable mid model;
 #                            "off" disables it                 (default: claude-sonnet)
 #   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
-#   --quiet                  Do not stream Copilot's output to stdout; write it
+#   --quiet                  Do not stream the bot's output to stdout; write it
 #                            only to the per-run log files (the original
-#                            behaviour). By default the loop streams Copilot's
+#                            behaviour). By default the loop streams the bot's
 #                            output live to stdout as well as the log files.
 #   --worktrees / --no-worktrees
 #                            Give each issue its own git worktree, or work in the
@@ -177,7 +177,7 @@
 #                            Merge each PR automatically instead of leaving it for
 #                            review (default: off).
 #   --quality-assurance / --no-quality-assurance
-#                            Ask Copilot to add tests (from the user's perspective)
+#                            Ask the bot to add tests (from the user's perspective)
 #                            for the work it did on each issue; disable to save cost
 #                            (default: on). --qa / --no-qa are accepted aliases.
 #   --summary / --no-summary Post a "what was done" summary comment on each issue
@@ -198,7 +198,7 @@
 #                            Delete a merged issue's remote branch (default: auto,
 #                            on only when the repo does not auto-delete on merge).
 #   -h, --help               Show help and exit.
-#   -V, --version            Print the copilot-loop version and exit.
+#   -V, --version            Print the bot-loop version and exit.
 #
 # Environment variables (equivalent to the flags above):
 #   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
@@ -562,14 +562,14 @@ Options (each is also settable via the matching environment variable; when both
 are given the command-line flag wins). "--flag value" and "--flag=value" both
 work:
   --trigger-label <label>  Label that marks an issue as ready    (default: ready)
-  --plan-label <label>     Label that puts an issue into plan mode: Copilot
+  --plan-label <label>     Label that puts an issue into plan mode: the bot
                            proposes an implementation plan (no code changes)
                            which is posted for review, then the issue waits for
                            the trigger label to run the plan     (default: plan)
   --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
   --repo-dir <dir>         Repository to operate in               (default: current git repo)
   --model <model>          Model passed to copilot --model        (default: unset/auto)
-  --copilot-timeout <dur>  Wall-clock limit for each Copilot run (issue resolve,
+  --copilot-timeout <dur>  Wall-clock limit for each bot run (issue resolve,
                            PR conflict/checks fix, default-branch sync) so a stuck
                            run cannot block the loop. Accepts seconds or an s/m/h/d
                            suffix (e.g. 1800, 30m, 2h); "0"/"off" disables it
@@ -579,7 +579,7 @@ work:
                            "Resolve #<n>: <title>" message         (default: off)
   --summary-model <model>  Light model that writes the "what was done" summary
                            posted on each resolved issue; "auto"/"off" lets
-                           Copilot pick its default              (default: gpt-5-mini)
+                           the bot pick its default              (default: gpt-5-mini)
   --triage-model <model>   Cheap model that classifies each issue as
                            trivial/normal/complex before coding so the coding
                            model can be chosen per difficulty, and asks the
@@ -615,14 +615,14 @@ work:
                            capable mid model; "off" disables it
                                                           (default: claude-sonnet-4.5)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
-  --quiet                  Do not stream Copilot's output to stdout; write it
+  --quiet                  Do not stream the bot's output to stdout; write it
                            only to the per-run log files (the original
-                           behaviour). By default the loop streams Copilot's
+                           behaviour). By default the loop streams the bot's
                            output live to stdout as well as the log files.
   -v, --verbose            Emit extra loop-level narration (each pass's phases:
                            sync, sweep, PR scans, queue scan, claim, sleep) so
                            the output shows what the loop itself is doing, not
-                           only Copilot's transcript. Default: off.
+                           only the bot's transcript. Default: off.
   --worktrees              Give every issue its own git worktree (never touch
                            the shared checkout). This is the default, so each
                            task always works in a different folder.
@@ -633,7 +633,7 @@ work:
                            the repo allows it, otherwise an immediate merge) so
                            no manual review is needed. Default: off.
   --no-auto-merge          Leave PRs open for manual review (the default).
-  --quality-assurance      Ask Copilot to add tests for the work it did on each
+  --quality-assurance      Ask the bot to add tests for the work it did on each
                            issue, written from the user's perspective (the
                            default). Alias: --qa.
   --no-quality-assurance   Skip the quality-assurance tests to save cost.
@@ -660,7 +660,7 @@ work:
   --no-delete-remote-branch
                            Never delete remote branches; leave that to GitHub.
   -h, --help               Show this help and exit.
-  -V, --version            Print the copilot-loop version and exit.
+  -V, --version            Print the bot-loop version and exit.
 
 Environment variables (equivalent to the flags above):
   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
@@ -727,7 +727,7 @@ parse_usage_stats() {
 _usage_header() {
   local model="${1:-}"
   [ -n "$model" ] || model="auto"
-  printf '**copilot-loop usage** (model: %s)' "$model"
+  printf '**bot-loop usage** (model: %s)' "$model"
 }
 # <<< usage helpers <<<
 
@@ -787,7 +787,7 @@ build_summary_prompt() {
   local num="$1" title="$2" context="$3"
   cat <<EOF
 You are writing a closing comment for GitHub issue #${num} ("${title}").
-Below is the tail of the autonomous coding agent's session log for this issue — its own narration (branch, PR) interleaved with the Copilot transcript.
+Below is the tail of the autonomous coding agent's session log for this issue — its own narration (branch, PR) interleaved with the bot transcript.
 From it, summarize what was actually done to resolve the issue: the key changes and the outcome (e.g. the PR that was raised or merged).
 Reply with ONLY the summary in GitHub-flavoured Markdown — a short paragraph or a few bullet points. No preamble, no headings, and do not wrap the whole reply in code fences.
 
@@ -1424,7 +1424,7 @@ while [ $# -gt 0 ]; do
     --cleanup-merged)          CLEANUP_MERGED=1 ;;
     --no-cleanup-merged)       CLEANUP_MERGED=0 ;;
     -h|--help)         usage; exit 0 ;;
-    -V|--version)      printf 'copilot-loop %s\n' "$COPILOT_LOOP_VERSION"; exit 0 ;;
+    -V|--version)      printf 'bot-loop %s\n' "$COPILOT_LOOP_VERSION"; exit 0 ;;
     *)                 die "unknown argument: $1 (use --help)" ;;
   esac
   shift
@@ -1792,7 +1792,7 @@ else
 fi
 [ -n "$BOT_LOGIN" ] || log "WARNING: could not determine gh login; reply detection disabled"
 
-log "starting copilot-loop"
+log "starting bot-loop"
 log "============================================================"
 log "  GitHub repo: $REPO_SLUG"
 log "  gh account:  ${BOT_LOGIN:-<unknown>} @ ${GH_HOST_ORIGIN:-github.com}"
@@ -1821,7 +1821,7 @@ else
   log "auto-merge: off — PRs are left open for review (pass --auto-merge to enable)"
 fi
 if [ "$QUALITY_ASSURANCE" = 1 ]; then
-  log "quality assurance: on — Copilot adds user-perspective tests per issue (pass --no-quality-assurance to disable)"
+  log "quality assurance: on — the bot adds user-perspective tests per issue (pass --no-quality-assurance to disable)"
 else
   log "quality assurance: off — no tests requested (pass --quality-assurance to enable)"
 fi
@@ -1845,16 +1845,16 @@ else
   log "cleanup: off — merged branches and worktrees are not swept (pass --cleanup-merged to enable)"
 fi
 
-ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the copilot loop to pick up"
-ensure_label "$PLAN_LABEL"       "5319e7" "Ask the copilot loop for an implementation plan before running it"
+ensure_label "$TRIGGER_LABEL"    "0e8a16" "Ready for the bot loop to pick up"
+ensure_label "$PLAN_LABEL"       "5319e7" "Ask the bot loop for an implementation plan before running it"
 ensure_label "$PLAN_REVIEW_LABEL" "5319e7" "A plan was posted; waiting for the user to review it and add the trigger label"
-ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the copilot loop"
-ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the copilot loop"
-ensure_label "$FAILED_LABEL"     "b60205" "The copilot loop failed to produce changes"
+ensure_label "$INPROGRESS_LABEL" "fbca04" "Currently being worked by the bot loop"
+ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the bot loop"
+ensure_label "$FAILED_LABEL"     "b60205" "The bot loop failed to produce changes"
 ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
 ensure_label "$PENDING_LABEL"    "d4c5f9" "Waiting for another issue to be resolved before it can start"
-ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The copilot loop could not resolve this PR's merge conflicts"
-ensure_label "$CHECKS_UNRESOLVED_LABEL" "b60205" "The copilot loop could not fix this PR's failing checks"
+ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The bot loop could not resolve this PR's merge conflicts"
+ensure_label "$CHECKS_UNRESOLVED_LABEL" "b60205" "The bot loop could not fix this PR's failing checks"
 
 # --- Workspace isolation -----------------------------------------------------
 # Every issue (and every PR conflict fix) runs in its own branch, prepared here.
@@ -2316,7 +2316,7 @@ process_issue() {
   [ -n "$slug" ] || slug="issue"
   branch="${BRANCH_PREFIX}${num}-${slug}"
   commit_msg="Resolve #${num}: ${title}"
-  pr_body="Closes #${num}"$'\n\n'"Automated by copilot-loop."
+  pr_body="Closes #${num}"$'\n\n'"Automated by bot-loop."
   log_file="$LOG_DIR/issue-${num}-$(date '+%Y%m%d-%H%M%S').log"
   # Mirror this run's status lines into the per-issue log so the TUI's output
   # panel shows the branch creation and the rest of the loop's narration, not
@@ -2616,7 +2616,7 @@ _fail_issue() {
   log "issue #$num: FAILED - $reason"
 
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
-  gh issue comment "$num" --body "$(printf 'copilot-loop failed: %s\n\n```\n%s\n```\n\n%s' \
+  gh issue comment "$num" --body "$(printf 'bot-loop failed: %s\n\n```\n%s\n```\n\n%s' \
     "$reason" "$block" "$FAILURE_MARKER")" >/dev/null 2>&1 || true
 
   # Stop here: mark the issue failed instead of re-queuing it, so a repeatedly
@@ -2788,7 +2788,7 @@ EOF
     CURRENT_RUN_LOG=""
     return 0
   fi
-  if ! git -C "$WORKSPACE_DIR" commit -m "Add AGENTS.md to front-load repo context for copilot-loop" >>"$log_file" 2>&1; then
+  if ! git -C "$WORKSPACE_DIR" commit -m "Add AGENTS.md to front-load repo context for bot-loop" >>"$log_file" 2>&1; then
     log "AGENTS.md: git commit failed; skipping bootstrap"
     cleanup_workspace "$branch"
     CURRENT_RUN_LOG=""
@@ -2803,7 +2803,7 @@ EOF
   local pr_url
   pr_url="$(gh pr create --base "$DEFAULT_BRANCH" --head "$branch" \
               --title "Add AGENTS.md to cut per-run exploration cost" \
-              --body "$(printf 'Auto-generated by copilot-loop: a concise AGENTS.md so every future run — and humans — start with the repo layout, build/test/lint commands and conventions instead of re-discovering them each run.\n\nGenerated with model: %s.' "$AGENTS_MODEL")" 2>>"$log_file")"
+              --body "$(printf 'Auto-generated by bot-loop: a concise AGENTS.md so every future run — and humans — start with the repo layout, build/test/lint commands and conventions instead of re-discovering them each run.\n\nGenerated with model: %s.' "$AGENTS_MODEL")" 2>>"$log_file")"
   if [ -z "$pr_url" ]; then
     log "AGENTS.md: gh pr create failed; branch pushed but no PR opened"
     cleanup_workspace "$branch"
@@ -2867,7 +2867,7 @@ process_issue_files() {
 Describe the task here. The first "# " heading becomes the issue title and
 everything below it becomes the issue body.
 
-Copy this file to a new name ending in .md and edit it; the copilot loop opens
+Copy this file to a new name ending in .md and edit it; the bot loop opens
 a GitHub issue from it (labelled "ready") and then deletes the file.
 
 Add a line like "Label: bug" to override the label, or "Label: none" to file the
@@ -2931,7 +2931,7 @@ EOF
       for l in $labels; do
         l="$(printf '%s' "$l" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
         [ -n "$l" ] || continue
-        ensure_label "$l" "ededed" "Applied by copilot-loop from an issue file"
+        ensure_label "$l" "ededed" "Applied by bot-loop from an issue file"
         label_args+=(--label "$l")
       done
       IFS="$OLDIFS"
@@ -2959,7 +2959,7 @@ _fail_pr() {
   log "PR #$num: FAILED to resolve conflicts - $reason"
   tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
-  gh pr comment "$num" --body "$(printf 'copilot-loop could not resolve merge conflicts: %s\n\n```\n%s\n```' \
+  gh pr comment "$num" --body "$(printf 'bot-loop could not resolve merge conflicts: %s\n\n```\n%s\n```' \
     "$reason" "$tail_out")" >/dev/null 2>&1 || true
   gh pr edit "$num" --add-label "$CONFLICT_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
   gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
@@ -2973,7 +2973,7 @@ _fail_pr_checks() {
   log "PR #$num: FAILED to fix failing checks - $reason"
   tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
-  gh pr comment "$num" --body "$(printf 'copilot-loop could not fix the failing checks: %s\n\n```\n%s\n```' \
+  gh pr comment "$num" --body "$(printf 'bot-loop could not fix the failing checks: %s\n\n```\n%s\n```' \
     "$reason" "$tail_out")" >/dev/null 2>&1 || true
   gh pr edit "$num" --add-label "$CHECKS_UNRESOLVED_LABEL" >/dev/null 2>&1 || true
   gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
@@ -2991,7 +2991,7 @@ _ask_issue() {
   question="$(cat "$qf" 2>/dev/null)"
   log "issue #$num: needs more info, asking the user on the issue"
   gh issue comment "$num" \
-    --body "$(printf '**copilot-loop needs more information to continue:**\n\n%s\n\n%s' \
+    --body "$(printf '**bot-loop needs more information to continue:**\n\n%s\n\n%s' \
       "$question" "$QUESTION_MARKER")" >/dev/null 2>&1 || true
   gh issue edit "$num" --add-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
   gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
@@ -3136,7 +3136,7 @@ EOF
   plan="$(cat "$plan_file" 2>/dev/null)"
   log "issue #$num: plan drafted, posting for review"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
-  gh issue comment "$num" --body "$(printf '**copilot-loop drafted an implementation plan for this issue.**\n\nReview the plan below. When you are happy with it, add the `%s` label and the loop will implement it. To change the plan, leave a comment with your adjustments before adding `%s` — the most recent plan in the thread is what gets executed.\n\n---\n\n%s\n\n%s' \
+  gh issue comment "$num" --body "$(printf '**bot-loop drafted an implementation plan for this issue.**\n\nReview the plan below. When you are happy with it, add the `%s` label and the loop will implement it. To change the plan, leave a comment with your adjustments before adding `%s` — the most recent plan in the thread is what gets executed.\n\n---\n\n%s\n\n%s' \
     "$TRIGGER_LABEL" "$TRIGGER_LABEL" "$plan" "$PLAN_MARKER")" >/dev/null 2>&1 || true
   gh issue edit "$num" --add-label "$PLAN_REVIEW_LABEL" >/dev/null 2>&1 || true
   gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
@@ -3498,7 +3498,7 @@ EOF
   fi
 
   gh pr comment "$num" \
-    --body "copilot-loop resolved the merge conflicts with \`$base\`." >/dev/null 2>&1 || true
+    --body "bot-loop resolved the merge conflicts with \`$base\`." >/dev/null 2>&1 || true
   gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
   log "PR #$num: conflicts resolved and pushed"
   cleanup_workspace "$head"
@@ -3617,7 +3617,7 @@ EOF
   fi
 
   gh pr comment "$num" \
-    --body "copilot-loop pushed a fix for the failing checks (${failing:-unknown})." >/dev/null 2>&1 || true
+    --body "bot-loop pushed a fix for the failing checks (${failing:-unknown})." >/dev/null 2>&1 || true
   gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
   log "PR #$num: pushed a fix for failing checks"
   cleanup_workspace "$head"
@@ -4017,7 +4017,7 @@ bot_loop_can_push() {
 # Args: <label> <error-text>.
 _auto_fix_build_prompt() {
   local label="${1:-the loop}" err="${2:-}"
-  printf 'copilot-loop (the autonomous loop in copilot-loop.sh) crashed while running "%s".\n\n' "$label"
+  printf 'bot-loop (the autonomous loop in copilot-loop.sh) crashed while running "%s".\n\n' "$label"
   if [ -n "$err" ]; then
     printf 'It exited unexpectedly. Investigate the captured error below, find the\n'
     printf 'root cause in the loop code, and fix it so the loop no longer crashes\n'
@@ -4062,7 +4062,7 @@ _auto_fix_write_report() {
     printf '# %s\n\n' "$title"
     printf '%s\n\n' "$body"
     printf -- '---\n\n'
-    printf 'You are running copilot-loop but cannot push to %s, so this crash\n' "${BOT_LOOP_REPO:-the bot-loop repo}"
+    printf 'You are running bot-loop but cannot push to %s, so this crash\n' "${BOT_LOOP_REPO:-the bot-loop repo}"
     printf 'could not be filed there automatically. Please send this report to the\n'
     printf 'bot-loop maintainer at %s so the loop can be fixed.\n' "${email:-the maintainer}"
   } >"$file" 2>/dev/null || true

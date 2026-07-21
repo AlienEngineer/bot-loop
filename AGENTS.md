@@ -1,18 +1,18 @@
 # bot-loop
 
-Autonomous software dev system. Pull GitHub issues labeled `ready`, hand each to GitHub Copilot CLI to resolve, open PRs auto. Unattended backlog worker, run many instances parallel.
+Autonomous software dev system. Pull GitHub issues labeled `ready`, hand each to GitHub Copilot CLI to resolve, open PRs auto. Unattended backlog bot, run many instances parallel.
 
 ## Architecture
 
 **Two commands:**
-- `bot-loop` (or `copilot-loop-tui.sh`) — Terminal UI (Rust/ratatui). Browse issues, start background workers, watch cost.
+- `bot-loop` (or `copilot-loop-tui.sh`) — Terminal UI (Rust/ratatui). Browse issues, start background bots, watch cost.
 - `bot-loop-bash` (or `copilot-loop.sh`) — Raw autonomous bash loop. Run inside target repo.
 
 **Flow per iteration:**
 1. Sync markdown files in `issues/` → GitHub issues
-2. Sync local default branch w/ remote (Copilot resolve conflicts if diverged)
-3. Check open PRs for conflicts → Copilot resolve → push
-4. Check open PRs for failing CI → Copilot fix → push
+2. Sync local default branch w/ remote (bot resolve conflicts if diverged)
+3. Check open PRs for conflicts → bot resolve → push
+4. Check open PRs for failing CI → bot fix → push
 5. Pick next issue (GitHub lock prevent race):
    - Resume `needs-info` or `copilot-failed` if human replied
    - Draft plan for `plan`-labeled issues (read-only, no code)
@@ -22,7 +22,7 @@ Autonomous software dev system. Pull GitHub issues labeled `ready`, hand each to
 8. Run `copilot -p` with issue thread as context
    - Triage cheap model classify issue → pick model from map
    - Quality assurance on (default): add user-perspective tests
-9. Copilot need info → post question, label `needs-info`, wait for reply (no PR)
+9. Bot need info → post question, label `needs-info`, wait for reply (no PR)
 10. Else commit (cheap model write message), sync with default, push, open PR
 11. Label issue `copilot-done` or `copilot-failed`
 12. Post usage cost as comment on issue/PR
@@ -37,7 +37,7 @@ tui/                       Rust TUI (ratatui)
   src/main.rs              Entry point
   src/app.rs               Core state machine
   src/github.rs            gh CLI wrapper
-  src/runner.rs            Loop worker management
+  src/runner.rs            Loop bot management
   src/ui.rs                Rendering and keybinds
 issues/                    Markdown → GitHub issues
   TEMPLATE.md              Issue template
@@ -80,11 +80,11 @@ No package manager. Bash scripts run direct. Rust build to `tui/target/`.
 - `plan-review` — plan posted, await approval (add `ready` to run)
 - `pending` — wait for dependency (`Wait for: #N` in body)
 - `in-progress` — claimed by loop instance
-- `needs-info` — Copilot asked question, await human reply
+- `needs-info` — bot asked question, await human reply
 - `copilot-done` — resolved, PR opened
 - `copilot-failed` — failed, no auto-retry (human reply resumes)
-- `conflict-unresolved` — PR conflict Copilot can't fix
-- `checks-unresolved` — PR failing checks Copilot can't fix
+- `conflict-unresolved` — PR conflict bot can't fix
+- `checks-unresolved` — PR failing checks bot can't fix
 
 **Issue markdown directives** (in `issues/*.md` files):
 ```markdown
@@ -104,7 +104,7 @@ Blocked by: #4                      # Alias for Wait for
 - `--cost-saver` / `COST_SAVER` — preset that enables triage with built-in defaults (trivial→cheap, normal→mid, complex→`--model`/strong); explicit `--triage-model`/`--triage-map` override it
 - `--agents-model` / `AGENTS_MODEL` — model for AGENTS.md bootstrap (default: `claude-sonnet-4.5`)
 
-**Quality assurance:** On by default. Copilot add user-perspective tests. Disable: `--no-quality-assurance` / `--no-qa`
+**Quality assurance:** On by default. Bot add user-perspective tests. Disable: `--no-quality-assurance` / `--no-qa`
 
 **Auto-merge:** Off by default. Enable: `--auto-merge` (use GitHub auto-merge or immediate merge)
 

@@ -194,10 +194,7 @@ fn header_spans(
         ));
         if workers > 0 {
             spans.push(Span::styled(
-                format!(
-                    "  ·  {workers} worker{}",
-                    if workers == 1 { "" } else { "s" }
-                ),
+                format!("  ·  {workers} bot{}", if workers == 1 { "" } else { "s" }),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ));
         }
@@ -454,7 +451,7 @@ fn leader_actions(app: &App) -> Vec<(&'static str, &'static str)> {
         ("d", "details"),
         ("i", "reply"),
         ("e", "labels"),
-        ("l", "add-worker"),
+        ("l", "add-bot"),
         ("L", "stop-all"),
         ("b", "bots"),
         ("M", "messages"),
@@ -642,7 +639,7 @@ fn render_ready_confirm(frame: &mut Frame, area: Rect, app: &App, number: u64) {
 /// Pure for testing.
 fn quit_note(workers_running: usize) -> &'static str {
     if workers_running > 0 {
-        "Quitting stops all running workers."
+        "Quitting stops all running bots."
     } else {
         "This closes the terminal UI."
     }
@@ -1309,7 +1306,7 @@ fn render_reply(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let q_block = Block::default()
         .borders(Borders::ALL)
-        .title(" Copilot asks ")
+        .title(" Bot asks ")
         .border_style(Style::new().fg(Color::Magenta));
     let q_inner = q_block.inner(question_area);
     let content = reply_question_content(app.reply_question());
@@ -1831,7 +1828,7 @@ mod tests {
         assert!(text.contains("r ready"));
         assert!(text.contains("i reply"));
         assert!(text.contains("m models"));
-        assert!(text.contains("add-worker"));
+        assert!(text.contains("add-bot"));
         assert!(text.contains("s summary"));
         // Refresh left the issue menu — it is a global key now (#174).
         assert!(!text.contains("f refresh"));
@@ -2073,8 +2070,8 @@ mod tests {
     fn quit_note_warns_that_quitting_stops_running_workers() {
         // With workers up, the prompt tells the operator quitting stops them so
         // the new close-kills-workers behaviour is not a surprise (#209).
-        assert_eq!(quit_note(1), "Quitting stops all running workers.");
-        assert_eq!(quit_note(3), "Quitting stops all running workers.");
+        assert_eq!(quit_note(1), "Quitting stops all running bots.");
+        assert_eq!(quit_note(3), "Quitting stops all running bots.");
         // With none running there is nothing to stop, so it just notes the close.
         assert_eq!(quit_note(0), "This closes the terminal UI.");
     }
@@ -2143,7 +2140,7 @@ mod tests {
             "⠋",
         ));
         assert!(text.contains("⠋ loop: running"));
-        assert!(text.contains("1 worker"));
+        assert!(text.contains("1 bot"));
         assert!(text.contains("working #96"));
         assert!(text.contains("model: auto"));
         assert!(text.contains("auto-merge: off"));
@@ -2164,7 +2161,7 @@ mod tests {
             "⠋",
         ));
         assert!(text.contains("loop: running"));
-        assert!(text.contains("3 workers"));
+        assert!(text.contains("3 bots"));
         assert!(text.contains("working #96, #97, #98"));
     }
 
@@ -2246,8 +2243,8 @@ mod tests {
         assert!(text.contains("⠋ loop: running"));
         assert!(text.contains("working #96"));
         assert!(text.contains("resolving PR #12"));
-        // Watching an external loop, the TUI started no workers of its own.
-        assert!(!text.contains("worker"));
+        // Watching an external loop, the TUI started no bots of its own.
+        assert!(!text.contains("bot"));
         assert!(!text.contains("waiting for work"));
     }
 
@@ -2267,7 +2264,7 @@ mod tests {
         ));
         assert!(text.contains("loop: off"));
         assert!(!text.contains("loop: running"));
-        assert!(!text.contains("worker"));
+        assert!(!text.contains("bot"));
         assert!(!text.contains("resolving PR"));
         assert!(!text.contains("⠋"));
     }
@@ -2865,7 +2862,7 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("Reply"));
         assert!(text.contains("#165"));
-        assert!(text.contains("Copilot asks"));
+        assert!(text.contains("Bot asks"));
         assert!(text.contains("Which database"));
         assert!(text.contains("Your reply"));
         // The typed draft shows in the reply field.
