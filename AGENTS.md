@@ -1,29 +1,29 @@
 # bot-loop
 
-Autonomous software development system. Pulls GitHub issues labeled `ready`, hands each to GitHub Copilot CLI to resolve, opens PRs automatically. Unattended backlog worker that runs multiple instances in parallel.
+Autonomous software dev system. Pull GitHub issues labeled `ready`, hand each to GitHub Copilot CLI to resolve, open PRs auto. Unattended backlog worker, run many instances parallel.
 
 ## Architecture
 
 **Two commands:**
-- `bot-loop` (or `copilot-loop-tui.sh`) — Terminal UI (Rust/ratatui) to browse issues, start background workers, watch cost
-- `bot-loop-bash` (or `copilot-loop.sh`) — Raw autonomous bash loop, runs inside target repo
+- `bot-loop` (or `copilot-loop-tui.sh`) — Terminal UI (Rust/ratatui). Browse issues, start background workers, watch cost.
+- `bot-loop-bash` (or `copilot-loop.sh`) — Raw autonomous bash loop. Run inside target repo.
 
 **Flow per iteration:**
 1. Sync markdown files in `issues/` → GitHub issues
-2. Sync local default branch with remote (Copilot resolves conflicts if diverged)
-3. Check open PRs for conflicts → Copilot resolves → push
-4. Check open PRs for failing CI → Copilot fixes → push
-5. Pick next issue (GitHub lock prevents race):
+2. Sync local default branch w/ remote (Copilot resolve conflicts if diverged)
+3. Check open PRs for conflicts → Copilot resolve → push
+4. Check open PRs for failing CI → Copilot fix → push
+5. Pick next issue (GitHub lock prevent race):
    - Resume `needs-info` or `copilot-failed` if human replied
    - Draft plan for `plan`-labeled issues (read-only, no code)
-   - Oldest `ready` issue (respects dependencies: `Wait for: #N`)
+   - Oldest `ready` issue (respect deps: `Wait for: #N`)
 6. Claim issue (add `in-progress`, remove trigger label atomically)
-7. Create branch `copilot/<n>-<slug>` in fresh worktree (isolates parallel runs)
+7. Create branch `copilot/<n>-<slug>` in fresh worktree (isolate parallel runs)
 8. Run `copilot -p` with issue thread as context
-   - Triage cheap model classifies issue → picks model from map
+   - Triage cheap model classify issue → pick model from map
    - Quality assurance on (default): add user-perspective tests
-9. If Copilot needs info → post question, label `needs-info`, wait for reply (no PR)
-10. Else commit (cheap model writes message), sync with default, push, open PR
+9. Copilot need info → post question, label `needs-info`, wait for reply (no PR)
+10. Else commit (cheap model write message), sync with default, push, open PR
 11. Label issue `copilot-done` or `copilot-failed`
 12. Post usage cost as comment on issue/PR
 13. Sleep 5m (configurable), repeat
@@ -65,22 +65,22 @@ cargo test
 cargo build --release               # Binary: target/release/copilot-loop-tui
 ```
 
-No package manager. Bash scripts run directly. Rust builds to `tui/target/`.
+No package manager. Bash scripts run direct. Rust build to `tui/target/`.
 
 ## Conventions
 
 **Branch names:** `copilot/<issue-number>-<slug>`  
-**Worktrees:** Each issue runs in own worktree (disable: `--no-worktrees`)  
-**Lock file:** `.copilot-loop/github.lock` prevents multi-instance races  
+**Worktrees:** Each issue run in own worktree (disable: `--no-worktrees`)  
+**Lock file:** `.copilot-loop/github.lock` prevent multi-instance races  
 **Log files:** `.copilot-loop/logs/issue-<n>-*.log` and `pr-<n>-*.log`
 
 **Issue lifecycle labels:**
 - `ready` — trigger label (configurable: `--trigger-label`)
 - `plan` — draft implementation plan first (read-only pass)
-- `plan-review` — plan posted, awaiting approval (add `ready` to run)
-- `pending` — waiting for dependency (`Wait for: #N` in body)
+- `plan-review` — plan posted, await approval (add `ready` to run)
+- `pending` — wait for dependency (`Wait for: #N` in body)
 - `in-progress` — claimed by loop instance
-- `needs-info` — Copilot asked question, awaiting human reply
+- `needs-info` — Copilot asked question, await human reply
 - `copilot-done` — resolved, PR opened
 - `copilot-failed` — failed, no auto-retry (human reply resumes)
 - `conflict-unresolved` — PR conflict Copilot can't fix
@@ -97,40 +97,40 @@ Blocked by: #4                      # Alias for Wait for
 ```
 
 **Models:**
-- `--model` / `COPILOT_MODEL` — default coding model (when triage disabled)
-- `--commit-model` / `COMMIT_MODEL` — cheap model for commit messages
-- `--triage-model` / `TRIAGE_MODEL` — cheap model classifies issue complexity
+- `--model` / `COPILOT_MODEL` — default coding model (triage off)
+- `--commit-model` / `COMMIT_MODEL` — cheap model, commit messages
+- `--triage-model` / `TRIAGE_MODEL` — cheap model classify issue complexity
 - `--triage-map` / `TRIAGE_MAP` — map difficulty class to model (e.g., `trivial=gpt-4o-mini,complex=claude-opus-4`)
 - `--cost-saver` / `COST_SAVER` — preset that enables triage with built-in defaults (trivial→cheap, normal→mid, complex→`--model`/strong); explicit `--triage-model`/`--triage-map` override it
 - `--agents-model` / `AGENTS_MODEL` — model for AGENTS.md bootstrap (default: `claude-sonnet-4.5`)
 
-**Quality assurance:** On by default. Copilot adds user-perspective tests. Disable: `--no-quality-assurance` / `--no-qa`
+**Quality assurance:** On by default. Copilot add user-perspective tests. Disable: `--no-quality-assurance` / `--no-qa`
 
-**Auto-merge:** Off by default. Enable: `--auto-merge` (uses GitHub auto-merge or immediate merge)
+**Auto-merge:** Off by default. Enable: `--auto-merge` (use GitHub auto-merge or immediate merge)
 
 **Merge methods:** `--merge-method merge|squash|rebase` (default: repo setting)
 
-**Self-update:** Loop pulls and re-execs itself when script changes upstream. Disable: `SELF_UPDATE=0`
+**Self-update:** Loop pull + re-exec itself when script change upstream. Disable: `SELF_UPDATE=0`
 
-**Sync remote:** Loop syncs default branch with remote before each pass. Disable: `SYNC_REMOTE=0`
+**Sync remote:** Loop sync default branch w/ remote before each pass. Disable: `SYNC_REMOTE=0`
 
-**Cleanup:** Loop removes merged branches/worktrees each pass. Disable: `--no-cleanup-merged`
+**Cleanup:** Loop remove merged branches/worktrees each pass. Disable: `--no-cleanup-merged`
 
 ## Critical Constraints
 
 - **Never push to default branch.** All work on `copilot/<n>-*` branches.
-- **Never touch files outside repo.** File access restricted to repo root.
+- **Never touch files outside repo.** File access limited to repo root.
 - **Git worktrees isolate runs.** Parallel instances never conflict (unless `--no-worktrees`).
-- **GitHub lock is atomic.** Claiming adds `in-progress` + removes trigger label in one gh call.
-- **Failures never auto-retry.** `copilot-failed` issues wait for human guidance.
-- **Dependencies block planning and execution.** Issue with `Wait for: #1` held until #1 closes.
+- **GitHub lock is atomic.** Claim add `in-progress` + remove trigger label in one gh call.
+- **Failures never auto-retry.** `copilot-failed` issues wait human guidance.
+- **Dependencies block planning + execution.** Issue with `Wait for: #1` held until #1 closes.
 
 ## Dependencies
 
-- `gh` (authenticated for target repo)
-- `copilot` (GitHub Copilot CLI, must be on PATH)
+- `gh` (authed for target repo)
+- `copilot` (GitHub Copilot CLI, on PATH)
 - `git`
-- Rust toolchain (for TUI only)
+- Rust toolchain (TUI only)
 
 ## Common Operations
 
