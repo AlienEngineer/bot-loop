@@ -3,18 +3,21 @@
 #
 # Tests for the one-time AGENTS.md bootstrap in copilot-loop.sh. When the loop
 # starts against a repo that has no AGENTS.md nor .github/copilot-instructions.md,
-# generate_agents_md runs a read-only Copilot pass that writes a short AGENTS.md
-# and opens it as its own PR; when either file already exists (or a bootstrap PR
-# is already open) it does nothing. Generation is failure-safe: a copilot run that
-# writes nothing never opens a PR and never returns non-zero.
+# generate_agents_md runs a read-only Copilot pass that writes a short AGENTS.md,
+# opens it as its own PR and merges that PR so AGENTS.md actually lands on the
+# default branch (#235) — otherwise every future run's fresh checkout would still
+# have none. When either file already exists (or a bootstrap PR is already open)
+# it does nothing. Generation is failure-safe: a copilot run that writes nothing
+# never opens a PR, and a merge that is blocked (branch protection) leaves the PR
+# open instead of crashing — neither ever returns non-zero.
 #
 # The "agents-md helpers", "workspace helpers" and "copilot-timeout helpers"
 # blocks are extracted verbatim from the script between their markers and sourced
 # here. agents_md_disabled is asserted as a pure unit; generate_agents_md is
 # exercised as an integration test against REAL throwaway git repos (a bare origin
-# plus a clone), with only log / run_copilot / gh (and the auto-merge/usage
-# helpers) mocked, so the real git and control flow run without touching GitHub or
-# any model.
+# plus a clone), with only log / run_copilot / gh (and the usage helper) mocked —
+# `gh pr merge` really fast-forwards the fixture's default branch — so the real
+# git and control flow run without touching GitHub or any model.
 #
 # Run: tests/agents-md.test.sh
 set -uo pipefail
@@ -61,10 +64,12 @@ AGENTS_MODEL="mid-model"
 COPILOT_TIMEOUT=""     # disabled -> copilot_run_timed_out is always false
 COPILOT_RC=0
 AUTO_MERGE=0
+MERGE_METHOD="merge"   # method land_bootstrap_pr merges the bootstrap PR with
 WORKSPACE_DIR=""
 CURRENT_RUN_LOG=""
 BOOT_BRANCH="${BRANCH_PREFIX}agents-md"
 PR_OPEN=0              # how many open bootstrap PRs the gh fixture reports
+MERGE_FAIL=0           # when 1 the gh fixture refuses `pr merge` (blocked merge)
 
 root="$(mktemp -d)"
 trap 'cd "$here" 2>/dev/null; rm -rf "$root"' EXIT
@@ -118,17 +123,28 @@ gh() {
   if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
     printf '%s\n' "${PR_OPEN:-0}"
   fi
+  # `gh pr merge <pr> [--auto] --<method>`: land_bootstrap_pr merges the bootstrap
+  # PR so AGENTS.md reaches the default branch. Emulate a real merge by advancing
+  # origin's default branch to the bootstrap branch tip (a fast-forward). MERGE_FAIL
+  # simulates a blocked merge (branch protection / failing required checks), which
+  # must leave the PR open rather than crash.
+  if [ "${1:-}" = "pr" ] && [ "${2:-}" = "merge" ]; then
+    [ "${MERGE_FAIL:-0}" = "1" ] && return 1
+    local _sha
+    _sha="$(git -C "$clone" ls-remote origin "refs/heads/$BOOT_BRANCH" 2>/dev/null | awk '{print $1}')"
+    [ -n "$_sha" ] && git -C "$clone" push -q origin "$_sha:refs/heads/$DEFAULT_BRANCH" 2>/dev/null
+    return 0
+  fi
   return 0
 }
 
-# The bootstrap's best-effort extras: keep them out of the way but observable.
+# The bootstrap's best-effort cost report: keep it out of the way but observable.
 # shellcheck disable=SC2329
 _report_usage() { printf 'usage %s\n' "${2:-}" >>"$GH_CALLS"; }
-# shellcheck disable=SC2329
-try_auto_merge() { printf 'automerge %s\n' "${1:-}" >>"$GH_CALLS"; }
 
 copilot_calls() { local n; n="$(grep -c . "$CALLS" 2>/dev/null)"; printf '%s' "${n:-0}"; }
 pr_creates()    { local n; n="$(grep -c '^pr create' "$GH_CALLS" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+pr_merges()     { local n; n="$(grep -c '^pr merge' "$GH_CALLS" 2>/dev/null)"; printf '%s' "${n:-0}"; }
 # Observe origin through the clone's transport: this environment sets
 # safe.bareRepository=explicit, so `git -C <bare>` is refused. ls-remote and the
 # remote-tracking refs work over the (local) transport just like a real remote.
@@ -163,6 +179,7 @@ setup_repo() {
   COPILOT_MODE="write"
   WORKSPACE_DIR=""
   PR_OPEN=0
+  MERGE_FAIL=0
   cd "$clone" 2>/dev/null || true
 }
 
@@ -185,9 +202,29 @@ assert_eq "missing: bootstrap branch on origin" "$(origin_branch "$BOOT_BRANCH")
 assert_eq "missing: AGENTS.md committed to the branch" \
   "$(origin_file "$BOOT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "1"
 assert_eq "missing: a PR was opened"            "$(pr_creates)" "1"
+assert_eq "missing: the bootstrap PR was merged" "$(pr_merges)" "1"
+assert_eq "missing: AGENTS.md landed on the default branch" \
+  "$(origin_file "$DEFAULT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "1"
 assert_eq "missing: local bootstrap branch cleaned up" "$(local_branch "$BOOT_BRANCH")" "no"
 assert_eq "missing: working tree clean after run" \
   "$(git -C "$clone" status --porcelain | wc -l | tr -d ' ')" "0"
+
+# --- #235: merge blocked -> PR left open, work not lost, never blocks ---------
+# A protected default branch (required reviews/checks) can refuse the merge. The
+# bootstrap must stay failure-safe: keep the branch + PR (so a human can merge)
+# and never crash the loop, even though AGENTS.md has not reached the default
+# branch yet.
+setup_repo
+MERGE_FAIL=1
+generate_agents_md; rc=$?
+MERGE_FAIL=0
+assert_eq "merge blocked: returns success (never blocks)" "$rc" "0"
+assert_eq "merge blocked: copilot still ran"              "$(copilot_calls)" "1"
+assert_eq "merge blocked: a PR was still opened"          "$(pr_creates)" "1"
+assert_eq "merge blocked: AGENTS.md kept on the bootstrap branch" \
+  "$(origin_file "$BOOT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "1"
+assert_eq "merge blocked: AGENTS.md NOT forced onto the default branch" \
+  "$(origin_file "$DEFAULT_BRANCH" AGENTS.md | grep -c 'Concise repo context')" "0"
 
 # --- already has AGENTS.md: no-op -------------------------------------------
 setup_repo

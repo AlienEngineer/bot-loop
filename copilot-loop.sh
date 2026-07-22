@@ -168,9 +168,10 @@
 #                            "off" keeps a flat timeout                (default: unset)
 #   --agents-model <model>   Model for the one-time AGENTS.md bootstrap: when the
 #                            repo has no AGENTS.md / copilot-instructions.md a
-#                            read-only pass writes a short AGENTS.md and opens it as
-#                            a PR. Runs once, so it defaults to a capable mid model;
-#                            "off" disables it                 (default: claude-sonnet)
+#                            read-only pass writes a short AGENTS.md, opens it as a
+#                            PR and merges that PR so it lands on the default
+#                            branch. Runs once, so it defaults to a capable mid
+#                            model; "off" disables it            (default: claude-sonnet)
 #   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
 #   --quiet                  Do not stream the bot's output to stdout; write it
 #                            only to the per-run log files (the original
@@ -320,11 +321,12 @@ COST_SAVER="${COST_SAVER:-}"
 # complex one gets more time. "off"/"none"/"0" keeps a flat timeout across classes.
 TRIAGE_TIMEOUT_MAP="${TRIAGE_TIMEOUT_MAP:-}"
 # AGENTS.md nor .github/copilot-instructions.md, a single read-only Copilot pass
-# writes a short AGENTS.md (auto-loaded into every later run) and opens it as a
-# PR. This runs once and is high-leverage, so it defaults to a capable mid model
-# rather than the cheapest one. Read raw here; the default is filled after
-# argument parsing so --agents-model can override it. "off"/"none"/"0" disables
-# the bootstrap entirely.
+# writes a short AGENTS.md (auto-loaded into every later run), opens it as a PR
+# and merges that PR so the file lands on the default branch (otherwise every
+# future run's fresh checkout would still have none). This runs once and is
+# high-leverage, so it defaults to a capable mid model rather than the cheapest
+# one. Read raw here; the default is filled after argument parsing so
+# --agents-model can override it. "off"/"none"/"0" disables the bootstrap entirely.
 AGENTS_MODEL="${AGENTS_MODEL:-}"
 ISSUES_DIR="${ISSUES_DIR:-}"
 # Stream Copilot's output live to stdout in addition to the per-run log files.
@@ -617,9 +619,10 @@ work:
                            on; "off" keeps a flat timeout            (default: unset)
   --agents-model <model>   Model for the one-time AGENTS.md bootstrap. When the
                            repo has no AGENTS.md / copilot-instructions.md, a
-                           read-only pass writes a short AGENTS.md and opens it as
-                           a PR before issues run. Runs once so it defaults to a
-                           capable mid model; "off" disables it
+                           read-only pass writes a short AGENTS.md, opens it as a
+                           PR and merges that PR onto the default branch before
+                           issues run. Runs once so it defaults to a capable mid
+                           model; "off" disables it
                                                           (default: claude-sonnet-4.5)
   --issues-dir <dir>       Folder scanned for issue markdown files (default: <repo>/issues)
   --quiet                  Do not stream the bot's output to stdout; write it
@@ -2890,11 +2893,12 @@ _fail_issue() {
 # run re-discovers the layout, build/test commands and conventions — repeated
 # input-token cost across the whole backlog. Once per repo, when neither AGENTS.md
 # nor .github/copilot-instructions.md exists, a single read-only Copilot pass
-# writes a SHORT AGENTS.md (Copilot CLI auto-loads it into every later run) and
-# opens it as its own PR, so future runs — and humans — start with that context.
-# The generation is time-boxed (via run_copilot/COPILOT_TIMEOUT) and fully
-# failure-safe: any problem is logged and swallowed so it can never block issue
-# work.
+# writes a SHORT AGENTS.md (Copilot CLI auto-loads it into every later run),
+# opens it as its own PR and merges that PR so the file actually lands on the
+# default branch — the whole point, since only then does every future run's fresh
+# checkout get it (#235). The generation is time-boxed (via run_copilot/
+# COPILOT_TIMEOUT) and fully failure-safe: any problem is logged and swallowed so
+# it can never block issue work.
 # >>> agents-md helpers >>>
 # True (rc 0) when the AGENTS.md bootstrap is disabled: an empty model or one of
 # the explicit off spellings (so --agents-model off turns it off). Pure.
@@ -2918,6 +2922,33 @@ bootstrap_pr_open() {
   [ -n "$branch" ] || return 1
   count="$(gh pr list --head "$branch" --state open --json number --jq 'length' 2>/dev/null)" || return 0
   [ -n "$count" ] && [ "$count" != "0" ]
+}
+
+# Merge the one-time AGENTS.md bootstrap PR so the file actually lands on the
+# default branch. This is the crux of #235: with --auto-merge off (the default)
+# the PR would otherwise sit open, AGENTS.md would never reach the default branch,
+# and every future run's fresh checkout would still have none — the file "still
+# missing" even though a PR was opened. The bootstrap is a one-time, docs-only,
+# self-contained change whose entire value is being on the default branch, so it
+# lands regardless of the global --auto-merge (which governs risky issue-work
+# PRs). Tries a direct merge first (lands this pass on an unprotected default
+# branch — the common fresh-repo case), then GitHub auto-merge (lands once
+# required checks/reviews pass on a protected branch). Failure-safe: if neither
+# works the PR is left open for a human, exactly as before, and issue work is
+# never blocked. Args: <pr-url> <log-file>.
+land_bootstrap_pr() {
+  local pr="${1:-}" log_file="${2:-}"
+  [ -n "$pr" ] || return 0
+  if gh pr merge "$pr" "--$MERGE_METHOD" >>"$log_file" 2>&1; then
+    log "AGENTS.md: bootstrap PR merged (method=$MERGE_METHOD) so it lands on ${DEFAULT_BRANCH} -> $pr"
+    return 0
+  fi
+  if gh pr merge "$pr" --auto "--$MERGE_METHOD" >>"$log_file" 2>&1; then
+    log "AGENTS.md: bootstrap PR set to auto-merge (method=$MERGE_METHOD) so it lands once checks pass -> $pr"
+    return 0
+  fi
+  log "AGENTS.md: WARNING could not merge bootstrap PR $pr; left open for manual merge"
+  return 0
 }
 
 # Generate AGENTS.md when the repo has none. Never returns non-zero and never
@@ -2978,8 +3009,8 @@ generate_agents_md() {
   prompt="$(cat <<'EOF'
 You are bootstrapping this repository for autonomous coding agents.
 
-Inspect the repository (read-only) and write a single, concise AGENTS.md file at
-its root. AGENTS.md is auto-loaded into EVERY future agent run, so keep it SHORT:
+Inspect the repository and write a single, concise AGENTS.md file at its root.
+AGENTS.md is auto-loaded into EVERY future agent run, so keep it SHORT:
 aim for well under ~150 lines. Bloat here becomes a fixed per-run cost, so include
 only high-signal, durable facts:
   - what the project is and its high-level architecture,
@@ -3070,10 +3101,12 @@ EOF
     CURRENT_RUN_LOG=""
     return 0
   fi
-  try_auto_merge "$pr_url" "AGENTS.md" "$log_file"
+  log "AGENTS.md: bootstrap PR opened -> $pr_url"
+  # Land it on the default branch: an unmerged PR leaves AGENTS.md off the default
+  # branch, so every future run still has none — the file "still missing" (#235).
+  land_bootstrap_pr "$pr_url" "$log_file"
   # Best-effort cost tracking on the bootstrap PR, mirroring the per-issue report.
   _report_usage pr "$pr_url" "$log_file" "$AGENTS_MODEL" 2>/dev/null || true
-  log "AGENTS.md: bootstrap PR opened -> $pr_url"
   cleanup_workspace "$branch"
   CURRENT_RUN_LOG=""
   return 0
