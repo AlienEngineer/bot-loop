@@ -1932,15 +1932,30 @@ _worktree_lock_state() {
 
 # prepare_workspace <branch> <start-ref>
 # Create (or reset) <branch> at <start-ref> and set WORKSPACE_DIR. Returns 1 if
-# the branch/worktree could not be created.
+# the branch/worktree could not be created. On failure the git error is stored in
+# PREPARE_WORKSPACE_ERROR so callers can surface a meaningful diagnosis.
+# Auto-recovery: if the first attempt fails, prune stale worktree refs and remove
+# any orphaned directory left by a previous crashed run, then retry once — this
+# handles the most common cause (stale worktree from an unclean shutdown) without
+# involving Copilot.
+PREPARE_WORKSPACE_ERROR=""
 prepare_workspace() {
   local branch="$1" start="$2"
+  PREPARE_WORKSPACE_ERROR=""
   cleanup_workspace "$branch"
   if [ "$USE_WORKTREES" = 1 ]; then
     local wt; wt="$(_worktree_path "$branch")"
     mkdir -p "$WORKTREE_BASE" 2>/dev/null || true
-    if ! git worktree add --force -B "$branch" "$wt" "$start" >/dev/null 2>&1; then
-      return 1
+    local err
+    if ! err="$(git worktree add --force -B "$branch" "$wt" "$start" 2>&1)"; then
+      # Auto-recovery: prune stale worktree metadata and remove any orphaned
+      # directory left behind by a previous crashed run, then retry once.
+      git worktree prune >/dev/null 2>&1 || true
+      [ -d "$wt" ] && rm -rf "$wt" 2>/dev/null || true
+      if ! err="$(git worktree add --force -B "$branch" "$wt" "$start" 2>&1)"; then
+        PREPARE_WORKSPACE_ERROR="$err"
+        return 1
+      fi
     fi
     # Lock the worktree for as long as this run owns it so a concurrent cleanup
     # pass in another bot (sweep_merged_branches / git worktree prune) can never
@@ -1951,7 +1966,9 @@ prepare_workspace() {
   else
     git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
     git -C "$REPO_DIR" clean -fd >/dev/null 2>&1 || true
-    if ! git -C "$REPO_DIR" switch -C "$branch" "$start" >/dev/null 2>&1; then
+    local err
+    if ! err="$(git -C "$REPO_DIR" switch -C "$branch" "$start" 2>&1)"; then
+      PREPARE_WORKSPACE_ERROR="$err"
       return 1
     fi
     WORKSPACE_DIR="$REPO_DIR"
@@ -2580,7 +2597,7 @@ process_issue() {
   git -C "$REPO_DIR" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
   if [ "$resume_mode" = 1 ]; then
     if ! prepare_workspace_resume "$branch"; then
-      _fail_issue "$num" "$log_file" "could not reopen work branch $branch to resume"
+      _fail_issue "$num" "$log_file" "could not reopen work branch $branch to resume" "$PREPARE_WORKSPACE_ERROR"
       return 1
     fi
     log "issue #$num: resuming in workspace $WORKSPACE_DIR"
@@ -2588,7 +2605,7 @@ process_issue() {
     local start="origin/${DEFAULT_BRANCH}"
     git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
     if ! prepare_workspace "$branch" "$start"; then
-      _fail_issue "$num" "$log_file" "could not create work branch $branch"
+      _fail_issue "$num" "$log_file" "could not create work branch $branch" "$PREPARE_WORKSPACE_ERROR"
       return 1
     fi
   fi
@@ -3361,7 +3378,7 @@ plan_issue() {
   local start="origin/${DEFAULT_BRANCH}"
   git -C "$REPO_DIR" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="FETCH_HEAD"
   if ! prepare_workspace "$branch" "$start"; then
-    _fail_issue "$num" "$log_file" "could not create plan workspace $branch"
+    _fail_issue "$num" "$log_file" "could not create plan workspace $branch" "$PREPARE_WORKSPACE_ERROR"
     return 1
   fi
 
