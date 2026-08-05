@@ -2481,6 +2481,38 @@ issue_has_label() {
         --jq 'any(.labels[]; .name == "'"$label"'")' 2>/dev/null)" = "true" ]
 }
 
+# Extract the model tag from a labels JSON array (e.g., "model:gpt-5.4").
+# Returns the model name without the "model:" prefix, or empty string if no model tag found.
+# Usage: extract_model_tag_from_labels '<json labels array>'
+extract_model_tag_from_labels() {
+  local labels_json="$1"
+  printf '%s' "$labels_json" | jq -r '.[] | select(.name | startswith("model:")) | .name[6:]' 2>/dev/null | head -1
+}
+
+# Determine if an issue should be picked based on model tag filtering.
+# Returns 0 (true) if the bot's model matches the issue's model tag (or both are unspecified).
+# Returns 1 (false) if the bot should skip this issue due to model tag mismatch.
+# Usage: should_pick_issue_by_model <bot_model> <issue_model_tag>
+# - bot_model: the model the bot is running with (e.g., "gpt-5.4", "auto", or empty for auto)
+# - issue_model_tag: the model tag from the issue (e.g., "gpt-5.4", "auto", or empty for no tag)
+should_pick_issue_by_model() {
+  local bot_model="${1:-}" issue_model_tag="${2:-}"
+  
+  # If bot model is empty or "auto", treat it as auto mode
+  if [ -z "$bot_model" ]; then
+    bot_model="auto"
+  fi
+  
+  # If issue has no model tag, it's only available to auto bots
+  if [ -z "$issue_model_tag" ]; then
+    [ "$bot_model" = "auto" ]
+    return
+  fi
+  
+  # If issue has model tag, it's only available to bots with matching model
+  [ "$bot_model" = "$issue_model_tag" ]
+}
+
 # Build the short prompt sent to a *resumed* Copilot session. The session already
 # holds the original issue prompt and the partial work, so this only tells Copilot
 # to pick up where it was interrupted and finish, keeping the same commit/push
@@ -3561,19 +3593,25 @@ reconcile_pending_labels() {
 # Returns the issue number on success, empty string if none available.
 # This prevents multiple instances from selecting the same issue.
 claim_next_ready_issue() {
-  local n body blockers issue=""
+  local n body blockers issue="" issue_model_tag
   acquire_github_lock || return 1
 
   # Ready issues oldest first (lowest number == earliest created). Fetch each
-  # issue's body in the same list call (NUL-separated number/body pairs) so we no
-  # longer spend one `gh issue view` per queued issue. Walk them in order and
-  # claim the first that is not blocked by an unresolved dependency (see
-  # issue_open_blockers). A blocked issue keeps its trigger label so it is
-  # reconsidered on a later pass once its blockers close.
-  while IFS= read -r -d '' n && IFS= read -r -d '' body; do
+  # issue's body and labels in the same list call (NUL-separated number/body/labels
+  # triplets) so we no longer spend one `gh issue view` per queued issue. Walk them
+  # in order and claim the first that is not blocked by an unresolved dependency
+  # (see issue_open_blockers) and matches the bot's model tag. A blocked or
+  # model-mismatched issue keeps its trigger label so it is reconsidered on a later
+  # pass once its blockers close or a matching bot picks it up.
+  while IFS= read -r -d '' n && IFS= read -r -d '' body && IFS= read -r -d '' issue_model_tag; do
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
+      continue
+    fi
+    # Check if the issue matches the bot's model tag
+    if ! should_pick_issue_by_model "$COPILOT_MODEL" "$issue_model_tag"; then
+      log "issue #$n: model tag mismatch (issue: $issue_model_tag, bot: ${COPILOT_MODEL:-auto}); skipping" >&2
       continue
     fi
     # Claim it immediately: add in-progress, remove trigger labels.
@@ -3591,8 +3629,8 @@ claim_next_ready_issue() {
   # front of the next number field ("\n12"), corrupting the branch name and
   # failing every issue after the first. join("") keeps the stream NUL-only.
   done < <(gh issue list --state open --label "$TRIGGER_LABEL" --limit 1000 \
-             --json number,body \
-             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000"] | join("")' 2>/dev/null)
+             --json number,body,labels \
+             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000" + (([.labels[].name | select(startswith("model:"))][0]? // "") | gsub("^model:"; "")) + "\u0000"] | join("")' 2>/dev/null)
 
   release_github_lock
   [ -n "$issue" ] && printf '%s\n' "$issue"
@@ -3608,13 +3646,18 @@ claim_next_ready_issue() {
 # keep the marker comments intact.
 # >>> plan-issue helpers >>>
 claim_next_plan_issue() {
-  local n body blockers issue=""
+  local n body blockers issue="" issue_model_tag
   acquire_github_lock || return 1
 
-  while IFS= read -r -d '' n && IFS= read -r -d '' body; do
+  while IFS= read -r -d '' n && IFS= read -r -d '' body && IFS= read -r -d '' issue_model_tag; do
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
+      continue
+    fi
+    # Check if the issue matches the bot's model tag
+    if ! should_pick_issue_by_model "$COPILOT_MODEL" "$issue_model_tag"; then
+      log "issue #$n: model tag mismatch (issue: $issue_model_tag, bot: ${COPILOT_MODEL:-auto}); skipping" >&2
       continue
     fi
     # Claim it while HOLDING THE LOCK: add in-progress and drop the plan label so
@@ -3628,8 +3671,8 @@ claim_next_plan_issue() {
   # See claim_next_ready_issue for why the records are emitted as one NUL-only
   # joined string rather than a newline-terminated stream.
   done < <(gh issue list --state open --label "$PLAN_LABEL" --limit 1000 \
-             --json number,body \
-             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000"] | join("")' 2>/dev/null)
+             --json number,body,labels \
+             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000" + (([.labels[].name | select(startswith("model:"))][0]? // "") | gsub("^model:"; "")) + "\u0000"] | join("")' 2>/dev/null)
 
   release_github_lock
   [ -n "$issue" ] && printf '%s\n' "$issue"
@@ -3661,7 +3704,7 @@ log_ready_issues() {
 claim_next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   
-  local nums n last_author body blockers issue=""
+  local nums n last_author body blockers issue="" issue_model_tag
   acquire_github_lock || return 1
   
   # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
@@ -3672,17 +3715,22 @@ claim_next_reply_issue() {
                --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
            | sort -n -u )"
   for n in $nums; do
-    # One view call per candidate for both the last comment's author and the
-    # body (NUL-separated) instead of two separate `gh issue view` calls.
-    { IFS= read -r -d '' last_author; IFS= read -r -d '' body; } < <(
-      gh issue view "$n" --json comments,body \
-        --jq '[(.comments[-1].author.login // ""), (.body // "")] | join("\u0000")' 2>/dev/null)
+    # One view call per candidate for the last comment's author, body, and labels
+    # (NUL-separated) instead of separate `gh issue view` calls.
+    { IFS= read -r -d '' last_author; IFS= read -r -d '' body; IFS= read -r -d '' issue_model_tag; } < <(
+      gh issue view "$n" --json comments,body,labels \
+        --jq '[(.comments[-1].author.login // ""), (.body // ""), (([.labels[].name | select(startswith("model:"))][0]? // "") | gsub("^model:"; ""))] | join("\u0000")' 2>/dev/null)
     if [ -z "$last_author" ] || [ "$last_author" = "$BOT_LOGIN" ]; then continue; fi
     # Honour the same dependency gate as fresh issues: do not resume an issue
     # while an issue it declares it is waiting for is still open.
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: replied but blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
+      continue
+    fi
+    # Check if the issue matches the bot's model tag
+    if ! should_pick_issue_by_model "$COPILOT_MODEL" "$issue_model_tag"; then
+      log "issue #$n: model tag mismatch (issue: $issue_model_tag, bot: ${COPILOT_MODEL:-auto}); skipping" >&2
       continue
     fi
     # Found one; claim it before releasing the lock

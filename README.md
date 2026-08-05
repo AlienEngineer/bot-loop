@@ -96,6 +96,32 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `-h`, `--help` | — | — | Show help and exit. |
 | `-V`, `--version` | — | — | Print the version and exit. |
 
+### Model-based job queuing
+
+When running multiple bot instances with different `--model` values, use issue labels to control which bot handles each issue:
+
+- **No model tag**: Available only to bots with `--model auto` (the default). Use for generic issues that any bot can work on.
+- **`model:<name>` tag** (e.g., `model:gpt-5.4`, `model:claude-opus-4.5`): Available only to bots with matching `--model <name>`. Use to route complex issues to specific models.
+
+Example setup:
+
+```sh
+# Terminal 1: Generic issues (auto-selection)
+bot-loop-bash --model auto
+
+# Terminal 2: Complex issues needing GPT-5.4
+bot-loop-bash --model gpt-5.4
+
+# Terminal 3: Issues needing Claude
+bot-loop-bash --model claude-opus-4.5
+```
+
+Then tag your issues in GitHub:
+
+- No tag → bot 1 picks it up
+- `model:gpt-5.4` → bot 2 picks it up
+- `model:claude-opus-4.5` → bot 3 picks it up
+
 A few settings are environment-only (no flag):
 
 - **`SELF_UPDATE`** (default on) — set to `0` to stop the loop pulling and

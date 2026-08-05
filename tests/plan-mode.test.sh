@@ -19,16 +19,20 @@ script="$here/../copilot-loop.sh"
 
 [ -f "$script" ] || { echo "cannot find copilot-loop.sh next to tests/"; exit 1; }
 
-# claim_next_plan_issue depends on the wait-for helpers (issue_open_blockers),
-# so pull those in too. All three blocks are extracted verbatim from the script.
+# claim_next_plan_issue depends on the wait-for helpers (issue_open_blockers) and
+# the should_pick_issue_by_model function for model tag filtering, so pull those in
+# too. All blocks are extracted verbatim from the script.
 wait_block="$(sed -n '/# >>> wait-for helpers >>>/,/# <<< wait-for helpers <<</p' "$script")"
 [ -n "$wait_block" ] || { echo "could not extract wait-for helpers (markers missing?)"; exit 1; }
 detect_block="$(sed -n '/# >>> plan-detect helpers >>>/,/# <<< plan-detect helpers <<</p' "$script")"
 [ -n "$detect_block" ] || { echo "could not extract plan-detect helpers (markers missing?)"; exit 1; }
+model_helpers="$(sed -n '/^should_pick_issue_by_model() {/,/^}/p' "$script")"
+[ -n "$model_helpers" ] || { echo "could not extract should_pick_issue_by_model"; exit 1; }
 claim_block="$(sed -n '/# >>> plan-issue helpers >>>/,/# <<< plan-issue helpers <<</p' "$script")"
 [ -n "$claim_block" ] || { echo "could not extract plan-issue helpers (markers missing?)"; exit 1; }
 eval "$wait_block"
 eval "$detect_block"
+eval "$model_helpers"
 eval "$claim_block"
 
 fail=0
@@ -58,6 +62,8 @@ PLAN_LABEL="plan"
 INPROGRESS_LABEL="in-progress"
 # shellcheck disable=SC2034
 PENDING_LABEL="pending"
+# shellcheck disable=SC2034
+COPILOT_MODEL=""  # Empty means auto (picks untagged issues)
 
 # Silence logs, make the lock a no-op, and format blockers plainly so the real
 # selection and claim logic runs unchanged.
