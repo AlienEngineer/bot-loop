@@ -132,3 +132,24 @@ A few settings are environment-only (no flag):
   files loop-crash reports against.
 - **`BOT_LOOP_EMAIL`** (default `aimirim.software@gmail.com`) — maintainer address
   the auto-fix path emails when you cannot push to `BOT_LOOP_REPO`.
+
+## TUI config file
+
+The TUI reads `~/.config/bot-loop.yaml` on startup and auto-spawns background
+bots according to the `bots.automatic-spawn` map. This is a TUI-only feature;
+the bash loop is not affected.
+
+```yaml
+bots:
+  automatic-spawn:
+    claude-opus 4.5: 5   # spawn 5 workers using claude-opus 4.5
+    claude-opus 5: 2     # spawn 2 workers using claude-opus 5
+    auto: 10             # spawn 10 workers letting Copilot pick the model
+```
+
+Each key is the model name passed to `--model`; `auto` lets Copilot choose the
+model (same as omitting `--model`). Models with spaces in their names are
+supported as plain YAML keys.
+
+When the file is absent or cannot be parsed, the TUI starts without spawning any
+bots automatically and falls back to manual spawning via the bots popup (`b`).

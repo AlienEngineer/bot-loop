@@ -4,6 +4,7 @@
 //! with the `gh` CLI and show them in a scrollable, vim-navigable list.
 
 mod app;
+mod config;
 mod cost;
 mod github;
 mod logs;
@@ -51,6 +52,10 @@ fn main() -> Result<()> {
     // Restore the model, auto-merge, quality-assurance, and close-summary choices
     // the user made last run, and persist any further changes from here on (#195).
     app.load_persisted_settings();
+
+    // Auto-spawn bots from ~/.config/bot-loop.yaml if configured (#241).
+    let spawn_plan = config::spawn_plan(&config::load());
+    app.spawn_from_config(&spawn_plan);
 
     match github::fetch_issues(DEFAULT_LIMIT) {
         Ok(issues) => {
