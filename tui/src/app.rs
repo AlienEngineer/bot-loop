@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
 
+use crate::config;
 use crate::cost::{self, MonthlyCost, YearMonth};
 use crate::github::{self, Issue, Label, PullRequest};
 use crate::logs;
@@ -1046,6 +1047,59 @@ impl App {
                 ));
             }
             Err(err) => self.set_status(format!("Error: {err}")),
+        }
+    }
+
+    /// Spawn background workers according to the automatic-spawn plan from
+    /// `~/.config/bot-loop.yaml`. Each entry in `plan` specifies a model and
+    /// count; this starts exactly that many workers, using each entry's model.
+    /// A missing loop script is reported once and silently skipped for the
+    /// remaining entries. Does nothing when the plan is empty.
+    pub fn spawn_from_config(&mut self, plan: &[config::SpawnEntry]) {
+        if plan.is_empty() {
+            return;
+        }
+        let repo = self.repo_root.clone();
+        let Some(script) = runner::resolve_loop_script(&repo) else {
+            self.set_status(format!(
+                "Cannot find {} — set {} to its path.",
+                runner::LOOP_SCRIPT_NAME,
+                runner::LOOP_SCRIPT_ENV
+            ));
+            return;
+        };
+        let was_idle = !self.runner.is_running();
+        let mut started = 0usize;
+        for entry in plan {
+            for _ in 0..entry.count {
+                let log = runner::log_path(&repo, self.next_worker_id);
+                if self
+                    .runner
+                    .start(
+                        self.next_worker_id,
+                        &script,
+                        &repo,
+                        &log,
+                        entry.model.as_deref(),
+                        self.auto_merge,
+                        self.quality_assurance,
+                    )
+                    .is_ok()
+                {
+                    self.next_worker_id += 1;
+                    started += 1;
+                }
+            }
+        }
+        if was_idle && started > 0 {
+            self.seed_in_progress_baseline();
+        }
+        if started > 0 {
+            let count = self.runner.running_count();
+            self.set_status(format!(
+                "Auto-spawned {started} bot{} from config. {count} running.",
+                if started == 1 { "" } else { "s" }
+            ));
         }
     }
 
