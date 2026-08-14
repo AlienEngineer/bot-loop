@@ -464,6 +464,10 @@ PLAN_MARKER="<!-- copilot-loop:plan -->"
 # crashes (issue #218), so they are easy to recognise in a thread and de-dupe.
 AUTO_FIX_MARKER="<!-- copilot-loop:auto-fix -->"
 
+# Hidden marker appended to the bot's "in-progress" reply on a PR review thread
+# so parallel instances know the thread is already claimed and skip it.
+PR_COMMENT_INPROGRESS_MARKER="<!-- copilot-loop:pr-comment-in-progress -->"
+
 # --- Helpers -----------------------------------------------------------------
 # Emit a timestamped status line to stdout. When CURRENT_RUN_LOG is set (during a
 # per-issue or per-PR run) the same line is also appended to that run's log file,
@@ -4096,6 +4100,270 @@ claim_next_failing_pr() {
 }
 # <<< failing-checks-pr helpers <<<
 
+# >>> pr-review-comments helpers >>>
+# Fetch unresolved, unclaimed review threads for PR $1 via GraphQL.
+# Prints one record per eligible thread to stdout, NUL-delimited fields:
+#   threadId \0 path \0 line \0 diffHunk \0 threadText
+# "Unclaimed" means: the thread is not resolved AND the first comment on the
+# thread does NOT contain PR_COMMENT_INPROGRESS_MARKER (i.e. no bot has
+# already posted an in-progress reply on it).
+pr_review_threads() {
+  local num="$1"
+  local marker="$PR_COMMENT_INPROGRESS_MARKER"
+  # shellcheck disable=SC2016  # $t/$c/$b are jq variables, not shell expansions
+  gh api graphql -f query='
+    query($owner: String!, $repo: String!, $pr: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr) {
+          reviewThreads(first: 50) {
+            nodes {
+              id
+              isResolved
+              path
+              line
+              originalLine
+              diffHunk
+              comments(first: 50) {
+                nodes { body author { login } }
+              }
+            }
+          }
+        }
+      }
+    }' \
+    -F owner=":owner" -F repo=":repo" -F pr="$num" \
+    --jq --arg marker "$marker" '
+      .data.repository.pullRequest.reviewThreads.nodes[]
+      | select(.isResolved == false)
+      | select((.comments.nodes[0].body // "") | contains($marker) | not)
+      | [
+          .id,
+          (.path // ""),
+          ((.line // .originalLine // 0) | tostring),
+          (.diffHunk // ""),
+          ( [ .comments.nodes[] | "**\(.author.login):** \(.body)" ] | join("\n\n") )
+        ]
+      | join("\u0000")' 2>/dev/null
+}
+
+# Echo the number of the lowest-numbered open PR targeting the default branch
+# that has at least one unclaimed, unresolved review thread, skipping PRs
+# already labelled conflict-unresolved, checks-unresolved, or in-progress.
+next_pr_with_review_comments() {
+  local jq_filter
+  jq_filter='[.[]'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$CONFLICT_UNRESOLVED_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$CHECKS_UNRESOLVED_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | select(([.labels[].name] | index("'"$INPROGRESS_LABEL"'")) | not)'
+  jq_filter="$jq_filter"' | .number] | sort | .[]'
+  local candidates
+  candidates="$(gh pr list --state open --base "$DEFAULT_BRANCH" \
+    --json number,labels --jq "$jq_filter" 2>/dev/null)"
+  local n
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    local threads
+    threads="$(pr_review_threads "$n")"
+    if [ -n "$threads" ]; then
+      printf '%s\n' "$n"
+      return 0
+    fi
+  done <<< "$candidates"
+  return 1
+}
+
+# Atomically select and claim the next PR with unresolved review comments,
+# protected by the GitHub lock so two instances never work the same PR.
+# Echoes the PR number on success, nothing when there is no PR to work.
+claim_next_pr_with_review_comments() {
+  local pr=""
+  acquire_github_lock || return 1
+  pr="$(next_pr_with_review_comments || true)"
+  if [ -n "$pr" ]; then
+    gh pr edit "$pr" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  fi
+  release_github_lock
+  [ -n "$pr" ] && printf '%s\n' "$pr"
+  [ -n "$pr" ]
+}
+
+# Post a reply to review thread $1 on PR $2 with body $3 via GraphQL.
+_post_review_thread_reply() {
+  local thread_id="$1" pr_num="$2" body="$3"
+  gh api graphql -f query='
+    mutation($threadId: ID!, $body: String!) {
+      addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+        comment { id }
+      }
+    }' \
+    -F threadId="$thread_id" -F body="$body" >/dev/null 2>&1 || true
+}
+
+# Resolve a single PR review thread comment by handing it to Copilot (one
+# thread per pass). Checks out the PR head branch, claims the first unclaimed
+# thread by posting an in-progress reply, runs Copilot with the thread context,
+# then posts the result as a follow-up reply. Commits and pushes when Copilot
+# edits files. Returns 0 on success, 1 on failure.
+resolve_pr_review_comments() {
+  local num="$1"
+  local head base title log_file copilot_rc
+
+  { IFS= read -r -d '' head; IFS= read -r -d '' base; IFS= read -r -d '' title; } < <(
+    gh pr view "$num" --json headRefName,baseRefName,title \
+      --jq '[.headRefName, .baseRefName, .title] | join("\u0000")' 2>/dev/null)
+  [ -n "$base" ] || base="$DEFAULT_BRANCH"
+  log_file="$LOG_DIR/pr-${num}-review-comments-$(date '+%Y%m%d-%H%M%S').log"
+  CURRENT_RUN_LOG="$log_file"
+
+  if [ -z "$head" ]; then
+    log "PR #$num: could not determine head branch, skipping"
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  log "PR #$num reviewing unresolved comments on branch $head: $title"
+
+  # Fetch first unclaimed, unresolved thread
+  local thread_record thread_id path line diff_hunk thread_text
+  thread_record="$(pr_review_threads "$num" | head -1)"
+  if [ -z "$thread_record" ]; then
+    log "PR #$num: no unresolved review threads found, nothing to do"
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # Parse NUL-delimited fields
+  thread_id="$(printf '%s' "$thread_record" | cut -d '' -f1)"
+  path="$(printf '%s' "$thread_record" | cut -d '' -f2)"
+  line="$(printf '%s' "$thread_record" | cut -d '' -f3)"
+  diff_hunk="$(printf '%s' "$thread_record" | cut -d '' -f4)"
+  thread_text="$(printf '%s' "$thread_record" | cut -d '' -f5)"
+
+  if [ -z "$thread_id" ]; then
+    log "PR #$num: failed to parse review thread record, skipping"
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # Claim this thread atomically by posting an in-progress reply
+  _post_review_thread_reply "$thread_id" "$num" \
+    "bot-loop is addressing this comment… ${PR_COMMENT_INPROGRESS_MARKER}"
+
+  # Check out PR branch into a fresh workspace
+  git -C "$REPO_DIR" fetch origin >>"$log_file" 2>&1 || true
+  if ! prepare_workspace "$head" "origin/$head"; then
+    _post_review_thread_reply "$thread_id" "$num" \
+      "bot-loop could not check out the PR branch to address this comment."
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  log "PR #$num: working on branch $head"
+  set_terminal_title "$head"
+
+  local prompt
+  prompt="$(cat <<EOF
+You are working in a git repository on branch "${head}" (pull request #${num}).
+
+A reviewer left a comment on a specific location in the code that you must address.
+
+File:       ${path}
+Line:       ${line}
+Code hunk:
+${diff_hunk}
+
+Review thread (most recent last):
+${thread_text}
+
+Address the reviewer's request. Edit the file if a code change is needed.
+If you need clarification, start your response with "QUESTION:" followed by your question.
+After making any changes, run the existing tests to verify nothing broke.
+Do NOT run git commit, git push, or create branches — those are handled automatically outside this session. Only edit files and verify.
+EOF
+)"
+  local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
+  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+
+  log "PR #$num: running copilot to address review comment (log: $log_file)"
+  if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
+    _post_review_thread_reply "$thread_id" "$num" \
+      "bot-loop could not access the workspace to address this comment."
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    return 1
+  fi
+  run_copilot "$log_file" "${copilot_args[@]}"
+  copilot_rc=$COPILOT_RC
+  cd "$REPO_DIR" 2>/dev/null || true
+  log "PR #$num: copilot exited with code $copilot_rc"
+
+  _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
+
+  if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
+    _post_review_thread_reply "$thread_id" "$num" \
+      "bot-loop timed out while addressing this comment."
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    cleanup_workspace "$head"
+    return 1
+  fi
+
+  # Extract last meaningful output from Copilot's session log and cap to 4000 chars
+  local copilot_reply
+  copilot_reply="$(grep -v '^[[:space:]]*$' "$log_file" 2>/dev/null | tail -n 30 | \
+    sed 's/^[0-9-]* [0-9:]* | //' | clean_summary)"
+
+  # Check if Copilot is asking a question
+  if printf '%s' "$copilot_reply" | grep -qi "^QUESTION:"; then
+    local question_body
+    question_body="$(printf '%s' "$copilot_reply" | sed 's/^QUESTION:[[:space:]]*//' | head -c 4000)"
+    _post_review_thread_reply "$thread_id" "$num" \
+      "**bot-loop needs more information:**
+
+${question_body}
+
+<!-- copilot-loop:needs-info -->"
+    log "PR #$num: Copilot asked a question on review thread, waiting for user reply"
+    gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+    cleanup_workspace "$head"
+    return 0
+  fi
+
+  # Commit and push if Copilot made code changes
+  if [ -n "$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null)" ]; then
+    git -C "$WORKSPACE_DIR" add -A
+    local commit_msg="Address review comment on $path (#$num)"
+    if ! git -C "$WORKSPACE_DIR" commit -m "$commit_msg" >>"$log_file" 2>&1; then
+      _post_review_thread_reply "$thread_id" "$num" \
+        "bot-loop addressed the comment but could not commit the changes."
+      gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+      cleanup_workspace "$head"
+      return 1
+    fi
+    if ! git -C "$WORKSPACE_DIR" push origin "HEAD:$head" >>"$log_file" 2>&1; then
+      _post_review_thread_reply "$thread_id" "$num" \
+        "bot-loop addressed the comment but could not push the changes."
+      gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+      cleanup_workspace "$head"
+      return 1
+    fi
+    log "PR #$num: committed and pushed changes addressing review comment"
+  fi
+
+  # Post reply with what was done
+  local reply_body
+  if [ -n "$copilot_reply" ]; then
+    reply_body="$(printf 'bot-loop addressed this comment:\n\n%s' "$copilot_reply")"
+  else
+    reply_body="bot-loop addressed this comment."
+  fi
+  _post_review_thread_reply "$thread_id" "$num" "$reply_body"
+
+  gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  log "PR #$num: review comment addressed"
+  cleanup_workspace "$head"
+  return 0
+}
+# <<< pr-review-comments helpers <<<
+
 # --- Self-update: pull the loop code and restart when it changed --------------
 # Before tackling each iteration, refresh this script from the default branch so
 # the loop always runs the latest code. When the upstream copy differs from the
@@ -4614,6 +4882,15 @@ while true; do
   if [ -n "$failing_pr" ]; then
     log "PR #$failing_pr has failing checks, fixing before starting new tasks"
     guard "PR #$failing_pr check fix" resolve_pr_check_failures "$failing_pr" || true
+    continue
+  fi
+
+  # Scan open PRs for unresolved reviewer comments and address one per pass.
+  vlog "loop: scanning open PRs for unhandled review comments"
+  review_comment_pr="$(claim_next_pr_with_review_comments || true)"
+  if [ -n "$review_comment_pr" ]; then
+    log "PR #$review_comment_pr has unhandled review comments, addressing"
+    guard "PR #$review_comment_pr review comments" resolve_pr_review_comments "$review_comment_pr" || true
     continue
   fi
 
