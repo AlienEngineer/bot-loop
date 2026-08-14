@@ -4224,21 +4224,22 @@ resolve_pr_review_comments() {
   log "PR #$num reviewing unresolved comments on branch $head: $title"
 
   # Fetch first unclaimed, unresolved thread
+  # Fetch first unclaimed, unresolved thread
   local thread_record thread_id path line diff_hunk thread_text
-  thread_record="$(pr_review_threads "$num" | head -1)"
+  thread_record="$(pr_review_threads "$num")"
+  thread_record="$(printf '%s\n' "$thread_record" | head -1)"
   if [ -z "$thread_record" ]; then
     log "PR #$num: no unresolved review threads found, nothing to do"
     gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     return 0
   fi
 
-  # Parse NUL-delimited fields
-  thread_id="$(printf '%s' "$thread_record" | cut -d '' -f1)"
-  path="$(printf '%s' "$thread_record" | cut -d '' -f2)"
-  line="$(printf '%s' "$thread_record" | cut -d '' -f3)"
-  diff_hunk="$(printf '%s' "$thread_record" | cut -d '' -f4)"
-  thread_text="$(printf '%s' "$thread_record" | cut -d '' -f5)"
-
+  # Parse the first eligible thread record emitted by pr_review_threads.
+  thread_id="$(printf '%s' "$thread_record" | awk -F'\034' '{print $1}')"
+  path="$(printf '%s' "$thread_record" | awk -F'\034' '{print $2}')"
+  line="$(printf '%s' "$thread_record" | awk -F'\034' '{print $3}')"
+  diff_hunk="$(printf '%s' "$thread_record" | awk -F'\034' '{print $4}')"
+  thread_text="$(printf '%s' "$thread_record" | awk -F'\034' '{print $5}')"
   if [ -z "$thread_id" ]; then
     log "PR #$num: failed to parse review thread record, skipping"
     gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
