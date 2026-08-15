@@ -841,6 +841,26 @@ build_summary_comment() {
 }
 # <<< summary helpers <<<
 
+# >>> path-sanitization helpers >>>
+# Helper to hide absolute filesystem paths from GitHub comments by replacing them
+# with ~/ notation, preventing exposure of user home directories and system
+# structure on public GitHub issues. Extracted verbatim by tests/hide-paths.test.sh
+# between these markers, so keep the marker comments intact.
+
+# Sanitize absolute paths in text for display by replacing common home directory
+# patterns with ~ notation. Handles $HOME as the primary case, with fallbacks
+# for /Users/* (macOS) and /home/* (Linux) patterns in case $HOME doesn't match.
+# This prevents exposing user home directories in GitHub comments, logs, etc.
+# Works on stdin, enabling pipeline use. Pure: reads $HOME and stdin.
+sanitize_paths_for_display() {
+  local home="${HOME:-/tmp}"
+  sed \
+    -e "s|${home}|~|g" \
+    -e 's|/Users/[^/]*|~|g' \
+    -e 's|/home/[^/]*|~|g'
+}
+# <<< path-sanitization helpers <<<
+
 # Post the per-run cost/usage summary Copilot printed (parsed out of $log_file)
 # as a comment on the issue or PR, tagged with USAGE_MARKER so it is easy to spot
 # and filter in the thread. The header always records which model resolved the
@@ -851,7 +871,7 @@ build_summary_comment() {
 _report_usage() {
   local kind="$1" num="$2" log_file="$3" model="${4:-}" summary header body
   [ -f "$log_file" ] || return 0
-  summary="$(parse_usage_stats <"$log_file" 2>/dev/null)"
+  summary="$(parse_usage_stats <"$log_file" 2>/dev/null | sanitize_paths_for_display)"
   [ -n "$summary" ] || return 0
   header="$(_usage_header "$model")"
   # shellcheck disable=SC2016  # backticks/%s are literal printf format, not expansions
@@ -883,7 +903,8 @@ build_issue_summary() {
   esc="$(printf '\033')"
   context="$(tail -c 16384 "$log_file" 2>/dev/null \
              | LC_ALL=C sed "s/${esc}\\[[0-9;?]*[A-Za-z]//g" \
-             | LC_ALL=C tr -d '\000-\010\013\014\016-\037')"
+             | LC_ALL=C tr -d '\000-\010\013\014\016-\037' \
+             | sanitize_paths_for_display)"
   [ -n "${context//[[:space:]]/}" ] || return 0
 
   prompt="$(build_summary_prompt "$num" "$title" "$context")"
@@ -2926,7 +2947,7 @@ _fail_issue() {
   if [ -n "$details" ]; then
     block="$details"
   else
-    block="$(tail -n 20 "$log_file" 2>/dev/null)"
+    block="$(tail -n 20 "$log_file" 2>/dev/null | sanitize_paths_for_display)"
   fi
 
   log "issue #$num: FAILED - $reason"
@@ -3303,7 +3324,7 @@ EOF
 _fail_pr() {
   local num="$1" log_file="$2" reason="$3" tail_out
   log "PR #$num: FAILED to resolve conflicts - $reason"
-  tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
+  tail_out="$(tail -n 20 "$log_file" 2>/dev/null | sanitize_paths_for_display)"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
   gh pr comment "$num" --body "$(printf 'bot-loop could not resolve merge conflicts: %s\n\n```\n%s\n```' \
     "$reason" "$tail_out")" >/dev/null 2>&1 || true
@@ -3317,7 +3338,7 @@ _fail_pr() {
 _fail_pr_checks() {
   local num="$1" log_file="$2" reason="$3" tail_out
   log "PR #$num: FAILED to fix failing checks - $reason"
-  tail_out="$(tail -n 20 "$log_file" 2>/dev/null)"
+  tail_out="$(tail -n 20 "$log_file" 2>/dev/null | sanitize_paths_for_display)"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
   gh pr comment "$num" --body "$(printf 'bot-loop could not fix the failing checks: %s\n\n```\n%s\n```' \
     "$reason" "$tail_out")" >/dev/null 2>&1 || true
@@ -3334,7 +3355,7 @@ _fail_pr_checks() {
 # >>> needs-info helpers >>>
 _ask_issue() {
   local num="$1" qf="$2" question
-  question="$(cat "$qf" 2>/dev/null)"
+  question="$(cat "$qf" 2>/dev/null | sanitize_paths_for_display)"
   log "issue #$num: needs more info, asking the user on the issue"
   gh issue comment "$num" \
     --body "$(printf '**bot-loop needs more information to continue:**\n\n%s\n\n%s' \
@@ -3479,7 +3500,7 @@ EOF
     return 1
   fi
 
-  plan="$(cat "$plan_file" 2>/dev/null)"
+  plan="$(cat "$plan_file" 2>/dev/null | sanitize_paths_for_display)"
   log "issue #$num: plan drafted, posting for review"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
   gh issue comment "$num" --body "$(printf '**bot-loop drafted an implementation plan for this issue.**\n\nReview the plan below. When you are happy with it, add the `%s` label and the loop will implement it. To change the plan, leave a comment with your adjustments before adding `%s` — the most recent plan in the thread is what gets executed.\n\n---\n\n%s\n\n%s' \

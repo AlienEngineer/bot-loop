@@ -27,6 +27,7 @@ extract() {
   [ -n "$block" ] || { echo "could not extract '$1' (markers missing?)"; exit 1; }
   eval "$block"
 }
+extract "path-sanitization helpers" # sanitize_paths_for_display
 extract "summary helpers"        # summary_enabled, resolve_summary_model, _summary_header,
                                  # build_summary_prompt, clean_summary, build_summary_comment
 extract "summary report helpers" # build_issue_summary, _report_summary

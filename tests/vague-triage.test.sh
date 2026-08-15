@@ -32,6 +32,7 @@ extract() {
   [ -n "$block" ] || { echo "could not extract '$1' (markers missing?)"; exit 1; }
   eval "$block"
 }
+extract "path-sanitization helpers" # sanitize_paths_for_display
 extract "vagueness helpers"      # comments_have_question, parse_vague_question
 extract "triage-vagueness helper" # triage_vagueness
 extract "plan-detect helpers"    # comments_have_plan (the plan guard)
