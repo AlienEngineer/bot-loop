@@ -13,6 +13,10 @@ here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/../copilot-loop.sh"
 [ -f "$script" ] || { echo "cannot find copilot-loop.sh next to tests/"; exit 1; }
 
+path_block="$(sed -n '/# >>> path-sanitization helpers >>>/,/# <<< path-sanitization helpers <<</p' "$script")"
+[ -n "$path_block" ] || { echo "could not extract path-sanitization helpers"; exit 1; }
+eval "$path_block"
+
 fail_block="$(sed -n '/^_fail_issue() {/,/^}/p' "$script")"
 [ -n "$fail_block" ] || { echo "could not extract _fail_issue"; exit 1; }
 eval "$fail_block"

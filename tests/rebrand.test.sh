@@ -85,6 +85,7 @@ FAILED_LABEL="copilot-failed"
 branch="copilot/7-demo"
 
 # Pull in the REAL functions under test straight from the script.
+eval "$(sed -n '/# >>> path-sanitization helpers >>>/,/# <<< path-sanitization helpers <<</p' "$script")"
 eval "$(sed -n '/# >>> needs-info helpers >>>/,/# <<< needs-info helpers <<</p' "$script")"
 eval "$(sed -n '/^_fail_issue() {/,/^}/p' "$script")"
 
