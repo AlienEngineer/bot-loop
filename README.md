@@ -74,6 +74,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--sleep-minutes <n>` | `SLEEP_MINUTES` | `5` | Minutes to sleep when there is no work. Press `f` to wake early. |
 | `--repo-dir <dir>` | `REPO_DIR` | current git repo | Repository to operate in. |
 | `--model <model>` | `COPILOT_MODEL` | auto | Model passed to `copilot --model`. |
+| `--effort <level>` | `COPILOT_EFFORT` | unset | Reasoning effort passed to `copilot --effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. Unset leaves each model on its own default. Copilot does not persist the effort picked in an interactive session, so it has to be set here. The levels differ per model, and `copilot` exits on one the model does not accept. |
 | `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | `30m` | Wall-clock limit per bot run so a stuck run cannot block the loop. Seconds, or an `s`/`m`/`h`/`d` suffix (`1800`, `30m`, `2h`); `0`/`off` disables it. |
 | `--commit-model <model>` | `COMMIT_MODEL` | `off` | Model that writes the commit message from the staged diff. `off` uses a deterministic `Resolve #<n>: <title>` message. |
 | `--summary-model <model>` | `SUMMARY_MODEL` | `gpt-5-mini` | Light model that writes the per-issue close summary from the run's session log. `auto`/`off` lets the bot pick its own default. |
@@ -142,14 +143,20 @@ the bash loop is not affected.
 ```yaml
 bots:
   automatic-spawn:
-    claude-opus 4.5: 5   # spawn 5 workers using claude-opus 4.5
-    claude-opus 5: 2     # spawn 2 workers using claude-opus 5
-    auto: 10             # spawn 10 workers letting Copilot pick the model
+    claude-opus 4.5: 5      # spawn 5 workers using claude-opus 4.5
+    claude-opus 5: 2        # spawn 2 workers using claude-opus 5
+    gpt-5.6-luna: 3 max     # spawn 3 workers on gpt-5.6-luna at max reasoning
+    auto: 10                # spawn 10 workers letting Copilot pick the model
 ```
 
 Each key is the model name passed to `--model`; `auto` lets Copilot choose the
 model (same as omitting `--model`). Models with spaces in their names are
 supported as plain YAML keys.
+
+The value is the worker count, optionally followed by a reasoning effort passed
+to `--effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Leave
+it off to run the model at its own default. An effort outside that list is
+ignored.
 
 When the file is absent or cannot be parsed, the TUI starts without spawning any
 bots automatically and falls back to manual spawning via the bots popup (`b`).

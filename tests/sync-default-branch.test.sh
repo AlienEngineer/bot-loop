@@ -48,6 +48,7 @@ assert_eq "classify: each side unique -> diverged"     "$(classify_sync_state no
 DEFAULT_BRANCH="main"
 SYNC_REMOTE=1
 COPILOT_MODEL=""
+COPILOT_EFFORT=""
 COPILOT_RC=0
 
 root="$(mktemp -d)"

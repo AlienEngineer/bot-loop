@@ -39,6 +39,7 @@ assert_eq() {
 
 # --- Config/mocks the extracted helpers read from the environment ------------
 COPILOT_MODEL=""
+COPILOT_EFFORT=""
 COPILOT_TIMEOUT=""
 COPILOT_RC=0
 

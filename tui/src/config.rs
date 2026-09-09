@@ -4,12 +4,17 @@
 //! model. A missing, empty, or invalid config file is treated as "no automatic
 //! spawns" so a bad edit never blocks the TUI.
 //!
+//! The count may carry a reasoning effort, forwarded to `copilot --effort`.
+//! Copilot does not persist the effort picked in an interactive session, so it
+//! has to be set here.
+//!
 //! Example `~/.config/bot-loop.yaml`:
 //!
 //! ```yaml
 //! bots:
 //!   automatic-spawn:
 //!     claude-opus 4.5: 5
+//!     gpt-5.6-luna: 3 max
 //!     auto: 10
 //! ```
 
@@ -26,17 +31,37 @@ pub struct BotLoopConfig {
 /// The `bots:` section.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BotsConfig {
-    /// Model name → number of bots to spawn automatically on TUI startup.
-    pub automatic_spawn: HashMap<String, usize>,
+    /// Model name → how many bots to spawn automatically on TUI startup and the
+    /// reasoning effort they run at (`None` = the model's own default).
+    pub automatic_spawn: HashMap<String, (usize, Option<String>)>,
 }
 
 /// A single entry in the automatic-spawn plan: start `count` workers using
-/// `model` (`None` = auto).
+/// `model` (`None` = auto) at `effort` (`None` = the model's own default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnEntry {
     /// The model to pass to the loop (`None` = let Copilot pick / `auto`).
     pub model: Option<String>,
     pub count: usize,
+    /// The reasoning effort to pass to the loop (`None` = the model's default).
+    pub effort: Option<String>,
+}
+
+/// The reasoning effort levels `copilot --effort` accepts. `copilot` exits on
+/// any other value, so the config parser drops what is not in this list.
+pub const EFFORT_LEVELS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Parse the value side of an `automatic-spawn` entry: a count, optionally
+/// followed by a reasoning effort (`"3 max"`). An effort outside
+/// [`EFFORT_LEVELS`] is dropped. Pure for testing.
+pub fn parse_spawn_value(raw: &str) -> Option<(usize, Option<String>)> {
+    let mut parts = raw.split_whitespace();
+    let count = parts.next()?.parse::<usize>().ok()?;
+    let effort = parts
+        .next()
+        .map(str::to_ascii_lowercase)
+        .filter(|level| EFFORT_LEVELS.contains(&level.as_str()));
+    Some((count, effort))
 }
 
 /// The resolved path to `~/.config/bot-loop.yaml`. `None` when the home
@@ -107,14 +132,14 @@ pub fn parse(raw: &str) -> Option<BotLoopConfig> {
             continue;
         }
 
-        // Parse "<model>: <count>" lines.
+        // Parse "<model>: <count> [<effort>]" lines.
         if let Some((key, val)) = trimmed.split_once(':') {
             let model = key.trim().to_string();
-            if let Ok(count) = val.trim().parse::<usize>()
+            if let Some((count, effort)) = parse_spawn_value(val)
                 && count > 0
                 && !model.is_empty()
             {
-                automatic_spawn.insert(model, count);
+                automatic_spawn.insert(model, (count, effort));
             }
         }
     }
@@ -132,14 +157,15 @@ pub fn spawn_plan(config: &BotLoopConfig) -> Vec<SpawnEntry> {
         .bots
         .automatic_spawn
         .iter()
-        .filter(|&(_, &count)| count > 0)
-        .map(|(model, &count)| SpawnEntry {
-            model: if model.trim().eq_ignore_ascii_case("auto") {
+        .filter(|(_, (count, _))| *count > 0)
+        .map(|(model, (count, effort))| SpawnEntry {
+            model: if crate::models::is_auto(model.trim()) {
                 None
             } else {
                 Some(model.clone())
             },
-            count,
+            count: *count,
+            effort: effort.clone(),
         })
         .collect();
     // Stable sort so tests are deterministic (alphabetical by model display name,
@@ -175,9 +201,9 @@ bots:
     auto: 10
 "#;
         let config = parse(yaml).unwrap();
-        assert_eq!(config.bots.automatic_spawn["claude-opus 4.5"], 5);
-        assert_eq!(config.bots.automatic_spawn["claude-opus 5"], 2);
-        assert_eq!(config.bots.automatic_spawn["auto"], 10);
+        assert_eq!(config.bots.automatic_spawn["claude-opus 4.5"].0, 5);
+        assert_eq!(config.bots.automatic_spawn["claude-opus 5"].0, 2);
+        assert_eq!(config.bots.automatic_spawn["auto"].0, 10);
     }
 
     #[test]
@@ -236,6 +262,22 @@ bots:
     }
 
     #[test]
+    fn parse_reads_the_effort_after_the_count() {
+        let yaml = "bots:\n  automatic-spawn:\n    gpt-5.6-luna: 3 max\n";
+        let plan = spawn_plan(&parse(yaml).unwrap());
+        assert_eq!(plan[0].count, 3);
+        assert_eq!(plan[0].effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn parse_drops_an_unknown_effort_but_keeps_the_count() {
+        assert_eq!(parse_spawn_value("3 turbo"), Some((3, None)));
+        assert_eq!(parse_spawn_value("3"), Some((3, None)));
+        assert_eq!(parse_spawn_value("3 MAX"), Some((3, Some("max".into()))));
+        assert_eq!(parse_spawn_value("max"), None);
+    }
+
+    #[test]
     fn parse_ignores_comments_and_blank_lines() {
         let yaml = r#"
 # This is a comment
@@ -246,7 +288,7 @@ bots:
     claude-opus 4.5: 3
 "#;
         let config = parse(yaml).unwrap();
-        assert_eq!(config.bots.automatic_spawn["claude-opus 4.5"], 3);
+        assert_eq!(config.bots.automatic_spawn["claude-opus 4.5"].0, 3);
     }
 
     #[test]
@@ -263,7 +305,7 @@ bots:
         )
         .unwrap();
         let config = load_from(Some(&path));
-        assert_eq!(config.bots.automatic_spawn["claude-opus 4.5"], 2);
-        assert_eq!(config.bots.automatic_spawn["auto"], 5);
+        assert_eq!(config.bots.automatic_spawn["claude-opus 4.5"].0, 2);
+        assert_eq!(config.bots.automatic_spawn["auto"].0, 5);
     }
 }
