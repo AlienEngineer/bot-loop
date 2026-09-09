@@ -110,10 +110,11 @@ pub fn parse(raw: &str) -> Option<BotLoopConfig> {
         // Parse "<model>: <count>" lines.
         if let Some((key, val)) = trimmed.split_once(':') {
             let model = key.trim().to_string();
-            if let Ok(count) = val.trim().parse::<usize>() {
-                if count > 0 && !model.is_empty() {
-                    automatic_spawn.insert(model, count);
-                }
+            if let Ok(count) = val.trim().parse::<usize>()
+                && count > 0
+                && !model.is_empty()
+            {
+                automatic_spawn.insert(model, count);
             }
         }
     }
@@ -133,7 +134,7 @@ pub fn spawn_plan(config: &BotLoopConfig) -> Vec<SpawnEntry> {
         .iter()
         .filter(|&(_, &count)| count > 0)
         .map(|(model, &count)| SpawnEntry {
-            model: if model.trim().to_ascii_lowercase() == "auto" {
+            model: if model.trim().eq_ignore_ascii_case("auto") {
                 None
             } else {
                 Some(model.clone())
@@ -251,10 +252,8 @@ bots:
     #[test]
     fn parse_actual_file_roundtrip() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!(
-            "copilot-loop-config-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("copilot-loop-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bot-loop.yaml");
         let mut f = std::fs::File::create(&path).unwrap();

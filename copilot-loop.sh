@@ -1976,7 +1976,9 @@ prepare_workspace() {
       # Auto-recovery: prune stale worktree metadata and remove any orphaned
       # directory left behind by a previous crashed run, then retry once.
       git worktree prune >/dev/null 2>&1 || true
-      [ -d "$wt" ] && rm -rf "$wt" 2>/dev/null || true
+      if [ -d "$wt" ]; then
+        rm -rf "$wt" 2>/dev/null || true
+      fi
       if ! err="$(git worktree add --force -B "$branch" "$wt" "$start" 2>&1)"; then
         PREPARE_WORKSPACE_ERROR="$err"
         return 1
@@ -3355,7 +3357,7 @@ _fail_pr_checks() {
 # >>> needs-info helpers >>>
 _ask_issue() {
   local num="$1" qf="$2" question
-  question="$(cat "$qf" 2>/dev/null | sanitize_paths_for_display)"
+  question="$(sanitize_paths_for_display <"$qf" 2>/dev/null)"
   log "issue #$num: needs more info, asking the user on the issue"
   gh issue comment "$num" \
     --body "$(printf '**bot-loop needs more information to continue:**\n\n%s\n\n%s' \
@@ -3500,7 +3502,7 @@ EOF
     return 1
   fi
 
-  plan="$(cat "$plan_file" 2>/dev/null | sanitize_paths_for_display)"
+  plan="$(sanitize_paths_for_display <"$plan_file" 2>/dev/null)"
   log "issue #$num: plan drafted, posting for review"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
   gh issue comment "$num" --body "$(printf '**bot-loop drafted an implementation plan for this issue.**\n\nReview the plan below. When you are happy with it, add the `%s` label and the loop will implement it. To change the plan, leave a comment with your adjustments before adding `%s` — the most recent plan in the thread is what gets executed.\n\n---\n\n%s\n\n%s' \
@@ -4210,7 +4212,8 @@ claim_next_pr_with_review_comments() {
 
 # Post a reply to review thread $1 on PR $2 with body $3 via GraphQL.
 _post_review_thread_reply() {
-  local thread_id="$1" pr_num="$2" body="$3"
+  local thread_id="$1" body="$3"
+  # shellcheck disable=SC2016  # GraphQL variables must remain literal
   gh api graphql -f query='
     mutation($threadId: ID!, $body: String!) {
       addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
