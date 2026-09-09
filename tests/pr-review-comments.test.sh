@@ -63,7 +63,8 @@ EDITS_FILE="$(mktemp)"
 GQL_FILE="$(mktemp)"
 GQL_QUERY_FILE="$(mktemp)"
 
-: >"$EDITS_FILE" >"$GQL_QUERY_FILE"
+: >"$EDITS_FILE"
+: >"$GQL_QUERY_FILE"
 
 cleanup() { rm -rf "$LOG_DIR" "$WORKSPACE_DIR" "$REPO_DIR"; rm -f "$PR_FILE" "$EDITS_FILE" "$GQL_FILE" "$GQL_QUERY_FILE"; }
 trap cleanup EXIT
@@ -76,6 +77,7 @@ release_github_lock() { :; }
 set_terminal_title() { :; }
 prepare_workspace() { return 0; }
 cleanup_workspace() { :; }
+# shellcheck disable=SC2034  # read by the dynamically extracted function
 run_copilot() { COPILOT_RC=0; }
 _report_usage() { :; }
 copilot_run_timed_out() { return 1; }
@@ -90,7 +92,12 @@ gh() {
     "pr list")
       local jqf=""
       while [ $# -gt 0 ]; do
-        [ "$1" = "--jq" ] && { jqf="$2"; shift 2; } || shift
+        if [ "$1" = "--jq" ]; then
+          jqf="$2"
+          shift 2
+        else
+          shift
+        fi
       done
       jq -r "$jqf" "$PR_FILE"
       ;;

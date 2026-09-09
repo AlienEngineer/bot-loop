@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Tests for README.md (issue #225). The README was rewritten to contain exactly
-# three things a user needs and nothing else:
+# Tests for README.md (issue #225). The README contains the four things a user
+# needs:
 #   1. Getting started — how to install via Homebrew.
 #   2. A brief description of what the loop does on each iteration.
 #   3. A description of every flag the bash script accepts.
+#   4. The TUI configuration file format.
 #
 # These are user-perspective checks: they assert the outcomes a reader observes
 # in the published README (the install commands, the loop walkthrough, and that
@@ -84,9 +85,9 @@ assert_eq "documents --plan-label" "$(has '--plan-label')" "yes"
 assert_eq "surfaces AGENTS_MODEL env var"        "$(has 'AGENTS_MODEL')" "yes"
 assert_eq "surfaces TRIAGE_TIMEOUT_MAP env var"  "$(has 'TRIAGE_TIMEOUT_MAP')" "yes"
 
-# --- "Nothing else": exactly the three requested sections --------------------
-assert_eq "has exactly three top-level sections" \
-  "$(grep -cE '^## ' "$readme")" "3"
+# --- The four user-facing sections ------------------------------------------
+assert_eq "has exactly four top-level sections" \
+  "$(grep -cE '^## ' "$readme")" "4"
 
 if [ "$fail" -eq 0 ]; then
   echo "All README tests passed."
