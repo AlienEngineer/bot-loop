@@ -105,7 +105,7 @@ pub struct App {
     pub form: CreateForm,
     limit: u32,
     runner: LoopRunner,
-    /// Models offered by the picker (first entry is always `auto`).
+    /// Models offered by the picker (first entry is normally `auto`).
     pub models: Vec<String>,
     /// Selection within the model picker popup.
     pub model_state: ListState,
@@ -248,7 +248,7 @@ impl App {
         if !issues.is_empty() {
             state.select(Some(0));
         }
-        let models = models::available();
+        let models = models::fallback();
         let mut model_state = ListState::default();
         model_state.select(Some(0));
         Self {
@@ -359,6 +359,13 @@ impl App {
             self.apply_settings(settings);
         }
         self.settings_path = Some(path);
+    }
+
+    /// Load the cached Copilot model list, refreshing it when it is older than a
+    /// day. Kept out of [`App::new`] so unit tests never invoke the CLI.
+    pub fn load_models(&mut self) {
+        self.models = models::available(&self.repo_root);
+        self.model_state.select(Some(0));
     }
 
     /// Write the current settings to disk when persistence is enabled (#195).
@@ -2262,7 +2269,10 @@ mod tests {
             .map(|i| format!(r#"{{"number": {i}, "title": "t{i}"}}"#))
             .collect();
         let json = format!("[{}]", items.join(","));
-        App::new(parse_issues(&json).unwrap())
+        let mut app = App::new(parse_issues(&json).unwrap());
+        app.models = vec!["auto".to_string(), "test-model".to_string()];
+        app.model_state.select(Some(0));
+        app
     }
 
     #[test]

@@ -49,6 +49,10 @@ fn main() -> Result<()> {
 
     let mut app = App::new(Vec::new());
 
+    // Restore the current Copilot model list from the daily cache, querying the
+    // CLI only when that cache has expired.
+    app.load_models();
+
     // Restore the model, auto-merge, quality-assurance, and close-summary choices
     // the user made last run, and persist any further changes from here on (#195).
     app.load_persisted_settings();
