@@ -22,7 +22,6 @@ eval "$helpers"
 fail=0
 assert_eq() {
   local desc="$1" got="$2" want="$3"
-  local rc=$?
   if [ "$got" = "$want" ]; then
     printf 'ok   - %s\n' "$desc"
   else

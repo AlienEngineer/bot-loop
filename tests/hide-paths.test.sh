@@ -9,6 +9,7 @@
 # exercised without touching GitHub.
 #
 # Run: tests/hide-paths.test.sh
+# shellcheck disable=SC2088  # expected output intentionally contains literal tildes
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"

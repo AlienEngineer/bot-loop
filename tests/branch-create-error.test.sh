@@ -76,7 +76,7 @@ WORKSPACE_DIR=""
 
 # --- Case 1: invalid start ref -> git error is captured, not silently lost ---
 # Using a ref that doesn't exist forces git to emit an error we can inspect.
-cd "$REPO_DIR"
+cd "$REPO_DIR" || exit
 PREPARE_WORKSPACE_ERROR=""
 WORKSPACE_DIR=""
 prepare_workspace "copilot/1-test" "refs/heads/nonexistent-ref-xyz" || true
