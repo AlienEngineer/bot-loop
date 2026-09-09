@@ -7,6 +7,7 @@
 # model carries the effort with it.
 #
 # Run: tests/reasoning-effort.test.sh
+# shellcheck disable=SC2016  # assertions intentionally match literal shell source
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
