@@ -41,7 +41,8 @@ pub fn loop_script_candidates(env_override: Option<String>, repo_root: &Path) ->
 /// Arguments passed to the background loop, mirroring the bash TUI's `spawn_bot`:
 /// point it at the repo and keep its log to clean status lines (the full Copilot
 /// transcript still lands under `<repo>/.copilot-loop/logs/`). When a `model` is
-/// given it is forwarded as `--model` so the loop runs on the user's choice;
+/// given it is forwarded as `--model` so the loop runs on the user's choice, and
+/// an `effort` as `--effort`;
 /// `None` (auto) leaves it off so Copilot picks. When `auto_merge` is set,
 /// `--auto-merge` is forwarded so each PR merges without manual review (#135).
 /// Quality assurance is on in the loop by default, so `--no-quality-assurance` is
@@ -50,6 +51,7 @@ pub fn loop_script_candidates(env_override: Option<String>, repo_root: &Path) ->
 pub fn loop_args(
     repo_dir: &Path,
     model: Option<&str>,
+    effort: Option<&str>,
     auto_merge: bool,
     quality_assurance: bool,
 ) -> Vec<String> {
@@ -61,6 +63,10 @@ pub fn loop_args(
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+    if let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
     }
     if auto_merge {
         args.push("--auto-merge".to_string());
@@ -179,6 +185,9 @@ struct Worker {
     script: PathBuf,
     repo_dir: PathBuf,
     model: Option<String>,
+    /// The reasoning effort the loop was launched with, forwarded again on a
+    /// restart (`None` = the model's own default).
+    effort: Option<String>,
     /// Whether the loop was launched with `--auto-merge`, forwarded again on a
     /// restart so the worker keeps the flags it was started with (#82, #135).
     auto_merge: bool,
@@ -280,7 +289,8 @@ impl LoopRunner {
     }
 
     /// Start a new worker in slot `id` against `repo_dir`, capturing output to
-    /// `log` and running on `model` (`None` = auto). When `auto_merge` is set the
+    /// `log`, running on `model` (`None` = auto) at `effort` (`None` = the
+    /// model's own default). When `auto_merge` is set the
     /// loop is told to merge each PR automatically (`--auto-merge`, #135); when
     /// `quality_assurance` is off it is told to skip the QA tests
     /// (`--no-quality-assurance`, #162). Errors when the process cannot be
@@ -298,12 +308,13 @@ impl LoopRunner {
         repo_dir: &Path,
         log: &Path,
         model: Option<&str>,
+        effort: Option<&str>,
         auto_merge: bool,
         quality_assurance: bool,
     ) -> Result<u32> {
         let child = spawn_detached(
             script,
-            &loop_args(repo_dir, model, auto_merge, quality_assurance),
+            &loop_args(repo_dir, model, effort, auto_merge, quality_assurance),
             log,
         )?;
         let pid = child.id();
@@ -312,6 +323,7 @@ impl LoopRunner {
             script: script.to_path_buf(),
             repo_dir: repo_dir.to_path_buf(),
             model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
             auto_merge,
             quality_assurance,
             log: log.to_path_buf(),
@@ -341,6 +353,7 @@ impl LoopRunner {
         let args = loop_args(
             &worker.repo_dir,
             worker.model.as_deref(),
+            worker.effort.as_deref(),
             worker.auto_merge,
             worker.quality_assurance,
         );
@@ -524,7 +537,7 @@ mod tests {
     #[test]
     fn loop_args_target_repo_and_quiet() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), None, false, true),
+            loop_args(Path::new("/work/repo"), None, None, false, true),
             vec!["--repo-dir", "/work/repo", "--quiet"]
         );
     }
@@ -532,7 +545,7 @@ mod tests {
     #[test]
     fn loop_args_forward_the_model_when_set() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), false, true),
+            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), None, false, true),
             vec!["--repo-dir", "/work/repo", "--quiet", "--model", "gpt-5.4"]
         );
     }
@@ -540,7 +553,37 @@ mod tests {
     #[test]
     fn loop_args_skip_blank_models() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), Some("   "), false, true),
+            loop_args(Path::new("/work/repo"), Some("   "), None, false, true),
+            vec!["--repo-dir", "/work/repo", "--quiet"]
+        );
+    }
+
+    #[test]
+    fn loop_args_forward_the_effort_when_set() {
+        assert_eq!(
+            loop_args(
+                Path::new("/work/repo"),
+                Some("gpt-5.6-luna"),
+                Some("max"),
+                false,
+                true
+            ),
+            vec![
+                "--repo-dir",
+                "/work/repo",
+                "--quiet",
+                "--model",
+                "gpt-5.6-luna",
+                "--effort",
+                "max"
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_args_skip_blank_efforts() {
+        assert_eq!(
+            loop_args(Path::new("/work/repo"), None, Some("  "), false, true),
             vec!["--repo-dir", "/work/repo", "--quiet"]
         );
     }
@@ -548,7 +591,7 @@ mod tests {
     #[test]
     fn loop_args_forward_auto_merge_when_set() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), None, true, true),
+            loop_args(Path::new("/work/repo"), None, None, true, true),
             vec!["--repo-dir", "/work/repo", "--quiet", "--auto-merge"]
         );
     }
@@ -556,7 +599,7 @@ mod tests {
     #[test]
     fn loop_args_combine_model_and_auto_merge() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), true, true),
+            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), None, true, true),
             vec![
                 "--repo-dir",
                 "/work/repo",
@@ -573,7 +616,7 @@ mod tests {
         // QA is on in the loop by default, so nothing is added when on; the flag
         // only appears to turn it off (#162).
         assert_eq!(
-            loop_args(Path::new("/work/repo"), None, false, false),
+            loop_args(Path::new("/work/repo"), None, None, false, false),
             vec![
                 "--repo-dir",
                 "/work/repo",
@@ -586,7 +629,7 @@ mod tests {
     #[test]
     fn loop_args_combine_all_flags() {
         assert_eq!(
-            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), true, false),
+            loop_args(Path::new("/work/repo"), Some("gpt-5.4"), None, true, false),
             vec![
                 "--repo-dir",
                 "/work/repo",
@@ -711,7 +754,7 @@ mod tests {
         log: &Path,
     ) -> u32 {
         for attempt in 1..=50 {
-            match runner.start(id, script, dir, log, None, false, true) {
+            match runner.start(id, script, dir, log, None, None, false, true) {
                 Ok(pid) => return pid,
                 Err(err) if attempt < 50 && is_text_file_busy(&err) => {
                     std::thread::sleep(Duration::from_millis(20));

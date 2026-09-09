@@ -132,6 +132,9 @@
 #   --sleep-minutes <n>      Idle sleep, minutes, when no work     (default: 5)
 #   --repo-dir <dir>         Repository to operate in              (default: current git repo)
 #   --model <model>          Model passed to copilot --model       (default: unset/auto)
+#   --effort <level>         Reasoning effort passed to copilot --effort: none,
+#                            minimal, low, medium, high, xhigh, max
+#                            (default: unset, the model's own default)
 #   --copilot-timeout <dur>  Wall-clock limit for each bot run (issue resolve,
 #                            PR conflict/checks fix, default-branch sync) so a stuck
 #                            run cannot block the loop. Accepts seconds or an
@@ -209,7 +212,8 @@
 #   -V, --version            Print the bot-loop version and exit.
 #
 # Environment variables (equivalent to the flags above):
-#   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
+#   TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_EFFORT,
+#   COPILOT_TIMEOUT,
 #   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
 #   SUMMARY_MODEL, REPORT_SUMMARY,
 #   QUIET, USE_WORKTREES,
@@ -272,6 +276,10 @@ TRIGGER_LABEL="${TRIGGER_LABEL:-}"
 PLAN_LABEL="${PLAN_LABEL:-}"
 SLEEP_MINUTES="${SLEEP_MINUTES:-}"
 COPILOT_MODEL="${COPILOT_MODEL:-}"
+# Reasoning effort for the coding runs, passed to `copilot --effort`. Empty
+# leaves each model on its own default. Copilot does not persist the effort
+# picked in an interactive session, so it has to be set here.
+COPILOT_EFFORT="${COPILOT_EFFORT:-}"
 # Wall-clock limit for each main Copilot run so a stuck run can never block the
 # loop. Read raw here; normalised (to a timeout(1) duration, or empty=disabled)
 # after argument parsing so a flag can still override it. Default 30m; "0"/"off"
@@ -582,6 +590,9 @@ work:
   --sleep-minutes <n>      Idle sleep, in minutes, when no work   (default: 5)
   --repo-dir <dir>         Repository to operate in               (default: current git repo)
   --model <model>          Model passed to copilot --model        (default: unset/auto)
+  --effort <level>         Reasoning effort passed to copilot --effort:
+                           none, minimal, low, medium, high, xhigh, max
+                           (default: unset, the model's own default)
   --copilot-timeout <dur>  Wall-clock limit for each bot run (issue resolve,
                            PR conflict/checks fix, default-branch sync) so a stuck
                            run cannot block the loop. Accepts seconds or an s/m/h/d
@@ -677,7 +688,8 @@ work:
   -V, --version            Print the bot-loop version and exit.
 
 Environment variables (equivalent to the flags above):
-  TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_TIMEOUT,
+  TRIGGER_LABEL, PLAN_LABEL, SLEEP_MINUTES, REPO_DIR, COPILOT_MODEL, COPILOT_EFFORT,
+  COPILOT_TIMEOUT,
   COMMIT_MODEL, TRIAGE_MODEL, TRIAGE_MAP, COST_SAVER, TRIAGE_TIMEOUT_MAP, AGENTS_MODEL, ISSUES_DIR,
   SUMMARY_MODEL, REPORT_SUMMARY,
   QUIET, USE_WORKTREES,
@@ -1431,6 +1443,9 @@ while [ $# -gt 0 ]; do
     --repo-dir=*)      REPO_DIR="${1#*=}" ;;
     --model)           need_arg $# "$1"; COPILOT_MODEL="$2"; shift ;;
     --model=*)         COPILOT_MODEL="${1#*=}" ;;
+    --effort|--reasoning-effort) need_arg $# "$1"; COPILOT_EFFORT="$2"; shift ;;
+    --effort=*)           COPILOT_EFFORT="${1#*=}" ;;
+    --reasoning-effort=*) COPILOT_EFFORT="${1#*=}" ;;
     --copilot-timeout)   need_arg $# "$1"; COPILOT_TIMEOUT="$2"; shift ;;
     --copilot-timeout=*) COPILOT_TIMEOUT="${1#*=}" ;;
     --commit-model)    need_arg $# "$1"; COMMIT_MODEL="$2"; shift ;;
@@ -2380,6 +2395,7 @@ EOF
 )"
     local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+    [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
     log "issue #$num: running copilot to resolve rebase conflicts (log: $log_file)"
     if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
@@ -2794,6 +2810,7 @@ EOF
   # (--resume) so a killed run can be resumed with its context intact (#233).
   copilot_args+=("$(copilot_session_arg "$resume_mode" "$session_id")")
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
+  [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "issue #$num: running copilot (log: $log_file)"
   if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
@@ -3477,6 +3494,7 @@ EOF
   coding_model="$COPILOT_MODEL"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
+  [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "issue #$num: running copilot to draft plan (log: $log_file)"
   if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
@@ -3839,6 +3857,7 @@ EOF
 )"
     local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+    [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
     if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
@@ -3961,6 +3980,7 @@ EOF
 )"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+  [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "PR #$num: running copilot to fix failing checks (log: $log_file)"
   if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
@@ -4305,6 +4325,7 @@ EOF
 )"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+  [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "PR #$num: running copilot to address review comment (log: $log_file)"
   if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
@@ -4574,6 +4595,7 @@ EOF
 )"
   local -a copilot_args=(-p "$prompt" --allow-all-tools --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+  [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   if ! cd "$REPO_DIR" 2>/dev/null; then
     git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true

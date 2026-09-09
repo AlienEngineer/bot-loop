@@ -1036,6 +1036,7 @@ impl App {
             &repo,
             &log,
             model.as_deref(),
+            None,
             self.auto_merge,
             self.quality_assurance,
         ) {
@@ -1058,8 +1059,8 @@ impl App {
     }
 
     /// Spawn background workers according to the automatic-spawn plan from
-    /// `~/.config/bot-loop.yaml`. Each entry in `plan` specifies a model and
-    /// count; this starts exactly that many workers, using each entry's model.
+    /// `~/.config/bot-loop.yaml`. Each entry in `plan` specifies a model,
+    /// reasoning effort, and count; this starts exactly that many workers, using each entry's model.
     /// A missing loop script is reported once and silently skipped for the
     /// remaining entries. Does nothing when the plan is empty.
     pub fn spawn_from_config(&mut self, plan: &[config::SpawnEntry]) {
@@ -1088,6 +1089,7 @@ impl App {
                         &repo,
                         &log,
                         entry.model.as_deref(),
+                        entry.effort.as_deref(),
                         self.auto_merge,
                         self.quality_assurance,
                     )
