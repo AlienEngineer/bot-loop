@@ -3,7 +3,8 @@
 Autonomous loop that pulls labelled GitHub issues, hands each one to the
 [GitHub Copilot CLI](https://github.com/github/copilot-cli) to resolve, and opens
 a pull request — so it works your backlog unattended. Several instances can run
-in parallel against one repository; a GitHub lock keeps them off the same issue.
+in parallel against one repository; a local GitHub lock serializes instances on
+one machine, while GitHub worker labels keep machines off the same issue.
 
 It ships as two commands:
 
@@ -46,8 +47,8 @@ Each pass the loop:
 5. Picks the next issue — one awaiting a human reply (`needs-info` /
    `copilot-failed`), otherwise the oldest open issue with the trigger label
    (`ready`). Issues with an unmet `Wait for: #N` dependency are held back.
-6. Claims it (`in-progress` label, under a GitHub lock so parallel instances
-   never collide).
+6. Claims it (`in-progress` plus a machine-scoped owner label, under a local
+   GitHub lock so instances on one machine never collide).
 7. Creates a branch — and its own worktree — from the latest default branch.
 8. Runs the bot to resolve it, then posts the run's cost as an issue comment.
    Unless disabled, the bot also adds tests from the user's perspective.
@@ -61,6 +62,23 @@ Each pass the loop:
 11. Sweeps merged branches and worktrees, then sleeps if there is no work (press
     `f` to wake it).
 
+### Cross-machine ownership
+
+The local `.copilot-loop/github.lock` only coordinates processes sharing one
+filesystem; it is not a lock between machines. Each loop instance therefore
+claims an issue with a stable `worker:<id>` label. The default ID is the
+normalized hostname. Set `WORKER_ID` explicitly when containers, cloned VMs, or
+other machines do not have unique hostnames.
+
+Ownership stays with the claiming worker while the job is unfinished, including
+when the issue is waiting under `needs-info` or `copilot-failed`. A different
+worker skips it, even after a restart. To deliberately recover or hand off a
+stale job, add the exact `override worker` label to the issue. The next eligible
+worker uses that one-shot override to replace the old `worker:<id>` label and
+then consumes `override worker`; it does not transfer unpushed files from a
+worker that is still running, so stop that worker or let its ownership-loss
+guard prevent publication.
+
 ## Flags
 
 Every option is a command-line flag or the matching environment variable; when
@@ -73,6 +91,7 @@ both are set, the flag wins. `--flag value` and `--flag=value` both work. Run
 | `--plan-label <label>` | `PLAN_LABEL` | `plan` | Label that puts an issue into plan mode: the bot drafts an implementation plan (no code changes), posts it for review, then the issue waits for the trigger label to run the plan. |
 | `--sleep-minutes <n>` | `SLEEP_MINUTES` | `5` | Minutes to sleep when there is no work. Press `f` to wake early. |
 | `--repo-dir <dir>` | `REPO_DIR` | current git repo | Repository to operate in. |
+| — | `WORKER_ID` | normalized hostname | Stable machine/worker identity used in the `worker:<id>` ownership label. Set explicitly when hostnames are shared. |
 | `--model <model>` | `COPILOT_MODEL` | auto | Model passed to `copilot --model`. |
 | `--effort <level>` | `COPILOT_EFFORT` | unset | Reasoning effort passed to `copilot --effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. Unset leaves each model on its own default. Copilot does not persist the effort picked in an interactive session, so it has to be set here. The levels differ per model, and `copilot` exits on one the model does not accept. |
 | `--copilot-timeout <dur>` | `COPILOT_TIMEOUT` | `30m` | Wall-clock limit per bot run so a stuck run cannot block the loop. Seconds, or an `s`/`m`/`h`/`d` suffix (`1800`, `30m`, `2h`); `0`/`off` disables it. |

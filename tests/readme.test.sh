@@ -58,6 +58,9 @@ assert_eq "iteration: picks the ready issue"  "$(has 'ready')" "yes"
 assert_eq "iteration: runs Copilot"           "$(has 'Copilot')" "yes"
 assert_eq "iteration: opens a PR"             "$(has 'PR')" "yes"
 assert_eq "iteration: sleeps when idle"       "$(has 'sleep')" "yes"
+assert_eq "documents cross-machine worker labels" "$(has 'worker:<id>')" "yes"
+assert_eq "documents the one-shot worker override" "$(has 'override worker')" "yes"
+assert_eq "documents unfinished ownership"      "$(has 'copilot-failed')" "yes"
 
 # --- 3. Documents every flag the bash script accepts -------------------------
 assert_eq "has a Flags section" \
@@ -84,6 +87,7 @@ assert_eq "documents --plan-label" "$(has '--plan-label')" "yes"
 # names other tests rely on are surfaced to the reader.
 assert_eq "surfaces AGENTS_MODEL env var"        "$(has 'AGENTS_MODEL')" "yes"
 assert_eq "surfaces TRIAGE_TIMEOUT_MAP env var"  "$(has 'TRIAGE_TIMEOUT_MAP')" "yes"
+assert_eq "surfaces WORKER_ID env var"           "$(has 'WORKER_ID')" "yes"
 
 # --- The four user-facing sections ------------------------------------------
 assert_eq "has exactly four top-level sections" \

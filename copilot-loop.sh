@@ -8,8 +8,10 @@
 #
 # MULTI-INSTANCE SUPPORT: Multiple instances of this script can run concurrently
 # without interfering with each other. Each instance will work on a different issue,
-# and synchronization is handled via a GitHub lock file (.copilot-loop/github.lock)
-# that protects issue selection and claiming operations. This allows you to:
+# and synchronization is handled by a local GitHub lock file
+# (.copilot-loop/github.lock) plus stable worker labels on GitHub. The local lock
+# only coordinates instances on one machine; worker:<id> labels keep an issue
+# owned by the machine that claimed it. This allows you to:
 # - Run multiple instances on the same machine (with different REPO_DIR)
 # - Run multiple instances in parallel for the same repository
 # - Use git worktrees for each instance to avoid file system conflicts
@@ -62,8 +64,9 @@
 #      Issues that declare a dependency ("Wait for: #N" in the body) are held
 #      back (and labelled "pending" while they wait) until every issue they name
 #      is closed (see "Issue dependencies: Wait for: #N" further down).
-#   3. Claim it: add "in-progress", remove the trigger/"needs-info" labels
-#      (done atomically by the claiming functions to prevent race conditions).
+#   3. Claim it: add "in-progress", the current worker:<id> owner label, and a
+#      task-kind marker; remove the trigger/"needs-info" labels (done while
+#      holding the local lock, with a GitHub read-back to prevent stale claims).
 #   4. Create a fresh branch for the issue, based on the latest default branch.
 #      The default branch (main/master) is never checked out for the work; by
 #      default each issue also runs in its own git worktree (a different folder)
@@ -220,6 +223,9 @@
 #   VERBOSE,
 #   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH,
 #   AUTO_FIX
+#   WORKER_ID (env-only): stable machine/worker identity used in worker:<id>
+#   ownership labels; defaults to the normalized hostname. Set it explicitly
+#   when multiple machines share a hostname (for example, containers).
 # Plus BOT_LOOP_REPO / BOT_LOOP_EMAIL (env-only, no flag): the repo auto-fix files
 # loop-crash reports against (default AlienEngineer/bot-loop) and the maintainer
 # address it emails when you cannot push there (default aimirim.software@gmail.com).
@@ -268,6 +274,7 @@ SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)/$(basename "$S
 # --repo-dir can still influence the derived paths (ISSUES_DIR, WORK_DIR, ...).
 REPO_DIR="${REPO_DIR:-}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-}"
+WORKER_ID="${WORKER_ID:-}"
 # Label that puts an issue into plan mode: instead of implementing it straight
 # away the loop asks Copilot for an implementation plan (no code changes), posts
 # it for review, and waits for the user to add the trigger label to run it. Read
@@ -425,6 +432,18 @@ INPROGRESS_LABEL="in-progress"
 DONE_LABEL="copilot-done"
 FAILED_LABEL="copilot-failed"
 NEEDS_INFO_LABEL="needs-info"
+# Adding this label is an explicit, one-shot handoff to another worker. The
+# claiming worker consumes it after it has verified its ownership.
+OVERRIDE_WORKER_LABEL="override worker"
+# Ownership and task labels are the cross-machine source of truth. Worker IDs
+# are normalized before they are put in a label so the label remains bounded and
+# safe to use with GitHub's label API.
+WORKER_LABEL_PREFIX="worker:"
+TASK_LABEL_PREFIX="bot-loop:task:"
+TASK_PROCESS_LABEL="${TASK_LABEL_PREFIX}process"
+TASK_PLAN_LABEL="${TASK_LABEL_PREFIX}plan"
+TASK_REPLY_LABEL="${TASK_LABEL_PREFIX}reply"
+WORKER_LABEL=""
 # Marks an open issue held back because it declares a still-open dependency
 # ("Wait for: #N"), so the wait is visible in GitHub. Reconciled every pass and
 # removed once every dependency closes (or the issue is claimed for work).
@@ -521,6 +540,352 @@ ensure_label() {
   local name="$1" color="$2" desc="$3"
   gh label create "$name" --color "$color" --description "$desc" >/dev/null 2>&1 || true
 }
+
+# >>> worker-ownership helpers >>>
+# Convert a worker identity into the bounded token used in a GitHub label. The
+# hostname is only a default; WORKER_ID is the stable escape hatch for containers
+# and machines whose hostnames are not unique.
+normalize_worker_id() {
+  local raw="${1:-}" normalized
+  normalized="$(printf '%s' "$raw" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+  [ -n "$normalized" ] || normalized="unknown"
+  normalized="${normalized:0:40}"
+  normalized="$(printf '%s' "$normalized" | sed -E 's/-+$//')"
+  [ -n "$normalized" ] || normalized="unknown"
+  printf '%s' "$normalized"
+}
+
+worker_label_for_id() {
+  printf '%s%s' "${WORKER_LABEL_PREFIX:-worker:}" "$(normalize_worker_id "${1:-}")"
+}
+
+worker_task_label() {
+  case "${1:-}" in
+    process) printf '%s' "${TASK_PROCESS_LABEL:-${TASK_LABEL_PREFIX:-bot-loop:task:}process}" ;;
+    plan)    printf '%s' "${TASK_PLAN_LABEL:-${TASK_LABEL_PREFIX:-bot-loop:task:}plan}" ;;
+    reply)   printf '%s' "${TASK_REPLY_LABEL:-${TASK_LABEL_PREFIX:-bot-loop:task:}reply}" ;;
+    *)       return 1 ;;
+  esac
+}
+
+# Labels are joined with ASCII unit separators so spaces in labels (notably
+# "override worker") remain unambiguous without putting JSON in every queue
+# record. GitHub labels cannot contain this control character.
+label_list_has() {
+  local labels="${1:-}" wanted="${2:-}" label found=1
+  while IFS= read -r label; do
+    [ "$label" = "$wanted" ] && found=0
+  done < <(printf '%s\n' "$labels" | tr '\037' '\n')
+  return "$found"
+}
+
+worker_owner_labels() {
+  local labels="${1:-}" label
+  while IFS= read -r label; do
+    case "$label" in
+      "${WORKER_LABEL_PREFIX:-worker:}"*) printf '%s\n' "$label" ;;
+    esac
+  done < <(printf '%s\n' "$labels" | tr '\037' '\n')
+}
+
+worker_owner_label() {
+  worker_owner_labels "${1:-}" | head -n1
+}
+
+worker_task_kind() {
+  local labels="${1:-}" label suffix found=""
+  while IFS= read -r label; do
+    case "$label" in
+      "${TASK_LABEL_PREFIX:-bot-loop:task:}"*)
+        suffix="${label#${TASK_LABEL_PREFIX:-bot-loop:task:}}"
+        case "$suffix" in
+          process|plan|reply) [ -z "$found" ] && found="$suffix" ;;
+        esac
+        ;;
+    esac
+  done < <(printf '%s\n' "$labels" | tr '\037' '\n')
+  [ -n "$found" ] && printf '%s' "$found"
+  [ -n "$found" ]
+}
+
+worker_task_labels() {
+  local labels="${1:-}" label
+  while IFS= read -r label; do
+    case "$label" in
+      "${TASK_LABEL_PREFIX:-bot-loop:task:}"process|\
+      "${TASK_LABEL_PREFIX:-bot-loop:task:}"plan|\
+      "${TASK_LABEL_PREFIX:-bot-loop:task:}"reply)
+        printf '%s\n' "$label" ;;
+    esac
+  done < <(printf '%s\n' "$labels" | tr '\037' '\n')
+}
+
+extract_model_tag_from_label_names() {
+  local labels="${1:-}" label found=""
+  while IFS= read -r label; do
+    case "$label" in
+      model:*) [ -z "$found" ] && found="${label#model:}" ;;
+    esac
+  done < <(printf '%s\n' "$labels" | tr '\037' '\n')
+  printf '%s' "$found"
+  return 0
+}
+
+# Fetch the complete current label set immediately before a claim or lifecycle
+# transition. The exit status matters: an API failure must never look like an
+# unlabelled issue that is safe to claim.
+issue_labels_names() {
+  local num="$1"
+  gh issue view "$num" --json labels \
+    --jq '[.labels[].name] | join("\u001f")' 2>/dev/null
+}
+
+worker_current_label() {
+  if [ -n "${WORKER_LABEL:-}" ]; then
+    printf '%s' "$WORKER_LABEL"
+  else
+    worker_label_for_id "${WORKER_ID:-unknown}"
+  fi
+}
+
+# True when this worker is the sole remote owner, regardless of whether the
+# issue is currently marked in-progress. Unfinished transitions use this guard
+# after removing in-progress; publication uses worker_owns_label_set below.
+worker_has_exclusive_ownership() {
+  local labels="${1:-}" owners current
+  owners="$(worker_owner_labels "$labels")"
+  current="$(worker_current_label)"
+  [ -n "$owners" ] || return 1
+  [ "$(printf '%s\n' "$owners" | wc -l | tr -d ' ')" = 1 ] || return 1
+  [ "$owners" = "$current" ]
+}
+
+# True only when the label set has exactly one owner, that owner is this worker,
+# and the issue is still in-progress. This is the guard used before publishing
+# or changing labels after a potentially long Copilot run.
+worker_owns_label_set() {
+  local labels="${1:-}"
+  worker_has_exclusive_ownership "$labels" \
+    && label_list_has "$labels" "$INPROGRESS_LABEL"
+}
+
+worker_owns_issue() {
+  local num="$1" labels
+  labels="$(issue_labels_names "$num")" || return 1
+  worker_owns_label_set "$labels"
+}
+
+# Decide whether the current worker may claim a freshly queued issue. An
+# in-progress issue without a task marker is legacy/unknown-owned and remains
+# blocked even when override worker is present; there is no safe way to know
+# which handler should receive it.
+worker_claim_decision() {
+  local labels="${1:-}" kind="${2:-}" current owner task owners
+  current="$(worker_current_label)"
+  owners="$(worker_owner_labels "$labels")"
+  owner="$(worker_owner_label "$labels")"
+  task="$(worker_task_kind "$labels" 2>/dev/null || true)"
+
+  if [ "$(printf '%s\n' "$owners" | sed '/^$/d' | wc -l | tr -d ' ')" -gt 1 ] 2>/dev/null \
+     && ! label_list_has "$labels" "$OVERRIDE_WORKER_LABEL"; then
+    printf 'skip'
+    return 0
+  fi
+  if label_list_has "$labels" "$INPROGRESS_LABEL"; then
+    if ! label_list_has "$labels" "$OVERRIDE_WORKER_LABEL"; then
+      printf 'skip'
+      return 0
+    fi
+    [ -n "$task" ] && [ "$task" = "$kind" ] || {
+      printf 'skip'
+      return 0
+    }
+    printf 'takeover'
+    return 0
+  fi
+
+  if [ -n "$owner" ] && [ "$owner" != "$current" ] \
+     && ! label_list_has "$labels" "$OVERRIDE_WORKER_LABEL"; then
+    printf 'skip'
+    return 0
+  fi
+  if label_list_has "$labels" "$OVERRIDE_WORKER_LABEL"; then
+    printf 'takeover'
+  else
+    printf 'claim'
+  fi
+}
+
+# Claim one issue and verify the result. The queue record is deliberately only a
+# hint: labels are fetched again under the GitHub lock immediately before the edit
+# so a stale list response cannot cause a foreign-owned issue to be dispatched.
+claim_issue_ownership() {
+  local num="$1" kind="$2" candidate_labels="${3:-}" labels decision expected_task
+  local owner task old verified prior_owners
+  local -a edit_args=()
+
+  expected_task="$(worker_task_label "$kind")" || return 1
+  if ! labels="$(issue_labels_names "$num")"; then
+    log "issue #$num: could not re-read labels before claiming; skipping" >&2
+    return 1
+  fi
+  # A mocked or cached queue may not expose labels in its first record. The
+  # freshly-read set above is authoritative; candidate_labels is intentionally
+  # unused after the race-safe re-read.
+  : "$candidate_labels"
+  decision="$(worker_claim_decision "$labels" "$kind")"
+  if [ "$decision" = "skip" ]; then
+    owner="$(worker_owner_label "$labels")"
+    log "issue #$num: owned by ${owner:-an unknown worker}; skipping" >&2
+    return 1
+  fi
+  if [ "$decision" = "takeover" ]; then
+    log "issue #$num: '$OVERRIDE_WORKER_LABEL' takeover selected for '$kind' work" >&2
+  fi
+
+  task="$(worker_task_kind "$labels" 2>/dev/null || true)"
+  prior_owners="$(worker_owner_labels "$labels")"
+  edit_args+=(--add-label "$INPROGRESS_LABEL" --add-label "$(worker_current_label)" \
+              --add-label "$expected_task")
+  case "$kind" in
+    process)
+      edit_args+=(--remove-label "$TRIGGER_LABEL"
+                  --remove-label "$NEEDS_INFO_LABEL"
+                  --remove-label "$FAILED_LABEL"
+                  --remove-label "$PLAN_REVIEW_LABEL") ;;
+    plan)
+      edit_args+=(--remove-label "$PLAN_LABEL") ;;
+    reply)
+      edit_args+=(--remove-label "$NEEDS_INFO_LABEL"
+                  --remove-label "$FAILED_LABEL") ;;
+  esac
+  edit_args+=(--remove-label "$PENDING_LABEL")
+
+  # A takeover replaces every foreign owner, but it does so in two phases. The
+  # first edit adds this worker without deleting the previous owner; if the
+  # read-back is not exactly the expected tentative state, cleanup can remove
+  # only this worker's label and leave the old owner untouched.
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    [ "$old" = "$expected_task" ] && continue
+    edit_args+=(--remove-label "$old")
+  done < <(worker_task_labels "$labels")
+
+  if ! gh issue edit "$num" "${edit_args[@]}" >/dev/null 2>&1; then
+    log "issue #$num: GitHub rejected the ownership claim; skipping" >&2
+    return 1
+  fi
+
+  if ! verified="$(issue_labels_names "$num")" \
+     || ! label_list_has "$verified" "$(worker_current_label)" \
+     || ! label_list_has "$verified" "$INPROGRESS_LABEL" \
+     || ! label_list_has "$verified" "$expected_task"; then
+    # Never remove another worker's label while recovering from a failed
+    # verification. Only this worker's tentative label is safe to clean up.
+    gh issue edit "$num" --remove-label "$(worker_current_label)" >/dev/null 2>&1 || true
+    log "issue #$num: ownership verification failed after claim; not dispatching" >&2
+    return 1
+  fi
+  if [ "$decision" = "takeover" ]; then
+    # Remove only the owners observed in the read-before-claim snapshot, and
+    # only when they are still present in the read-back. A concurrent takeover
+    # is therefore never clobbered by stale cleanup.
+    local -a old_owner_args=(--remove-label "$OVERRIDE_WORKER_LABEL")
+    if ! label_list_has "$verified" "$OVERRIDE_WORKER_LABEL"; then
+      gh issue edit "$num" --remove-label "$(worker_current_label)" >/dev/null 2>&1 || true
+      log "issue #$num: override disappeared during takeover; not dispatching" >&2
+      return 1
+    fi
+    while IFS= read -r old; do
+      [ -n "$old" ] || continue
+      [ "$old" = "$(worker_current_label)" ] && continue
+      label_list_has "$verified" "$old" || {
+        gh issue edit "$num" --remove-label "$(worker_current_label)" >/dev/null 2>&1 || true
+        log "issue #$num: previous owner changed during takeover; not dispatching" >&2
+        return 1
+      }
+      old_owner_args+=(--remove-label "$old")
+    done <<< "$prior_owners"
+    if [ "${#old_owner_args[@]}" -gt 0 ] \
+       && ! gh issue edit "$num" "${old_owner_args[@]}" >/dev/null 2>&1; then
+      gh issue edit "$num" --remove-label "$(worker_current_label)" >/dev/null 2>&1 || true
+      log "issue #$num: could not replace the previous owner; not dispatching" >&2
+      return 1
+    fi
+    if ! verified="$(issue_labels_names "$num")" \
+       || ! worker_owns_label_set "$verified" \
+       || ! label_list_has "$verified" "$expected_task"; then
+      gh issue edit "$num" --remove-label "$(worker_current_label)" >/dev/null 2>&1 || true
+      log "issue #$num: takeover verification failed; not dispatching" >&2
+      return 1
+    fi
+  elif ! worker_owns_label_set "$verified"; then
+    gh issue edit "$num" --remove-label "$(worker_current_label)" >/dev/null 2>&1 || true
+    log "issue #$num: ownership verification failed after claim; not dispatching" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Apply an unfinished transition (question/failure) while retaining ownership
+# and the task marker. The second label read prevents an old worker from removing
+# in-progress after an override takeover.
+worker_mark_unfinished() {
+  local num="$1" label="$2" labels
+  labels="$(issue_labels_names "$num")" || return 1
+  worker_owns_label_set "$labels" || return 1
+  gh issue edit "$num" --add-label "$label" --remove-label "$INPROGRESS_LABEL" \
+    >/dev/null 2>&1 || return 1
+  if ! labels="$(issue_labels_names "$num")" \
+     || ! worker_has_exclusive_ownership "$labels" \
+     || ! label_list_has "$labels" "$label" \
+     || [ -z "$(worker_task_kind "$labels" 2>/dev/null || true)" ]; then
+    log "issue #$num: ownership changed while recording '$label'; leaving remote labels untouched"
+    return 1
+  fi
+  return 0
+}
+
+# Terminal transitions release only this worker's ownership. A foreign/stale
+# owner is never cleaned up automatically; the operator must add override worker.
+worker_release_issue() {
+  local num="$1" terminal_label="${2:-}" labels old
+  local -a edit_args=()
+  labels="$(issue_labels_names "$num")" || return 1
+  worker_owns_label_set "$labels" || return 1
+  [ -n "$terminal_label" ] && edit_args+=(--add-label "$terminal_label")
+  edit_args+=(--remove-label "$INPROGRESS_LABEL"
+              --remove-label "$(worker_current_label)"
+              --remove-label "$OVERRIDE_WORKER_LABEL")
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    edit_args+=(--remove-label "$old")
+  done < <(worker_task_labels "$labels")
+  gh issue edit "$num" "${edit_args[@]}" >/dev/null 2>&1 || return 1
+  if ! labels="$(issue_labels_names "$num")" \
+     || { [ -n "$terminal_label" ] && ! label_list_has "$labels" "$terminal_label"; } \
+     || [ -n "$(worker_owner_labels "$labels")" ] \
+     || label_list_has "$labels" "$INPROGRESS_LABEL" \
+     || [ -n "$(worker_task_kind "$labels" 2>/dev/null || true)" ]; then
+    log "issue #$num: ownership changed before terminal cleanup completed"
+    return 1
+  fi
+  return 0
+}
+
+# Emit NUL-delimited issue records: number, body, and the complete label set.
+# The caller supplies a GitHub label used for the server-side queue scan. A
+# second scan for OVERRIDE_WORKER_LABEL makes override-only in-progress issues
+# visible even though the original queue label was removed at claim time.
+issue_queue_records() {
+  local queue_label="$1"
+  gh issue list --state open --label "$queue_label" --limit 1000 \
+    --json number,body,labels \
+    --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000" + ([.labels[].name] | join("\u001f")) + "\u0000"] | join("")' 2>/dev/null
+}
+# <<< worker-ownership helpers <<<
 
 # >>> gh-host helpers >>>
 # Echo the hostname embedded in a git remote URL, for both SSH and HTTPS forms:
@@ -695,7 +1060,7 @@ Environment variables (equivalent to the flags above):
   QUIET, USE_WORKTREES,
   VERBOSE,
   AUTO_MERGE, QUALITY_ASSURANCE, MERGE_METHOD, CLEANUP_MERGED, DELETE_REMOTE_BRANCH,
-  AUTO_FIX, BOT_LOOP_REPO, BOT_LOOP_EMAIL
+  AUTO_FIX, BOT_LOOP_REPO, BOT_LOOP_EMAIL, WORKER_ID
 EOF
 }
 
@@ -1497,6 +1862,11 @@ done
 # so running from a subdirectory still targets the whole repo.
 REPO_DIR="${REPO_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 TRIGGER_LABEL="${TRIGGER_LABEL:-ready}"
+if [ -z "$WORKER_ID" ]; then
+  WORKER_ID="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown')"
+fi
+WORKER_ID="$(normalize_worker_id "$WORKER_ID")"
+WORKER_LABEL="$(worker_label_for_id "$WORKER_ID")"
 # Label that routes an issue through plan mode before it is implemented. Kept
 # distinct from the trigger label so the same issue can be planned first
 # (labelled PLAN_LABEL) and then run (labelled TRIGGER_LABEL) after review.
@@ -1864,6 +2234,7 @@ log "  origin url:  $ORIGIN_URL"
 log "  local dir:   $REPO_DIR"
 log "============================================================"
 log "default_branch=$DEFAULT_BRANCH trigger_label=$TRIGGER_LABEL plan_label=$PLAN_LABEL sleep=${SLEEP_MINUTES}m"
+log "worker_id=$WORKER_ID worker_label=$WORKER_LABEL (override with '$OVERRIDE_WORKER_LABEL')"
 if [ "$USE_WORKTREES" = 1 ]; then
   log "isolation: per-issue git worktrees under $WORKTREE_BASE (default branch never checked out)"
 else
@@ -1917,6 +2288,11 @@ ensure_label "$DONE_LABEL"       "1d76db" "A PR was opened by the bot loop"
 ensure_label "$FAILED_LABEL"     "b60205" "The bot loop failed to produce changes"
 ensure_label "$NEEDS_INFO_LABEL" "d93f0b" "Waiting for the issue author to answer a question"
 ensure_label "$PENDING_LABEL"    "d4c5f9" "Waiting for another issue to be resolved before it can start"
+ensure_label "$OVERRIDE_WORKER_LABEL" "b60205" "Allow another bot-loop worker to take over this issue once"
+ensure_label "$WORKER_LABEL" "0366d6" "Machine that owns the bot-loop issue job"
+ensure_label "$TASK_PROCESS_LABEL" "0366d6" "bot-loop issue implementation task marker"
+ensure_label "$TASK_PLAN_LABEL" "0366d6" "bot-loop issue planning task marker"
+ensure_label "$TASK_REPLY_LABEL" "0366d6" "bot-loop issue reply task marker"
 ensure_label "$CONFLICT_UNRESOLVED_LABEL" "b60205" "The bot loop could not resolve this PR's merge conflicts"
 ensure_label "$CHECKS_UNRESOLVED_LABEL" "b60205" "The bot loop could not fix this PR's failing checks"
 
@@ -2479,10 +2855,11 @@ _resume_marker_path() {
 }
 
 # Drop a resume marker for issue <num> recording the Copilot session id, work
-# branch, owning loop pid and log file, so a later start can resume the session.
+# branch, owning loop pid, worker identity, task kind and log file, so a later
+# start can resume the session only on the machine that owns the issue.
 # Best-effort: a write failure never affects the run.
 write_resume_marker() {
-  local num="$1" session_id="$2" branch="$3" log_file="${4:-}"
+  local num="$1" session_id="$2" branch="$3" log_file="${4:-}" task_kind="${5:-process}"
   local dir; dir="${RESUME_DIR:-${WORK_DIR:-.}/resume}"
   mkdir -p "$dir" 2>/dev/null || true
   {
@@ -2490,6 +2867,8 @@ write_resume_marker() {
     printf 'SESSION_ID=%s\n' "$session_id"
     printf 'BRANCH=%s\n' "$branch"
     printf 'PID=%s\n' "$$"
+    printf 'WORKER_ID=%s\n' "${WORKER_ID:-}"
+    printf 'TASK_KIND=%s\n' "$task_kind"
     printf 'LOG=%s\n' "$log_file"
   } >"$(_resume_marker_path "$num")" 2>/dev/null || true
 }
@@ -2507,13 +2886,39 @@ resume_marker_field() {
   sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n1
 }
 
-# Decide what to do with an interrupted-run marker at startup from two booleans:
-# whether the owning loop process is still alive, and whether the issue is still
-# labelled in-progress. Echoes: skip (a live peer still owns it), resume (owner
-# gone, issue still in-progress), or drop (owner gone, issue already moved on so
-# the marker is stale). Pure.
+# Decide what to do with an interrupted-run marker at startup. The first two
+# arguments retain the original liveness/state decision; optional worker/owner
+# arguments prevent a marker from another machine or an overridden issue from
+# being resumed locally. Echoes skip, resume, or drop. Pure.
 resume_marker_action() {
   local owner_alive="${1:-0}" in_progress="${2:-0}"
+  local marker_worker="${3:-}" current_worker="${4:-}" remote_owner="${5:-}"
+  local remote_labels="${6:-}" remote_owner_count
+  if [ -n "$marker_worker" ] && [ -n "$current_worker" ] \
+     && [ "$marker_worker" != "$current_worker" ]; then
+    printf 'drop'
+    return 0
+  fi
+  if [ -n "$remote_labels" ]; then
+    if label_list_has "$remote_labels" "$OVERRIDE_WORKER_LABEL"; then
+      printf 'drop'
+      return 0
+    fi
+    remote_owner_count="$(worker_owner_labels "$remote_labels" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ -n "$current_worker" ] && [ "$remote_owner_count" != 1 ]; then
+      printf 'drop'
+      return 0
+    fi
+  fi
+  if [ -n "$current_worker" ] && [ -z "$remote_owner" ]; then
+    printf 'drop'
+    return 0
+  fi
+  if [ -n "$remote_owner" ] && [ -n "$current_worker" ] \
+     && [ "$remote_owner" != "$(worker_label_for_id "$current_worker")" ]; then
+    printf 'drop'
+    return 0
+  fi
   if [ "$owner_alive" = 1 ]; then printf 'skip'; return 0; fi
   if [ "$in_progress" = 1 ]; then printf 'resume'; else printf 'drop'; fi
 }
@@ -2631,13 +3036,15 @@ EOF
 resume_interrupted_issues() {
   local dir; dir="${RESUME_DIR:-${WORK_DIR:-.}/resume}"
   [ -d "$dir" ] || return 0
-  local f num session_id branch owner_pid owner_alive in_progress action
+  local f num session_id branch owner_pid marker_worker task_kind owner_alive in_progress action labels owner
   for f in "$dir"/issue-*.env; do
     [ -e "$f" ] || continue
     num="$(resume_marker_field "$f" NUM)"
     session_id="$(resume_marker_field "$f" SESSION_ID)"
     branch="$(resume_marker_field "$f" BRANCH)"
     owner_pid="$(resume_marker_field "$f" PID)"
+    marker_worker="$(resume_marker_field "$f" WORKER_ID)"
+    task_kind="$(resume_marker_field "$f" TASK_KIND)"
     if [ -z "$num" ] || [ -z "$session_id" ]; then
       rm -f "$f" 2>/dev/null || true
       continue
@@ -2646,20 +3053,34 @@ resume_interrupted_issues() {
     if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
       owner_alive=1
     fi
-    in_progress=0
-    if issue_has_label "$num" "$INPROGRESS_LABEL"; then
-      in_progress=1
+    if command -v issue_labels_names >/dev/null 2>&1; then
+      if ! labels="$(issue_labels_names "$num")"; then
+        log "issue #$num: could not read ownership for resume marker; leaving it for a later pass"
+        continue
+      fi
+      in_progress=0
+      if label_list_has "$labels" "$INPROGRESS_LABEL"; then
+        in_progress=1
+      fi
+      owner="$(worker_owner_label "$labels")"
+      action="$(resume_marker_action "$owner_alive" "$in_progress" "$marker_worker" \
+        "${WORKER_ID:-}" "$owner" "$labels")"
+    else
+      # Backward-compatible extraction path for the standalone resume helper
+      # fixtures; the full loop always uses the ownership-aware branch above.
+      in_progress=0
+      issue_has_label "$num" "$INPROGRESS_LABEL" && in_progress=1
+      action="$(resume_marker_action "$owner_alive" "$in_progress")"
     fi
-    action="$(resume_marker_action "$owner_alive" "$in_progress")"
     case "$action" in
       skip)
         log "issue #$num: interrupted Copilot session $session_id still owned by live pid $owner_pid; leaving it" ;;
       drop)
-        log "issue #$num: stale resume marker (issue no longer in-progress); discarding"
+        log "issue #$num: resume marker is stale, foreign-owned, or overridden; discarding"
         rm -f "$f" 2>/dev/null || true ;;
       resume)
         log "issue #$num: resuming interrupted Copilot session $session_id (was pid ${owner_pid:-unknown})"
-        RESUME_SESSION_ID="$session_id" RESUME_BRANCH="$branch" \
+        RESUME_SESSION_ID="$session_id" RESUME_BRANCH="$branch" RESUME_TASK_KIND="${task_kind:-process}" \
           guard "issue #$num (resume)" process_issue "$num" || true ;;
     esac
   done
@@ -2671,6 +3092,7 @@ process_issue() {
   local num="$1"
   local title body slug branch commit_msg commit_text commit_out pr_body log_file ahead pr_url
   local question_file comments comments_block qa_block plan_block model_label
+  local task_kind="${RESUME_TASK_KIND:-process}"
 
   # One API round-trip for everything we need from the issue (title, body, and
   # the comment thread) instead of three separate `gh issue view` calls. Fields
@@ -2689,6 +3111,15 @@ process_issue() {
   # panel shows the branch creation and the rest of the loop's narration, not
   # just Copilot's transcript (#126). Cleared at the top of the main loop.
   CURRENT_RUN_LOG="$log_file"
+
+  # A claim is verified before dispatch, but a resumed marker can enter here
+  # without a fresh claim. Refuse both paths when the issue is no longer solely
+  # owned by this worker.
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before work started; abandoning local run"
+    return 2
+  fi
 
   # Resume support (#233): pin a known Copilot session UUID for this run so an
   # interrupted run can later be continued with --resume. In resume mode (driven
@@ -2866,6 +3297,12 @@ EOF
   [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "issue #$num: running copilot (log: $log_file)"
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before handing off to copilot"
+    cleanup_workspace "$branch"
+    return 2
+  fi
   if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
     _fail_issue "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run (refusing to edit $REPO_DIR)"
     return 1
@@ -2873,7 +3310,7 @@ EOF
   # Mark this run resumable while Copilot is live: if the bot is killed now the
   # marker survives and the next start resumes this exact session (#233). It is
   # cleared the instant Copilot returns, so only an interruption leaves it behind.
-  write_resume_marker "$num" "$session_id" "$branch" "$log_file"
+  write_resume_marker "$num" "$session_id" "$branch" "$log_file" "$task_kind"
   run_copilot "$log_file" "${copilot_args[@]}"
   local copilot_rc=$COPILOT_RC
   clear_resume_marker "$num"
@@ -2897,6 +3334,13 @@ EOF
   if [ -s "$question_file" ]; then
     _ask_issue "$num" "$question_file"
     return 0
+  fi
+
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost after copilot; refusing to publish local changes"
+    cleanup_workspace "$branch"
+    return 2
   fi
 
   # Stage everything Copilot produced. It is told not to commit, but if it did
@@ -2972,10 +3416,22 @@ EOF
       _fail_issue "$num" "$log_file" "no commits to open a PR with after syncing with ${DEFAULT_BRANCH}"
       return 1
     fi
+    if command -v worker_owns_issue >/dev/null 2>&1 \
+       && ! worker_owns_issue "$num"; then
+      log "issue #$num: ownership was lost before pushing; abandoning local branch"
+      cleanup_workspace "$branch"
+      return 2
+    fi
     log "issue #$num: $ahead commit(s), pushing branch $branch"
     if ! git -C "$WORKSPACE_DIR" push -u origin "$branch" >>"$log_file" 2>&1; then
       _fail_issue "$num" "$log_file" "git push failed"
       return 1
+    fi
+    if command -v worker_owns_issue >/dev/null 2>&1 \
+       && ! worker_owns_issue "$num"; then
+      log "issue #$num: ownership was lost before opening the PR; leaving labels untouched"
+      cleanup_workspace "$branch"
+      return 2
     fi
     local -a pr_create_args=(--base "$DEFAULT_BRANCH" --head "$branch"
                              --title "$commit_msg" --body "$pr_body")
@@ -2998,7 +3454,16 @@ EOF
       return 1
     fi
     try_auto_merge "$pr_url" "$num" "$log_file"
-    gh issue edit "$num" --add-label "$DONE_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
+    if command -v worker_release_issue >/dev/null 2>&1; then
+      if ! worker_release_issue "$num" "$DONE_LABEL"; then
+        log "issue #$num: ownership was lost before terminal cleanup; leaving the new owner's labels untouched"
+        cleanup_workspace "$branch"
+        return 2
+      fi
+    else
+      gh issue edit "$num" --add-label "$DONE_LABEL" --remove-label "$INPROGRESS_LABEL" \
+        >/dev/null 2>&1
+    fi
     log "issue #$num: DONE -> $pr_url"
     # Post a short "what was done" summary on the issue, written from this run's
     # session log by the light SUMMARY_MODEL (#161/#217). Best-effort and after the
@@ -3025,6 +3490,12 @@ EOF
 # it for a fresh attempt (see claim_next_reply_issue).
 _fail_issue() {
   local num="$1" log_file="$2" reason="$3" details="${4:-}"
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before recording failure; leaving labels untouched"
+    cleanup_workspace "$branch"
+    return 2
+  fi
   # Prefer explicit details (the exact failing command's output) over the raw
   # log tail, which is mostly Copilot chatter and buries the real cause.
   local block
@@ -3042,7 +3513,15 @@ _fail_issue() {
 
   # Stop here: mark the issue failed instead of re-queuing it, so a repeatedly
   # failing issue can never be retried in an endless loop.
-  gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
+  if command -v worker_mark_unfinished >/dev/null 2>&1; then
+    if ! worker_mark_unfinished "$num" "$FAILED_LABEL"; then
+      log "issue #$num: ownership changed while recording failure; leaving labels untouched"
+      cleanup_workspace "$branch"
+      return 2
+    fi
+  else
+    gh issue edit "$num" --add-label "$FAILED_LABEL" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1
+  fi
   cleanup_workspace "$branch"
 }
 
@@ -3439,13 +3918,30 @@ _fail_pr_checks() {
 # >>> needs-info helpers >>>
 _ask_issue() {
   local num="$1" qf="$2" question
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before asking for more information; leaving labels untouched"
+    rm -f "$qf"
+    cleanup_workspace "$branch"
+    return 2
+  fi
   question="$(sanitize_paths_for_display <"$qf" 2>/dev/null)"
   log "issue #$num: needs more info, asking the user on the issue"
   gh issue comment "$num" \
     --body "$(printf '**bot-loop needs more information to continue:**\n\n%s\n\n%s' \
       "$question" "$QUESTION_MARKER")" >/dev/null 2>&1 || true
-  gh issue edit "$num" --add-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
-  gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  if command -v worker_mark_unfinished >/dev/null 2>&1 \
+     && ! worker_mark_unfinished "$num" "$NEEDS_INFO_LABEL"; then
+    log "issue #$num: ownership changed while recording needs-info; leaving labels untouched"
+    rm -f "$qf"
+    cleanup_workspace "$branch"
+    return 2
+  elif ! command -v worker_mark_unfinished >/dev/null 2>&1; then
+    # Keep extracted legacy fixtures and standalone helper users working; the
+    # full loop always has worker_mark_unfinished available.
+    gh issue edit "$num" --add-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
+    gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  fi
   rm -f "$qf"
   cleanup_workspace "$branch"
 }
@@ -3507,6 +4003,12 @@ plan_issue() {
   log_file="$LOG_DIR/issue-${num}-plan-$(date '+%Y%m%d-%H%M%S').log"
   CURRENT_RUN_LOG="$log_file"
 
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before planning; abandoning local run"
+    return 2
+  fi
+
   # Publish which issue this worker (pid) is on so the TUI can show its pid on
   # that issue's row while it drafts the plan (#214).
   set_worker_issue "$num"
@@ -3564,6 +4066,12 @@ EOF
   [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "issue #$num: running copilot to draft plan (log: $log_file)"
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before handing off the plan"
+    cleanup_workspace "$branch"
+    return 2
+  fi
   if ! cd "$WORKSPACE_DIR" 2>/dev/null; then
     _fail_issue "$num" "$log_file" "workspace '$WORKSPACE_DIR' vanished before copilot could run"
     return 1
@@ -3586,12 +4094,21 @@ EOF
   fi
 
   plan="$(sanitize_paths_for_display <"$plan_file" 2>/dev/null)"
+  if command -v worker_owns_issue >/dev/null 2>&1 \
+     && ! worker_owns_issue "$num"; then
+    log "issue #$num: ownership was lost before posting the plan; leaving labels untouched"
+    cleanup_workspace "$branch"
+    return 2
+  fi
   log "issue #$num: plan drafted, posting for review"
   # shellcheck disable=SC2016  # %s/\n are printf specifiers, single quotes intended
   gh issue comment "$num" --body "$(printf '**bot-loop drafted an implementation plan for this issue.**\n\nReview the plan below. When you are happy with it, add the `%s` label and the loop will implement it. To change the plan, leave a comment with your adjustments before adding `%s` — the most recent plan in the thread is what gets executed.\n\n---\n\n%s\n\n%s' \
     "$TRIGGER_LABEL" "$TRIGGER_LABEL" "$plan" "$PLAN_MARKER")" >/dev/null 2>&1 || true
-  gh issue edit "$num" --add-label "$PLAN_REVIEW_LABEL" >/dev/null 2>&1 || true
-  gh issue edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
+  if ! worker_release_issue "$num" "$PLAN_REVIEW_LABEL"; then
+    log "issue #$num: ownership was lost before releasing the planned issue; leaving labels untouched"
+    cleanup_workspace "$branch"
+    return 2
+  fi
   log "issue #$num: PLAN posted -> waiting for user to add '$TRIGGER_LABEL'"
   cleanup_workspace "$branch"
   return 0
@@ -3672,7 +4189,8 @@ pending_action() {
 # <<< pending-label helpers <<<
 
 # Reconcile the pending label across the whole open working set (issues carrying
-# the trigger, plan, needs-info or failed label) so it always reflects reality:
+# the trigger, plan, needs-info, failed, or one-shot override label) so it
+# always reflects reality:
 # mark an issue "pending" while it waits for an open dependency and unmark it once
 # nothing blocks it. Only issues whose state actually changed are edited, and gh
 # failures never abort the loop. Relies on issue_open_blockers and pending_action.
@@ -3681,7 +4199,8 @@ reconcile_pending_labels() {
   nums="$( { gh issue list --state open --label "$TRIGGER_LABEL"    --limit 1000 --json number --jq '.[].number' 2>/dev/null;
              gh issue list --state open --label "$PLAN_LABEL"       --limit 1000 --json number --jq '.[].number' 2>/dev/null;
              gh issue list --state open --label "$NEEDS_INFO_LABEL" --limit 1000 --json number --jq '.[].number' 2>/dev/null;
-             gh issue list --state open --label "$FAILED_LABEL"     --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
+             gh issue list --state open --label "$FAILED_LABEL"     --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$OVERRIDE_WORKER_LABEL" --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
            | sort -n -u )"
   for n in $nums; do
     body="$(gh issue view "$n" --json body --jq '.body' 2>/dev/null)"
@@ -3703,44 +4222,39 @@ reconcile_pending_labels() {
 # Returns the issue number on success, empty string if none available.
 # This prevents multiple instances from selecting the same issue.
 claim_next_ready_issue() {
-  local n body blockers issue="" issue_model_tag
+  local n body labels blockers issue="" issue_model_tag task_kind seen=""
   acquire_github_lock || return 1
 
-  # Ready issues oldest first (lowest number == earliest created). Fetch each
-  # issue's body and labels in the same list call (NUL-separated number/body/labels
-  # triplets) so we no longer spend one `gh issue view` per queued issue. Walk them
-  # in order and claim the first that is not blocked by an unresolved dependency
-  # (see issue_open_blockers) and matches the bot's model tag. A blocked or
-  # model-mismatched issue keeps its trigger label so it is reconsidered on a later
-  # pass once its blockers close or a matching bot picks it up.
-  while IFS= read -r -d '' n && IFS= read -r -d '' body && IFS= read -r -d '' issue_model_tag; do
+  # Scan both the normal ready queue and the one-shot override queue. An override
+  # may be the only remaining queue label after the original claim removed ready.
+  # The complete label set is carried through the NUL-delimited record, then
+  # re-read by claim_issue_ownership immediately before editing GitHub.
+  while IFS= read -r -d '' n && IFS= read -r -d '' body && IFS= read -r -d '' labels; do
+    n="${n//$'\n'/}"
+    case " $seen " in *" $n "*) continue ;; esac
+    seen="$seen $n"
+    task_kind="$(worker_task_kind "$labels" 2>/dev/null || true)"
+    if [ -n "$task_kind" ] && [ "$task_kind" != "process" ]; then
+      log "issue #$n: override/task marker routes it to '$task_kind'; skipping ready queue" >&2
+      continue
+    fi
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
       continue
     fi
-    # Check if the issue matches the bot's model tag
+    issue_model_tag="$(extract_model_tag_from_label_names "$labels")"
     if ! should_pick_issue_by_model "$COPILOT_MODEL" "$issue_model_tag"; then
       log "issue #$n: model tag mismatch (issue: $issue_model_tag, bot: ${COPILOT_MODEL:-auto}); skipping" >&2
       continue
     fi
-    # Claim it immediately: add in-progress, remove trigger labels.
-    # Do this WHILE HOLDING THE LOCK so no other instance can select it.
-    issue="$n"
-    gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
-    # If this issue was planned first, the trigger label the user added to run the
-    # plan is what got us here; drop the now-stale review label as we start work.
-    gh issue edit "$issue" --remove-label "$PLAN_REVIEW_LABEL" >/dev/null 2>&1 || true
-    break
-  # Emit one joined string, not a stream: gh/jq append a newline after every
-  # streamed result, and with NUL-delimited records that newline leaks into the
-  # front of the next number field ("\n12"), corrupting the branch name and
-  # failing every issue after the first. join("") keeps the stream NUL-only.
-  done < <(gh issue list --state open --label "$TRIGGER_LABEL" --limit 1000 \
-             --json number,body,labels \
-             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000" + (([.labels[].name | select(startswith("model:"))][0]? // "") | gsub("^model:"; "")) + "\u0000"] | join("")' 2>/dev/null)
+    if claim_issue_ownership "$n" process "$labels"; then
+      issue="$n"
+      log "issue #$n: claimed by $(worker_current_label)" >&2
+      break
+    fi
+  done < <({ issue_queue_records "$TRIGGER_LABEL"
+             issue_queue_records "$OVERRIDE_WORKER_LABEL"; })
 
   release_github_lock
   [ -n "$issue" ] && printf '%s\n' "$issue"
@@ -3756,33 +4270,35 @@ claim_next_ready_issue() {
 # keep the marker comments intact.
 # >>> plan-issue helpers >>>
 claim_next_plan_issue() {
-  local n body blockers issue="" issue_model_tag
+  local n body labels blockers issue="" issue_model_tag task_kind seen=""
   acquire_github_lock || return 1
 
-  while IFS= read -r -d '' n && IFS= read -r -d '' body && IFS= read -r -d '' issue_model_tag; do
+  while IFS= read -r -d '' n && IFS= read -r -d '' body && IFS= read -r -d '' labels; do
+    n="${n//$'\n'/}"
+    case " $seen " in *" $n "*) continue ;; esac
+    seen="$seen $n"
+    task_kind="$(worker_task_kind "$labels" 2>/dev/null || true)"
+    if [ -n "$task_kind" ] && [ "$task_kind" != "plan" ]; then
+      log "issue #$n: override/task marker routes it to '$task_kind'; skipping plan queue" >&2
+      continue
+    fi
     blockers="$(issue_open_blockers "$n" "$body")"
     if [ -n "$blockers" ]; then
       log "issue #$n: blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
       continue
     fi
-    # Check if the issue matches the bot's model tag
+    issue_model_tag="$(extract_model_tag_from_label_names "$labels")"
     if ! should_pick_issue_by_model "$COPILOT_MODEL" "$issue_model_tag"; then
       log "issue #$n: model tag mismatch (issue: $issue_model_tag, bot: ${COPILOT_MODEL:-auto}); skipping" >&2
       continue
     fi
-    # Claim it while HOLDING THE LOCK: add in-progress and drop the plan label so
-    # the plan is generated exactly once and no other instance re-plans it. The
-    # review label is added later, once the plan has been posted.
-    issue="$n"
-    gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$PLAN_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
-    break
-  # See claim_next_ready_issue for why the records are emitted as one NUL-only
-  # joined string rather than a newline-terminated stream.
-  done < <(gh issue list --state open --label "$PLAN_LABEL" --limit 1000 \
-             --json number,body,labels \
-             --jq 'sort_by(.number) | [.[] | (.number|tostring) + "\u0000" + (.body // "") + "\u0000" + (([.labels[].name | select(startswith("model:"))][0]? // "") | gsub("^model:"; "")) + "\u0000"] | join("")' 2>/dev/null)
+    if claim_issue_ownership "$n" plan "$labels"; then
+      issue="$n"
+      log "issue #$n: claimed for planning by $(worker_current_label)" >&2
+      break
+    fi
+  done < <({ issue_queue_records "$PLAN_LABEL"
+             issue_queue_records "$OVERRIDE_WORKER_LABEL"; })
 
   release_github_lock
   [ -n "$issue" ] && printf '%s\n' "$issue"
@@ -3795,10 +4311,14 @@ claim_next_plan_issue() {
 # claimed. Informational only and silent when the queue is empty (the later
 # "no ready issues" message covers that case); safe to call without the lock.
 log_ready_issues() {
-  local lines count
+  local lines count override_lines
   lines="$(gh issue list --state open --label "$TRIGGER_LABEL" \
              --limit 1000 --json number,title \
              --jq 'sort_by(.number) | .[] | "#\(.number) \(.title)"' 2>/dev/null)"
+  override_lines="$(gh issue list --state open --label "$OVERRIDE_WORKER_LABEL" \
+             --limit 1000 --json number,title \
+             --jq 'sort_by(.number) | .[] | "#\(.number) \(.title) [override worker]"' 2>/dev/null)"
+  [ -n "$override_lines" ] && lines="${lines}${lines:+$'\n'}${override_lines}"
   [ -n "$lines" ] || return 0
   count="$(printf '%s\n' "$lines" | wc -l | tr -d ' ')"
   log "ready issues ($count):"
@@ -3814,23 +4334,32 @@ log_ready_issues() {
 claim_next_reply_issue() {
   [ -n "$BOT_LOGIN" ] || return 1
   
-  local nums n last_author body blockers issue="" issue_model_tag
+  local nums n last_author body labels blockers issue="" issue_model_tag task_kind
   acquire_github_lock || return 1
   
   # Both labels mean "blocked, waiting on the user"; a human reply resumes them.
-  # Sorted ascending (by number == creation order) so oldest replied issue first.
+  # An override-only in-progress issue is also included, but only when its task
+  # marker says it belongs to this reply/process flow.
   nums="$( { gh issue list --state open --label "$NEEDS_INFO_LABEL" \
                --limit 1000 --json number --jq '.[].number' 2>/dev/null;
              gh issue list --state open --label "$FAILED_LABEL" \
+               --limit 1000 --json number --jq '.[].number' 2>/dev/null;
+             gh issue list --state open --label "$OVERRIDE_WORKER_LABEL" \
                --limit 1000 --json number --jq '.[].number' 2>/dev/null; } \
            | sort -n -u )"
   for n in $nums; do
-    # One view call per candidate for the last comment's author, body, and labels
-    # (NUL-separated) instead of separate `gh issue view` calls.
-    { IFS= read -r -d '' last_author; IFS= read -r -d '' body; IFS= read -r -d '' issue_model_tag; } < <(
+    # One view call per candidate for the last comment's author, body, and the
+    # complete labels (NUL-separated) instead of separate calls.
+    { IFS= read -r -d '' last_author; IFS= read -r -d '' body; IFS= read -r -d '' labels; } < <(
       gh issue view "$n" --json comments,body,labels \
-        --jq '[(.comments[-1].author.login // ""), (.body // ""), (([.labels[].name | select(startswith("model:"))][0]? // "") | gsub("^model:"; ""))] | join("\u0000")' 2>/dev/null)
-    if [ -z "$last_author" ] || [ "$last_author" = "$BOT_LOGIN" ]; then continue; fi
+        --jq '[(.comments[-1].author.login // ""), (.body // ""), ([.labels[].name] | join("\u001f"))] | join("\u0000")' 2>/dev/null)
+    labels="${labels%$'\n'}"
+    task_kind="$(worker_task_kind "$labels" 2>/dev/null || true)"
+    if label_list_has "$labels" "$OVERRIDE_WORKER_LABEL"; then
+      case "$task_kind" in process|reply) : ;; *) continue ;; esac
+    elif [ -z "$last_author" ] || [ "$last_author" = "$BOT_LOGIN" ]; then
+      continue
+    fi
     # Honour the same dependency gate as fresh issues: do not resume an issue
     # while an issue it declares it is waiting for is still open.
     blockers="$(issue_open_blockers "$n" "$body")"
@@ -3838,18 +4367,19 @@ claim_next_reply_issue() {
       log "issue #$n: replied but blocked, waiting for $(_fmt_blockers "$blockers") to close; skipping" >&2
       continue
     fi
-    # Check if the issue matches the bot's model tag
+    issue_model_tag="$(extract_model_tag_from_label_names "$labels")"
     if ! should_pick_issue_by_model "$COPILOT_MODEL" "$issue_model_tag"; then
       log "issue #$n: model tag mismatch (issue: $issue_model_tag, bot: ${COPILOT_MODEL:-auto}); skipping" >&2
       continue
     fi
-    # Found one; claim it before releasing the lock
-    issue="$n"
-    gh issue edit "$issue" --add-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$NEEDS_INFO_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$FAILED_LABEL" >/dev/null 2>&1 || true
-    gh issue edit "$issue" --remove-label "$PENDING_LABEL" >/dev/null 2>&1 || true
-    break
+    # Retain a process marker left by the original run; otherwise use the reply
+    # marker so an override-only issue remains routable on a later pass.
+    [ "$task_kind" = process ] && task_kind=process || task_kind=reply
+    if claim_issue_ownership "$n" "$task_kind" "$labels"; then
+      issue="$n"
+      log "issue #$n: claimed user reply by $(worker_current_label)" >&2
+      break
+    fi
   done
   
   release_github_lock
