@@ -3792,6 +3792,62 @@ claim_next_reply_issue() {
   [ -n "$issue" ]
 }
 
+# >>> pr-prompt helpers >>>
+# Keep heredocs outside command substitutions so Bash 3.2 does not parse
+# prompt text as shell syntax.
+build_pr_conflict_prompt() {
+  local base="$1" head="$2" num="$3" conflicts="$4"
+  cat <<EOF
+You are working in a git repository. Merging branch "${base}" into branch
+"${head}" (pull request #${num}) produced conflicts that must be resolved.
+
+These files contain git conflict markers (<<<<<<<, =======, >>>>>>>):
+${conflicts}
+
+Resolve every conflict so the result is correct and preserves the intent of both
+branches, then remove all conflict markers. Run any build or test commands needed
+to verify your work. Do NOT run git commit, git merge, git push, or create
+branches — those steps are handled automatically outside this session. Only edit
+files to resolve the conflicts and verify.
+EOF
+}
+
+build_pr_check_prompt() {
+  local head="$1" num="$2" failing="$3"
+  cat <<EOF
+You are working in a git repository on branch "${head}" (pull request #${num}).
+Its continuous-integration checks are failing: ${failing:-unknown}.
+
+Investigate why these checks fail and fix the code so they pass. Run the relevant
+build, test, or lint commands locally to reproduce each failure and confirm your
+fix. Do NOT run git commit, git push, or create branches — those steps are handled
+automatically outside this session. Only edit files and verify.
+EOF
+}
+
+build_pr_review_prompt() {
+  local head="$1" num="$2" path="$3" line="$4" diff_hunk="$5" thread_text="$6"
+  cat <<EOF
+You are working in a git repository on branch "${head}" (pull request #${num}).
+
+A reviewer left a comment on a specific location in the code that you must address.
+
+File:       ${path}
+Line:       ${line}
+Code hunk:
+${diff_hunk}
+
+Review thread (most recent last):
+${thread_text}
+
+Address the reviewer's request. Edit the file if a code change is needed.
+If you need clarification, start your response with "QUESTION:" followed by your question.
+After making any changes, run the existing tests to verify nothing broke.
+Do NOT run git commit, git push, or create branches — those are handled automatically outside this session. Only edit files and verify.
+EOF
+}
+# <<< pr-prompt helpers <<<
+
 # --- Core: resolve merge conflicts on a single PR ---------------------------
 # Merges the PR's base branch into its head branch; if that conflicts, hands the
 # conflicted files to Copilot to resolve, then commits and pushes so the PR
@@ -3843,20 +3899,7 @@ resolve_pr_conflicts() {
     log "PR #$num: resolving conflicts in: $(printf '%s' "$conflicts" | tr '\n' ' ')"
 
     local prompt
-    prompt="$(cat <<EOF
-You are working in a git repository. Merging branch "${base}" into branch
-"${head}" (pull request #${num}) produced conflicts that must be resolved.
-
-These files contain git conflict markers (<<<<<<<, =======, >>>>>>>):
-${conflicts}
-
-Resolve every conflict so the result is correct and preserves the intent of both
-branches, then remove all conflict markers. Run any build or test commands needed
-to verify your work. Do NOT run git commit, git merge, git push, or create
-branches — those steps are handled automatically outside this session. Only edit
-files to resolve the conflicts and verify.
-EOF
-)"
+    prompt="$(build_pr_conflict_prompt "$base" "$head" "$num" "$conflicts")"
     local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
     [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
     [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
@@ -3970,16 +4013,7 @@ resolve_pr_check_failures() {
   set_terminal_title "$head"
 
   local prompt
-  prompt="$(cat <<EOF
-You are working in a git repository on branch "${head}" (pull request #${num}).
-Its continuous-integration checks are failing: ${failing:-unknown}.
-
-Investigate why these checks fail and fix the code so they pass. Run the relevant
-build, test, or lint commands locally to reproduce each failure and confirm your
-fix. Do NOT run git commit, git push, or create branches — those steps are handled
-automatically outside this session. Only edit files and verify.
-EOF
-)"
+  prompt="$(build_pr_check_prompt "$head" "$num" "$failing")"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
   [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
@@ -4307,25 +4341,7 @@ resolve_pr_review_comments() {
   set_terminal_title "$head"
 
   local prompt
-  prompt="$(cat <<EOF
-You are working in a git repository on branch "${head}" (pull request #${num}).
-
-A reviewer left a comment on a specific location in the code that you must address.
-
-File:       ${path}
-Line:       ${line}
-Code hunk:
-${diff_hunk}
-
-Review thread (most recent last):
-${thread_text}
-
-Address the reviewer's request. Edit the file if a code change is needed.
-If you need clarification, start your response with "QUESTION:" followed by your question.
-After making any changes, run the existing tests to verify nothing broke.
-Do NOT run git commit, git push, or create branches — those are handled automatically outside this session. Only edit files and verify.
-EOF
-)"
+  prompt="$(build_pr_review_prompt "$head" "$num" "$path" "$line" "$diff_hunk" "$thread_text")"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
   [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
   [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
