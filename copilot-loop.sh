@@ -2366,9 +2366,10 @@ _rebase_continue() {
 # stops on several commits is carried all the way through. Returns 0 when the
 # rebase completes cleanly, 1 when it cannot be resolved (Copilot times out, leaves
 # markers, or the rebase fails for another reason); the caller aborts + fails then.
-# Usage: resolve_rebase_conflicts <num> <log_file> <upstream>
+# Usage: resolve_rebase_conflicts <num> <log_file> <upstream> [model]
 resolve_rebase_conflicts() {
   local num="$1" log_file="$2" upstream="$3"
+  local coding_model="${4:-${COPILOT_MODEL:-}}"
   local conflicts copilot_rc f unresolved cont_rc prompt
 
   while true; do
@@ -2396,7 +2397,7 @@ files to resolve the conflicts and verify.
 EOF
 )"
     local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
-    [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+    [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
     [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
     log "issue #$num: running copilot to resolve rebase conflicts (log: $log_file)"
@@ -2409,7 +2410,7 @@ EOF
     log "issue #$num: copilot exited with code $copilot_rc while resolving rebase conflicts"
 
     # Each resolution run is a separate Copilot invocation, so account for its cost.
-    _report_usage issue "$num" "$log_file" "$COPILOT_MODEL"
+    _report_usage issue "$num" "$log_file" "$coding_model"
 
     if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
       return 1
@@ -2524,13 +2525,63 @@ issue_has_label() {
         --jq 'any(.labels[]; .name == "'"$label"'")' 2>/dev/null)" = "true" ]
 }
 
+# Extract and resolve the model metadata carried by a PR. These helpers are kept
+# together so issue PR creation and every later repair path use the same label
+# convention and first-match behavior.
+# >>> pr-model helpers >>>
 # Extract the model tag from a labels JSON array (e.g., "model:gpt-5.4").
 # Returns the model name without the "model:" prefix, or empty string if no model tag found.
 # Usage: extract_model_tag_from_labels '<json labels array>'
 extract_model_tag_from_labels() {
   local labels_json="$1"
-  printf '%s' "$labels_json" | jq -r '.[] | select(.name | startswith("model:")) | .name[6:]' 2>/dev/null | head -1
+  printf '%s' "$labels_json" \
+    | jq -r '.[] | select(.name | startswith("model:")) | .name[6:] | select(length > 0)' \
+    2>/dev/null | head -1
 }
+
+# Echo the label name for a selected coding model, or nothing when the run is
+# intentionally unpinned.
+model_label_for_model() {
+  local model="${1:-}"
+  if [ -n "$model" ]; then
+    printf 'model:%s\n' "$model"
+  fi
+}
+
+# Ensure the dynamic model label exists and echo it for `gh pr create`.
+ensure_pr_model_label() {
+  local model="${1:-}" label
+  [ -n "$model" ] || return 0
+  label="$(model_label_for_model "$model")"
+  ensure_label "$label" "6f42c1" "Copilot model used for the issue run"
+  printf '%s\n' "$label"
+}
+
+# True when PR <num-or-url> carries the expected model label. This verification
+# keeps a successful PR creation from silently losing the model metadata.
+pr_has_model_label() {
+  local pr="$1" model="${2:-}" labels_json expected
+  [ -n "$model" ] || return 0
+  expected="$(model_label_for_model "$model")"
+  labels_json="$(gh pr view "$pr" --json labels --jq '.labels' 2>/dev/null)" || return 1
+  printf '%s' "$labels_json" \
+    | jq -e --arg expected "$expected" 'any(.[]; .name == $expected)' >/dev/null 2>&1
+}
+
+# Resolve the model to use for a PR repair. A persisted model label wins; PRs
+# created before model persistence (or without a pinned model) use this worker's
+# configured model as the compatibility fallback.
+resolve_pr_model() {
+  local num="$1" labels_json model
+  labels_json="$(gh pr view "$num" --json labels --jq '.labels' 2>/dev/null)" || labels_json=""
+  model="$(extract_model_tag_from_labels "$labels_json")"
+  if [ -n "$model" ]; then
+    printf '%s\n' "$model"
+  else
+    printf '%s\n' "${COPILOT_MODEL:-}"
+  fi
+}
+# <<< pr-model helpers <<<
 
 # Determine if an issue should be picked based on model tag filtering.
 # Returns 0 (true) if the bot's model matches the issue's model tag (or both are unspecified).
@@ -2619,7 +2670,7 @@ resume_interrupted_issues() {
 process_issue() {
   local num="$1"
   local title body slug branch commit_msg commit_text commit_out pr_body log_file ahead pr_url
-  local question_file comments comments_block qa_block plan_block
+  local question_file comments comments_block qa_block plan_block model_label
 
   # One API round-trip for everything we need from the issue (title, body, and
   # the comment thread) instead of three separate `gh issue view` calls. Fields
@@ -2891,7 +2942,7 @@ EOF
       # Anything else (an invalid upstream, a lock error, ...) never leaves
       # unmerged paths, so it is a genuine failure and still aborts + fails.
       if [ -n "$(git -C "$WORKSPACE_DIR" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
-        if resolve_rebase_conflicts "$num" "$log_file" "$sync_target"; then
+        if resolve_rebase_conflicts "$num" "$log_file" "$sync_target" "$coding_model"; then
           log "issue #$num: resolved rebase conflicts while syncing with ${DEFAULT_BRANCH}"
         else
           git -C "$WORKSPACE_DIR" rebase --abort >/dev/null 2>&1 || true
@@ -2926,10 +2977,24 @@ EOF
       _fail_issue "$num" "$log_file" "git push failed"
       return 1
     fi
-    pr_url="$(gh pr create --base "$DEFAULT_BRANCH" --head "$branch" \
-                --title "$commit_msg" --body "$pr_body" 2>>"$log_file")"
+    local -a pr_create_args=(--base "$DEFAULT_BRANCH" --head "$branch"
+                             --title "$commit_msg" --body "$pr_body")
+    if [ -n "$coding_model" ]; then
+      model_label="$(ensure_pr_model_label "$coding_model")"
+      if [ -z "$model_label" ]; then
+        _fail_issue "$num" "$log_file" "could not prepare model label for '$coding_model'"
+        return 1
+      fi
+      pr_create_args+=(--label "$model_label")
+    fi
+    pr_url="$(gh pr create "${pr_create_args[@]}" 2>>"$log_file")"
     if [ -z "$pr_url" ]; then
       _fail_issue "$num" "$log_file" "gh pr create failed"
+      return 1
+    fi
+    if [ -n "$coding_model" ] && ! pr_has_model_label "$pr_url" "$coding_model"; then
+      _fail_issue "$num" "$log_file" \
+        "PR created without required model label '$model_label'"
       return 1
     fi
     try_auto_merge "$pr_url" "$num" "$log_file"
@@ -3854,7 +3919,7 @@ EOF
 # becomes mergeable again. Returns 0 on success, 1 on failure.
 resolve_pr_conflicts() {
   local num="$1"
-  local head base title log_file conflicts copilot_rc
+  local head base title log_file conflicts copilot_rc coding_model
 
   # One API round-trip for the PR's head branch, base branch and title (all
   # single-line) instead of three separate `gh pr view` calls.
@@ -3874,6 +3939,7 @@ resolve_pr_conflicts() {
     gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     return 1
   fi
+  coding_model="$(resolve_pr_model "$num")"
 
   log "PR #$num has conflicts with $base: $title"
 
@@ -3901,7 +3967,7 @@ resolve_pr_conflicts() {
     local prompt
     prompt="$(build_pr_conflict_prompt "$base" "$head" "$num" "$conflicts")"
     local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
-    [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+    [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
     [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
     log "PR #$num: running copilot to resolve conflicts (log: $log_file)"
@@ -3915,7 +3981,7 @@ resolve_pr_conflicts() {
     log "PR #$num: copilot exited with code $copilot_rc"
 
     # Track what this conflict-resolution prompt cost on the PR.
-    _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
+    _report_usage pr "$num" "$log_file" "$coding_model"
 
     # A timed-out run (COPILOT_TIMEOUT exceeded, rc 124) is a failed attempt.
     if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
@@ -3977,7 +4043,7 @@ pr_failing_check_names() {
 # on success, 1 on failure.
 resolve_pr_check_failures() {
   local num="$1"
-  local head base title log_file failing copilot_rc
+  local head base title log_file failing copilot_rc coding_model
 
   # One API round-trip for the PR's head branch, base branch and title.
   { IFS= read -r -d '' head; IFS= read -r -d '' base; IFS= read -r -d '' title; } < <(
@@ -3996,6 +4062,7 @@ resolve_pr_check_failures() {
     gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     return 1
   fi
+  coding_model="$(resolve_pr_model "$num")"
 
   failing="$(pr_failing_check_names "$num")"
   log "PR #$num has failing checks (${failing:-unknown}): $title"
@@ -4015,7 +4082,7 @@ resolve_pr_check_failures() {
   local prompt
   prompt="$(build_pr_check_prompt "$head" "$num" "$failing")"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
-  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+  [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
   [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "PR #$num: running copilot to fix failing checks (log: $log_file)"
@@ -4029,7 +4096,7 @@ resolve_pr_check_failures() {
   log "PR #$num: copilot exited with code $copilot_rc"
 
   # Track what this fix prompt cost on the PR.
-  _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
+  _report_usage pr "$num" "$log_file" "$coding_model"
 
   # A timed-out run (COPILOT_TIMEOUT exceeded, rc 124) is a failed attempt.
   if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
@@ -4284,7 +4351,7 @@ _post_review_thread_reply() {
 # edits files. Returns 0 on success, 1 on failure.
 resolve_pr_review_comments() {
   local num="$1"
-  local head base title log_file copilot_rc
+  local head base title log_file copilot_rc coding_model
 
   { IFS= read -r -d '' head; IFS= read -r -d '' base; IFS= read -r -d '' title; } < <(
     gh pr view "$num" --json headRefName,baseRefName,title \
@@ -4298,6 +4365,7 @@ resolve_pr_review_comments() {
     gh pr edit "$num" --remove-label "$INPROGRESS_LABEL" >/dev/null 2>&1 || true
     return 1
   fi
+  coding_model="$(resolve_pr_model "$num")"
 
   log "PR #$num reviewing unresolved comments on branch $head: $title"
 
@@ -4343,7 +4411,7 @@ resolve_pr_review_comments() {
   local prompt
   prompt="$(build_pr_review_prompt "$head" "$num" "$path" "$line" "$diff_hunk" "$thread_text")"
   local -a copilot_args=(-p "$prompt" --allow-all-tools -C "$WORKSPACE_DIR" --add-dir "$WORKSPACE_DIR" --no-color --log-level none)
-  [ -n "$COPILOT_MODEL" ] && copilot_args+=(--model "$COPILOT_MODEL")
+  [ -n "$coding_model" ] && copilot_args+=(--model "$coding_model")
   [ -n "$COPILOT_EFFORT" ] && copilot_args+=(--effort "$COPILOT_EFFORT")
 
   log "PR #$num: running copilot to address review comment (log: $log_file)"
@@ -4358,7 +4426,7 @@ resolve_pr_review_comments() {
   cd "$REPO_DIR" 2>/dev/null || true
   log "PR #$num: copilot exited with code $copilot_rc"
 
-  _report_usage pr "$num" "$log_file" "$COPILOT_MODEL"
+  _report_usage pr "$num" "$log_file" "$coding_model"
 
   if copilot_run_timed_out "$COPILOT_TIMEOUT" "$copilot_rc"; then
     _post_review_thread_reply "$thread_id" "$num" \
