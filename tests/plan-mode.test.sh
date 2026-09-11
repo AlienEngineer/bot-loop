@@ -22,6 +22,8 @@ script="$here/../copilot-loop.sh"
 # claim_next_plan_issue depends on the wait-for helpers (issue_open_blockers) and
 # the should_pick_issue_by_model function for model tag filtering, so pull those in
 # too. All blocks are extracted verbatim from the script.
+ownership_block="$(sed -n '/# >>> worker-ownership helpers >>>/,/# <<< worker-ownership helpers <<</p' "$script")"
+[ -n "$ownership_block" ] || { echo "could not extract worker ownership helpers (markers missing?)"; exit 1; }
 wait_block="$(sed -n '/# >>> wait-for helpers >>>/,/# <<< wait-for helpers <<</p' "$script")"
 [ -n "$wait_block" ] || { echo "could not extract wait-for helpers (markers missing?)"; exit 1; }
 detect_block="$(sed -n '/# >>> plan-detect helpers >>>/,/# <<< plan-detect helpers <<</p' "$script")"
@@ -33,6 +35,7 @@ claim_block="$(sed -n '/# >>> plan-issue helpers >>>/,/# <<< plan-issue helpers 
 eval "$wait_block"
 eval "$detect_block"
 eval "$model_helpers"
+eval "$ownership_block"
 eval "$claim_block"
 
 fail=0
@@ -64,6 +67,14 @@ INPROGRESS_LABEL="in-progress"
 PENDING_LABEL="pending"
 # shellcheck disable=SC2034
 COPILOT_MODEL=""  # Empty means auto (picks untagged issues)
+WORKER_ID="build-host"
+WORKER_LABEL="worker:build-host"
+WORKER_LABEL_PREFIX="worker:"
+OVERRIDE_WORKER_LABEL="override worker"
+TASK_LABEL_PREFIX="bot-loop:task:"
+TASK_PROCESS_LABEL="bot-loop:task:process"
+TASK_PLAN_LABEL="bot-loop:task:plan"
+TASK_REPLY_LABEL="bot-loop:task:reply"
 
 # Silence logs, make the lock a no-op, and format blockers plainly so the real
 # selection and claim logic runs unchanged.
@@ -115,30 +126,42 @@ gh() {
         | jq -r "$jqf"
       ;;
     "issue view")
-      local n="$1"
-      jq -r --arg n "$n" '.[] | select((.number|tostring)==$n) | .state // ""' "$ISSUES_FILE"
-      ;;
-    "issue edit")
-      local n="$1"; shift
-      local action="" label=""
+      local n="$1" jqf=""
+      shift
       while [ $# -gt 0 ]; do
         case "$1" in
-          --add-label)    action="add";    label="$2"; shift 2 ;;
-          --remove-label) action="remove"; label="$2"; shift 2 ;;
+          --jq) jqf="$2"; shift 2 ;;
           *) shift ;;
         esac
       done
-      printf '%s:%s:%s\n' "$action" "$n" "$label" >>"$EDITS_FILE"
-      local tmp; tmp="$(mktemp)"
-      if [ "$action" = "add" ]; then
-        jq --arg n "$n" --arg l "$label" \
-          'map(if (.number|tostring)==$n then (.labels += [{"name":$l}]) else . end)' \
-          "$ISSUES_FILE" >"$tmp" && mv "$tmp" "$ISSUES_FILE"
-      else
-        jq --arg n "$n" --arg l "$label" \
-          'map(if (.number|tostring)==$n then (.labels |= map(select(.name != $l))) else . end)' \
-          "$ISSUES_FILE" >"$tmp" && mv "$tmp" "$ISSUES_FILE"
-      fi
+      case "$jqf" in
+        *'join("\u001f")'*)
+          jq -r --arg n "$n" \
+            '.[] | select((.number|tostring)==$n) | [.labels[].name] | join("\u001f")' "$ISSUES_FILE" ;;
+        *) jq -r --arg n "$n" '.[] | select((.number|tostring)==$n) | .state // ""' "$ISSUES_FILE" ;;
+      esac
+      ;;
+    "issue edit")
+      local n="$1"; shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --add-label)
+            printf 'add:%s:%s\n' "$n" "$2" >>"$EDITS_FILE"
+            local tmp; tmp="$(mktemp)"
+            jq --arg n "$n" --arg l "$2" \
+              'map(if (.number|tostring)==$n and (any(.labels[]; .name==$l)|not) then (.labels += [{"name":$l}]) else . end)' \
+              "$ISSUES_FILE" >"$tmp" && mv "$tmp" "$ISSUES_FILE"
+            shift 2 ;;
+          --remove-label)
+            printf 'remove:%s:%s\n' "$n" "$2" >>"$EDITS_FILE"
+            local tmp; tmp="$(mktemp)"
+            jq --arg n "$n" --arg l "$2" \
+              'map(if (.number|tostring)==$n then (.labels |= map(select(.name != $l))) else . end)' \
+              "$ISSUES_FILE" >"$tmp" && mv "$tmp" "$ISSUES_FILE"
+            shift 2 ;;
+          *) shift ;;
+        esac
+      done
       ;;
   esac
 }
@@ -159,7 +182,7 @@ edits() { tr '\n' ' ' <"$EDITS_FILE" | sed 's/ *$//'; }
 claim1="$(claim_next_plan_issue)"
 assert_eq "claims oldest unblocked plan issue (skips blocked #3)" "$claim1" "5"
 assert_eq "claim marks it in-progress and drops plan+pending" \
-  "$(edits)" "add:5:in-progress remove:5:plan remove:5:pending"
+  "$(edits)" "add:5:in-progress add:5:worker:build-host add:5:bot-loop:task:plan remove:5:plan remove:5:pending"
 
 # --- anti-double-grab: the next claim never re-grabs the claimed issue -------
 : >"$EDITS_FILE"

@@ -72,6 +72,28 @@ gh() {
       while [ $# -gt 0 ]; do case "$1" in --body) body="$2"; shift 2 ;; *) shift ;; esac; done
       printf '%s\n' "$body" >"$GH_LOG"
       ;;
+    "issue view")
+      printf '%s' "$ISSUE_LABELS"
+      ;;
+    "issue edit")
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --add-label)
+            label_list_has "$ISSUE_LABELS" "$2" || ISSUE_LABELS="${ISSUE_LABELS:+$ISSUE_LABELS$'\037'}$2"
+            shift 2 ;;
+          --remove-label)
+            labels_after=""
+            while IFS= read -r existing; do
+              [ "$existing" = "$2" ] && continue
+              labels_after="${labels_after:+$labels_after$'\037'}$existing"
+            done < <(printf '%s\n' "$ISSUE_LABELS" | tr '\037' '\n')
+            ISSUE_LABELS="$labels_after"
+            shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      ;;
     *) : ;;
   esac
 }
@@ -82,9 +104,16 @@ FAILURE_MARKER="<!-- copilot-loop:failed -->"
 NEEDS_INFO_LABEL="needs-info"
 INPROGRESS_LABEL="in-progress"
 FAILED_LABEL="copilot-failed"
+OVERRIDE_WORKER_LABEL="override worker"
+WORKER_LABEL_PREFIX="worker:"
+TASK_LABEL_PREFIX="bot-loop:task:"
+WORKER_ID="build-host"
+WORKER_LABEL="worker:build-host"
+ISSUE_LABELS=$'in-progress\037worker:build-host\037bot-loop:task:process'
 branch="copilot/7-demo"
 
 # Pull in the REAL functions under test straight from the script.
+eval "$(sed -n '/# >>> worker-ownership helpers >>>/,/# <<< worker-ownership helpers <<</p' "$script")"
 eval "$(sed -n '/# >>> path-sanitization helpers >>>/,/# <<< path-sanitization helpers <<</p' "$script")"
 eval "$(sed -n '/# >>> needs-info helpers >>>/,/# <<< needs-info helpers <<</p' "$script")"
 eval "$(sed -n '/^_fail_issue() {/,/^}/p' "$script")"
@@ -101,8 +130,14 @@ assert_contains "needs-info: keeps the question" \
 # The hidden marker keeps its stable id, so ignore it when checking the prose.
 assert_absent "needs-info: no copilot-loop brand in prose" \
   "${ask_body%%<!--*}" "copilot-loop"
+assert_contains "needs-info: owner retained" \
+  "$(printf '%s' "$ISSUE_LABELS" | tr '\037' ',')" "worker:build-host"
+assert_contains "needs-info: task retained" \
+  "$(printf '%s' "$ISSUE_LABELS" | tr '\037' ',')" "bot-loop:task:process"
 
 # --- 4. The failure comment is branded bot-loop -----------------------------
+# A new retry claim restores the active state before the failure path runs.
+ISSUE_LABELS=$'in-progress\037worker:build-host\037bot-loop:task:process'
 _fail_issue 7 /dev/null "the build broke" "cargo test: 1 failed"
 fail_body="$(cat "$GH_LOG")"
 assert_contains "failure: bot-loop prefix"    "$fail_body" "bot-loop failed:"

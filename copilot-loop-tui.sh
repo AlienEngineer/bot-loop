@@ -18,9 +18,10 @@
 #   - they keep working even after the TUI exits (the TUI re-attaches to the
 #     running bots the next time it starts), and
 #   - they never fight the TUI or each other for the keyboard.
-# The loop's own multi-instance support (a shared GitHub lock plus per-issue git
-# worktrees) is what makes running many bots against one repo safe; the TUI just
-# drives it. See copilot-loop.sh for that mechanism.
+# The loop's own multi-instance support (a local GitHub lock, cross-machine
+# worker ownership labels, plus per-issue git worktrees) is what makes running
+# many bots against one repo safe; the TUI just drives it. See copilot-loop.sh
+# for that mechanism.
 #
 # Requirements: bash, and whatever copilot-loop.sh itself needs (git, gh,
 # copilot) for the bots to make progress. The TUI opens even if those are

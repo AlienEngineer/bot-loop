@@ -32,6 +32,9 @@ extract() {
   [ -n "$block" ] || { echo "could not extract '$1' (markers missing?)"; exit 1; }
   eval "$block"
 }
+ownership_block="$(sed -n '/# >>> worker-ownership helpers >>>/,/# <<< worker-ownership helpers <<</p' "$script")"
+[ -n "$ownership_block" ] || { echo "could not extract worker ownership helpers"; exit 1; }
+eval "$ownership_block"
 extract "path-sanitization helpers" # sanitize_paths_for_display
 extract "vagueness helpers"      # comments_have_question, parse_vague_question
 extract "triage-vagueness helper" # triage_vagueness
@@ -115,6 +118,12 @@ assert_eq "triage off -> model not called" "$(model_calls)" "0"
 QUESTION_MARKER="<!-- copilot-loop:needs-info -->"
 NEEDS_INFO_LABEL="needs-info"
 INPROGRESS_LABEL="in-progress"
+OVERRIDE_WORKER_LABEL="override worker"
+WORKER_LABEL_PREFIX="worker:"
+TASK_LABEL_PREFIX="bot-loop:task:"
+WORKER_ID="build-host"
+WORKER_LABEL="worker:build-host"
+ISSUE_LABELS=$'in-progress\037worker:build-host\037bot-loop:task:process'
 branch="copilot/7-demo"   # read by _ask_issue -> cleanup_workspace (mocked)
 
 GH_LOG="$(mktemp)"
@@ -137,12 +146,26 @@ gh() {
       while [ $# -gt 0 ]; do case "$1" in --body) body="$2"; shift 2 ;; *) shift ;; esac; done
       printf 'comment:%s\n%s\n' "$num" "$body" >>"$GH_LOG"
       ;;
+    "issue view")
+      printf '%s' "$ISSUE_LABELS"
+      ;;
     "issue edit")
       local num="$1"; shift
       while [ $# -gt 0 ]; do
         case "$1" in
-          --add-label)    printf 'add:%s:%s\n' "$num" "$2" >>"$GH_LOG"; shift 2 ;;
-          --remove-label) printf 'remove:%s:%s\n' "$num" "$2" >>"$GH_LOG"; shift 2 ;;
+          --add-label)
+            printf 'add:%s:%s\n' "$num" "$2" >>"$GH_LOG"
+            label_list_has "$ISSUE_LABELS" "$2" || ISSUE_LABELS="${ISSUE_LABELS:+$ISSUE_LABELS$'\037'}$2"
+            shift 2 ;;
+          --remove-label)
+            printf 'remove:%s:%s\n' "$num" "$2" >>"$GH_LOG"
+            labels_after=""
+            while IFS= read -r existing; do
+              [ "$existing" = "$2" ] && continue
+              labels_after="${labels_after:+$labels_after$'\037'}$existing"
+            done < <(printf '%s\n' "$ISSUE_LABELS" | tr '\037' '\n')
+            ISSUE_LABELS="$labels_after"
+            shift 2 ;;
           *) shift ;;
         esac
       done
@@ -192,6 +215,10 @@ case "|$(ghlog)" in
   *"|remove:7:in-progress|"*) assert_eq "vague issue -> in-progress dropped" "yes" "yes" ;;
   *) assert_eq "vague issue -> in-progress dropped" "no" "yes" ;;
 esac
+assert_eq "vague issue -> owner retained while waiting" \
+  "$(printf '%s' "$ISSUE_LABELS" | tr '\037' ',' | grep -c 'worker:build-host')" "1"
+assert_eq "vague issue -> task retained while waiting" \
+  "$(printf '%s' "$ISSUE_LABELS" | tr '\037' ',' | grep -c 'bot-loop:task:process')" "1"
 assert_eq "vague issue -> question file consumed" "$QF_LEFT" "no"
 
 # --- A well-specified issue: no comment, proceeds to coding ------------------
