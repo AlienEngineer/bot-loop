@@ -47,7 +47,8 @@ COPILOT_RC=0
 # shellcheck disable=SC2329
 log() { :; }
 # shellcheck disable=SC2329
-_report_usage() { :; }
+USAGE_MODELS=""
+_report_usage() { USAGE_MODELS="${USAGE_MODELS} ${4:-}"; }
 # No timeout in force, so a run is never treated as timed out.
 # shellcheck disable=SC2329
 copilot_run_timed_out() { return 1; }
@@ -57,6 +58,7 @@ trap 'cd "$here" 2>/dev/null; rm -rf "$root"' EXIT
 
 origin=""; clone=""; other=""; wt=""; log_file=""
 CALLS=""            # records each run_copilot invocation
+CALL_ARGS=""        # records the arguments passed to each Copilot invocation
 RESOLVE_MODE="resolve"   # resolve | leave | match-upstream
 
 # Stand in for a Copilot run: record the call, then act on the conflicted file to
@@ -67,6 +69,7 @@ RESOLVE_MODE="resolve"   # resolve | leave | match-upstream
 # shellcheck disable=SC2329
 run_copilot() {
   printf 'call\n' >>"$CALLS"
+  printf '%s\n' "$*" >>"$CALL_ARGS"
   local n; n="$(grep -c . "$CALLS" 2>/dev/null)"
   case "$RESOLVE_MODE" in
     resolve)        printf 'resolved-%s\n' "$n" >"$WORKSPACE_DIR/file.txt" ;;
@@ -103,6 +106,8 @@ setup_repo() {
 
   REPO_DIR="$clone"
   CALLS="$root/copilot-calls"; : >"$CALLS"
+  CALL_ARGS="$root/copilot-args"; : >"$CALL_ARGS"
+  USAGE_MODELS=""
   log_file="$root/run.log"; : >"$log_file"
 }
 
@@ -154,10 +159,14 @@ make_issue_branch "feature"     # feat:        base -> feature (conflicts)
 start_rebase
 upstream_sha="$(git -C "$wt" rev-parse origin/main)"
 
-resolve_rebase_conflicts 42 "$log_file" "origin/main"; rc=$?
+resolve_rebase_conflicts 42 "$log_file" "origin/main" "gpt-luna-5.6"; rc=$?
 
 assert_eq "resolved: resolver reports success (rc 0)" "$rc" "0"
 assert_eq "resolved: copilot run once"                "$(calls)" "1"
+assert_eq "resolved: uses the issue coding model" \
+  "$(grep -c -- '--model gpt-luna-5.6' "$CALL_ARGS")" "1"
+assert_eq "resolved: reports usage for the issue coding model" \
+  "$USAGE_MODELS" " gpt-luna-5.6"
 assert_eq "resolved: no unmerged paths remain" \
   "$(git -C "$wt" diff --name-only --diff-filter=U | wc -l | tr -d ' ')" "0"
 assert_eq "resolved: rebase finished (not in progress)" \

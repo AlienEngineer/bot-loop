@@ -104,6 +104,14 @@ When running multiple bot instances with different `--model` values, use issue l
 - **No model tag**: Available only to bots with `--model auto` (the default). Use for generic issues that any bot can work on.
 - **`model:<name>` tag** (e.g., `model:gpt-5.4`, `model:claude-opus-4.5`): Available only to bots with matching `--model <name>`. Use to route complex issues to specific models.
 
+When bot-loop opens an issue PR, it copies the effective coding model to that PR
+as a `model:<name>` label. This is the model selected for the coding run, including
+one selected by `--triage-map` or `--cost-saver`; an explicit `auto` is preserved
+as `model:auto`, while an unpinned run adds no model label. Later merge-conflict,
+failing-check, and review-comment repairs prefer that PR label, so they use the
+same model rather than the repairing worker's configuration. Older or unlabelled
+PRs fall back to the repairing worker's configured `--model`.
+
 Example setup:
 
 ```sh
