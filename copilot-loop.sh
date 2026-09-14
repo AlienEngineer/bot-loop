@@ -599,7 +599,7 @@ worker_task_kind() {
   while IFS= read -r label; do
     case "$label" in
       "${TASK_LABEL_PREFIX:-bot-loop:task:}"*)
-        suffix="${label#${TASK_LABEL_PREFIX:-bot-loop:task:}}"
+        suffix="${label#"${TASK_LABEL_PREFIX:-bot-loop:task:}"}"
         case "$suffix" in
           process|plan|reply) [ -z "$found" ] && found="$suffix" ;;
         esac
@@ -698,10 +698,10 @@ worker_claim_decision() {
       printf 'skip'
       return 0
     fi
-    [ -n "$task" ] && [ "$task" = "$kind" ] || {
+    if [ -z "$task" ] || [ "$task" != "$kind" ]; then
       printf 'skip'
       return 0
-    }
+    fi
     printf 'takeover'
     return 0
   fi

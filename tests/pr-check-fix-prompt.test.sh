@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2317,SC2329  # extracted functions and stubs are invoked indirectly
+# shellcheck disable=SC2016,SC2034,SC2317,SC2329  # extracted functions and stubs are invoked indirectly
 #
 # Regression test for the PR check-fix prompt crash on Bash 3.2. The prompt
 # builders are extracted from copilot-loop.sh, and the real check-fix resolver
