@@ -26,8 +26,9 @@ brew install bot-loop
 ```
 
 Homebrew installs a prebuilt universal (arm64 + x86_64) macOS binary and pulls in
-`git` and `gh`, but not `copilot` — install that separately. Upgrade later with
-`brew upgrade bot-loop`.
+`coreutils`, `git`, and `gh`, but not `copilot` — install that separately.
+`coreutils` supplies the GNU `gtimeout` used to guard Copilot runs. Upgrade later
+with `brew upgrade bot-loop`.
 
 Then run from inside your repository:
 

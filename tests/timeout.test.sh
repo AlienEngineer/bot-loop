@@ -10,11 +10,11 @@
 # duration is passed to timeout(1), when an exit code counts as a timeout, and how
 # the baseline is scaled per difficulty class.
 #
-# The "copilot-timeout helpers" and "triage helpers" blocks are extracted verbatim
-# from the script between their markers and sourced here, so the real code is
-# exercised without running copilot or timeout. (parse_triage_map from the triage
-# block is used to exercise the class -> factor -> scaled-timeout path a user
-# configures through TRIAGE_TIMEOUT_MAP.)
+# The "copilot-timeout helpers", "timeout command helper" and "triage helpers"
+# blocks are extracted verbatim from the script between their markers and sourced
+# here, so the real code is exercised without running copilot or timeout.
+# (parse_triage_map from the triage block is used to exercise the class -> factor
+# -> scaled-timeout path a user configures through TRIAGE_TIMEOUT_MAP.)
 #
 # Run: tests/timeout.test.sh
 set -uo pipefail
@@ -24,7 +24,7 @@ script="$here/../copilot-loop.sh"
 
 [ -f "$script" ] || { echo "cannot find copilot-loop.sh next to tests/"; exit 1; }
 
-for marker in "copilot-timeout helpers" "triage helpers"; do
+for marker in "copilot-timeout helpers" "timeout command helper" "triage helpers"; do
   block="$(sed -n "/# >>> ${marker} >>>/,/# <<< ${marker} <<</p" "$script")"
   [ -n "$block" ] || { echo "could not extract '${marker}' (markers missing?)"; exit 1; }
   eval "$block"
@@ -147,6 +147,26 @@ assert_eq "abs map: trivial -> 10m" "$(scale_copilot_timeout "$base" "$(parse_tr
 assert_eq "abs map: complex -> 60m" "$(scale_copilot_timeout "$base" "$(parse_triage_map "$absmap" complex)")" "60m"
 assert_eq "map: complex with timeout off stays off" \
   "$(scale_copilot_timeout "" "$(parse_triage_map "$map" complex)")" ""
+
+# --- _timeout_program: use the canonical macOS timeout implementation --------
+timeout_test_dir="$(mktemp -d)"
+timeout_test_path="$PATH"
+trap 'rm -rf "$timeout_test_dir"' EXIT
+printf '#!/bin/sh\nexit 0\n' >"$timeout_test_dir/timeout"
+printf '#!/bin/sh\nexit 0\n' >"$timeout_test_dir/gtimeout"
+chmod +x "$timeout_test_dir/timeout" "$timeout_test_dir/gtimeout"
+PATH="$timeout_test_dir:$PATH"
+
+# shellcheck disable=SC2329
+uname() { printf '%s\n' "${TIMEOUT_TEST_OS:-}"; }
+TIMEOUT_TEST_OS=Darwin
+assert_eq "program: macOS prefers gtimeout" "$(_timeout_program)" "$timeout_test_dir/gtimeout"
+TIMEOUT_TEST_OS=Linux
+assert_eq "program: Linux prefers timeout" "$(_timeout_program)" "$timeout_test_dir/timeout"
+rm -f "$timeout_test_dir/gtimeout"
+TIMEOUT_TEST_OS=Darwin
+assert_eq "program: macOS falls back to timeout" "$(_timeout_program)" "$timeout_test_dir/timeout"
+PATH="$timeout_test_path"
 
 # --- Docs: the flag/env var are surfaced to users ----------------------------
 assert_eq "help documents --triage-timeout-map" \

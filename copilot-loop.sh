@@ -1325,14 +1325,28 @@ _report_summary() {
 
 # Run a command with a wall-clock limit when a timeout utility is available so a
 # hung helper (e.g. the commit-message model) can never stall the whole loop.
-# Uses timeout/gtimeout if present, otherwise runs the command unguarded. Passes
+# On macOS prefer Homebrew's GNU gtimeout: an unrelated unprefixed timeout on
+# PATH can use incompatible process-group semantics and kill this wrapper. Passes
 # through the command's exit status (124 on timeout, per timeout(1)).
+# >>> timeout command helper >>>
+_timeout_program() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin*)
+      command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null
+      ;;
+    *)
+      command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null
+      ;;
+  esac
+}
+# <<< timeout command helper <<<
+
 _run_with_timeout() {
   local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+  local program
+  program="$(_timeout_program)"
+  if [ -n "$program" ]; then
+    "$program" "$secs" "$@"
   else
     "$@"
   fi
