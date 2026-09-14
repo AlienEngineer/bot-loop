@@ -9,6 +9,7 @@ class BotLoop < Formula
   sha256 "a26e41164ffbbdfc1aa7843fa77e394b9435e3fabd762c92dd7274f178be9171"
   version "0.1.40"
 
+  depends_on "coreutils"
   depends_on "gh"
   depends_on "git"
 

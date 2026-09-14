@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2317  # mock/stub helpers are invoked indirectly by the code under test
+# shellcheck disable=SC2034,SC2317,SC2329  # extracted config and stubs are invoked indirectly
 #
 # Unit tests for plan mode in copilot-loop.sh (#172). An issue labelled with the
 # plan label is drafted into an implementation plan (no code changes) that is
