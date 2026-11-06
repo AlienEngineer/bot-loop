@@ -48,6 +48,12 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new(Vec::new());
+    app.set_loop_args(
+        std::env::args()
+            .skip(1)
+            .skip_while(|arg| arg == "--")
+            .collect(),
+    );
 
     // Restore the current Copilot model list from the daily cache, querying the
     // CLI only when that cache has expired.

@@ -255,6 +255,8 @@ impl Worker {
 #[derive(Default)]
 pub struct LoopRunner {
     workers: Vec<Worker>,
+    /// Startup flags appended after the TUI defaults for every launch.
+    pub extra_args: Vec<String>,
 }
 
 impl LoopRunner {
@@ -312,11 +314,9 @@ impl LoopRunner {
         auto_merge: bool,
         quality_assurance: bool,
     ) -> Result<u32> {
-        let child = spawn_detached(
-            script,
-            &loop_args(repo_dir, model, effort, auto_merge, quality_assurance),
-            log,
-        )?;
+        let mut args = loop_args(repo_dir, model, effort, auto_merge, quality_assurance);
+        args.extend_from_slice(&self.extra_args);
+        let child = spawn_detached(script, &args, log)?;
         let pid = child.id();
         self.workers.push(Worker {
             id,
@@ -350,13 +350,14 @@ impl LoopRunner {
         if worker.is_running() {
             anyhow::bail!("bot #{id} is still running");
         }
-        let args = loop_args(
+        let mut args = loop_args(
             &worker.repo_dir,
             worker.model.as_deref(),
             worker.effort.as_deref(),
             worker.auto_merge,
             worker.quality_assurance,
         );
+        args.extend_from_slice(&self.extra_args);
         let child = spawn_detached(&worker.script, &args, &worker.log)?;
         worker.pid = child.id();
         worker.child = Some(child);
@@ -934,14 +935,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restart_reuses_the_slot_and_archives_the_previous_log() {
+    fn restart_preserves_startup_flags_and_archives_the_previous_log() {
         use std::os::unix::fs::PermissionsExt;
 
         // A script that records a line then exits cleanly, so the worker stops on
         // its own and we can prove a restart re-runs it and keeps the old log.
         let mut script = std::env::temp_dir();
         script.push(format!("copilot-loop-restart-{}.sh", std::process::id()));
-        fs::write(&script, "#!/bin/sh\necho run\n").unwrap();
+        fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
         let dir = std::env::temp_dir();
@@ -951,8 +952,14 @@ mod tests {
         let _ = fs::remove_file(&archived);
 
         let mut runner = LoopRunner::new();
+        runner.extra_args = vec!["--copilot-timeout".into(), "2h".into()];
         start_worker(&mut runner, 7, &script, &dir, &log);
         assert_eq!(wait_until_stopped(&mut runner, 7), WorkerStatus::Stopped);
+        let expected = format!(
+            "--repo-dir\n{}\n--quiet\n--copilot-timeout\n2h\n",
+            dir.display()
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
 
         // Restart in place: same slot, previous log archived, new log created.
         for attempt in 1..=50 {
@@ -977,6 +984,8 @@ mod tests {
         assert_eq!(views[0].id, 7);
 
         wait_until_stopped(&mut runner, 7);
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
+        assert_eq!(fs::read_to_string(&archived).unwrap(), expected);
         let _ = fs::remove_file(&script);
         let _ = fs::remove_file(&log);
         let _ = fs::remove_file(&archived);
