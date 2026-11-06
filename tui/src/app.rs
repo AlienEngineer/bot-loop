@@ -312,6 +312,11 @@ impl App {
         }
     }
 
+    /// Forward startup flags to every worker, including automatic spawns and restarts.
+    pub fn set_loop_args(&mut self, args: Vec<String>) {
+        self.runner.extra_args = args;
+    }
+
     /// Set the transient feedback message shown on the message line and record it
     /// in the messages history so the popup can show a log of past feedback (#182).
     ///
